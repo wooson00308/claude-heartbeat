@@ -6,9 +6,13 @@ Generic scheduler that periodically executes claude CLI with configured prompts.
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 import logging
+import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -195,9 +199,68 @@ def _check_condition(job: dict) -> bool:
         return True
 
 
+def _kill_process_group(proc: subprocess.Popen, grace: float = 10.0) -> None:
+    """Forcefully terminate process group with SIGTERM, then SIGKILL fallback.
+
+    Required because `subprocess.run(timeout=...)` only sends SIGKILL to the
+    direct child. If the child spawned grandchildren that hold stdout/stderr
+    pipes open, the parent's `wait()` blocks forever. Sending the signal to
+    the entire process group (created via `start_new_session=True`) ensures
+    grandchildren are cleaned up too.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        log.error(f"process group {pgid} kill failed after SIGKILL")
+
+
 def _slug_to_cwd(slug: str) -> Path:
-    """Convert project slug to CWD path."""
-    return Path("/" + slug.lstrip("-").replace("-", "/"))
+    """Convert project slug to CWD path.
+
+    Slug is CWD with '/' replaced by '-' and prefixed with '-'.
+    Simple replace('-', '/') breaks folder names containing hyphens (e.g. dr2-unity).
+    Instead, walk from root and greedily match existing directories.
+    """
+    parts = slug.lstrip("-").split("-")
+    path = Path("/")
+    i = 0
+    while i < len(parts):
+        # Try longest match first: join remaining parts with '-' and shrink
+        matched = False
+        for end in range(len(parts), i, -1):
+            candidate = "-".join(parts[i:end])
+            trial = path / candidate
+            if trial.exists():
+                path = trial
+                i = end
+                matched = True
+                break
+        if not matched:
+            # Fallback: take single part
+            path = path / parts[i]
+            i += 1
+    return path
 
 
 def run_job(job: dict, state: dict) -> bool:
@@ -207,7 +270,8 @@ def run_job(job: dict, state: dict) -> bool:
     prompt = job["prompt"]
     timeout = job["timeout"]
 
-    job_state = state.setdefault(name, {})
+    with _state_lock:
+        job_state = state.setdefault(name, {})
 
     # Check condition
     if not _check_condition(job):
@@ -227,41 +291,58 @@ def run_job(job: dict, state: dict) -> bool:
     start_time = time.time()
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["claude", "-p", prompt],
             cwd=str(cwd),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            start_new_session=True,  # 새 process group → killpg로 손자까지 잡음
         )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            # 파이프 잔량 회수 (이미 죽었으니 즉시 반환)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            # 기존 except 블록이 받아서 처리하도록 재발생
+            raise
+
+        returncode = proc.returncode
         elapsed = round(time.time() - start_time, 1)
 
-        if result.returncode == 0:
+        if returncode == 0:
             log.info(f"[{name}] 완료 ({elapsed}초)")
-            job_state["last_run"] = datetime.now().isoformat()
-            job_state["last_result"] = "success"
-            job_state["last_duration"] = elapsed
-            _save_state(state)
+            with _state_lock:
+                job_state["last_run"] = datetime.now().isoformat()
+                job_state["last_result"] = "success"
+                job_state["last_duration"] = elapsed
+                _save_state(state)
             if _should_notify(job, "success"):
                 _notify("Heartbeat", f"[{name}] 완료 ({elapsed}초)")
             return True
         else:
-            log.error(f"[{name}] 실패 (exit {result.returncode}, {elapsed}초): {result.stderr[:200]}")
-            job_state["last_run"] = datetime.now().isoformat()
-            job_state["last_result"] = "failure"
-            job_state["last_duration"] = elapsed
-            _save_state(state)
+            log.error(f"[{name}] 실패 (exit {returncode}, {elapsed}초): {stderr[:200]}")
+            with _state_lock:
+                job_state["last_run"] = datetime.now().isoformat()
+                job_state["last_result"] = "failure"
+                job_state["last_duration"] = elapsed
+                _save_state(state)
             if _should_notify(job, "failure"):
-                _notify("Heartbeat", f"[{name}] 실패 (exit {result.returncode})")
+                _notify("Heartbeat", f"[{name}] 실패 (exit {returncode})")
             return False
 
     except subprocess.TimeoutExpired:
         elapsed = round(time.time() - start_time, 1)
         log.error(f"[{name}] 타임아웃 ({timeout}초)")
-        job_state["last_run"] = datetime.now().isoformat()
-        job_state["last_result"] = "timeout"
-        job_state["last_duration"] = elapsed
-        _save_state(state)
+        with _state_lock:
+            job_state["last_run"] = datetime.now().isoformat()
+            job_state["last_result"] = "timeout"
+            job_state["last_duration"] = elapsed
+            _save_state(state)
         if _should_notify(job, "failure"):
             _notify("Heartbeat", f"[{name}] 타임아웃 ({timeout}초)")
         return False
@@ -272,8 +353,43 @@ def run_job(job: dict, state: dict) -> bool:
         return False
 
 
+_state_lock = threading.Lock()
+
+
+def _run_slug_group(_slug: str, jobs: list[dict], state: dict, now: float) -> None:
+    """Run all due jobs for a single slug, sequentially."""
+    for job in jobs:
+        name = job["name"]
+        interval = job["interval"]
+
+        with _state_lock:
+            job_state = state.get(name, {})
+            last_run_str = job_state.get("last_run")
+
+        if last_run_str:
+            try:
+                last_run_ts = datetime.fromisoformat(last_run_str).timestamp()
+            except ValueError:
+                last_run_ts = 0
+        else:
+            last_run_ts = 0
+
+        if now - last_run_ts >= interval:
+            try:
+                run_job(job, state)
+            except Exception as e:
+                log.error(f"[{name}] 에러: {e}")
+                with _state_lock:
+                    state.setdefault(name, {})["last_run"] = datetime.now().isoformat()
+                    _save_state(state)
+
+
 def heartbeat_loop() -> None:
-    """Main heartbeat loop. Re-reads HEARTBEAT.md each cycle."""
+    """Main heartbeat loop. Re-reads HEARTBEAT.md each cycle.
+
+    Jobs with the same slug run sequentially (to avoid file conflicts).
+    Different slugs run in parallel.
+    """
     log.info("Heartbeat 데몬 시작")
 
     state = _load_state()
@@ -287,28 +403,25 @@ def heartbeat_loop() -> None:
             time.sleep(tick)
             continue
 
-        now = time.time()
+        # Group jobs by slug
+        slug_groups: dict[str, list[dict]] = defaultdict(list)
         for job in jobs:
-            name = job["name"]
-            interval = job["interval"]
-            job_state = state.get(name, {})
-            last_run_str = job_state.get("last_run")
+            slug_groups[job["slug"]].append(job)
 
-            if last_run_str:
-                try:
-                    last_run_ts = datetime.fromisoformat(last_run_str).timestamp()
-                except ValueError:
-                    last_run_ts = 0
-            else:
-                last_run_ts = 0
+        now = time.time()
 
-            if now - last_run_ts >= interval:
+        # Run slug groups in parallel
+        with ThreadPoolExecutor(max_workers=len(slug_groups)) as executor:
+            futures = {
+                executor.submit(_run_slug_group, slug, group, state, now): slug
+                for slug, group in slug_groups.items()
+            }
+            for future in as_completed(futures):
+                slug = futures[future]
                 try:
-                    run_job(job, state)
+                    future.result()
                 except Exception as e:
-                    log.error(f"[{name}] 에러: {e}")
-                    state.setdefault(name, {})["last_run"] = datetime.now().isoformat()
-                    _save_state(state)
+                    log.error(f"[{slug}] 그룹 실행 에러: {e}")
 
         time.sleep(tick)
 
