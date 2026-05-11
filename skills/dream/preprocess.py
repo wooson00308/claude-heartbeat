@@ -27,6 +27,11 @@ ACTIVE_MTIME_QUIET_SEC = 30 * 60          # 30분 — 이 시간 이상 조용�
 HUGE_FILE_SIZE_BYTES = 10 * 1024 * 1024   # 10MB — 이 크기 이상이면 mtime 무시하고 강제 처리
 COMPACT_BOUNDARY_MARKER = "This session is being continued from a previous conversation"
 
+# 라운드당 처리량 cap
+ROUND_MAX_MESSAGES = 300
+ROUND_MAX_CHARS = 1500 * 1024          # 1500 KB 마크다운
+ROUND_MAX_CHUNKS_ACTIVE = 2            # 활성 transcript는 라운드당 최대 N개 compact 청크
+
 
 def get_project_dir(slug: str) -> Path:
     return PROJECTS_DIR / slug
@@ -414,6 +419,270 @@ def find_unprocessed_transcripts(slug: str) -> list[Path]:
                 transcripts.append(f)
 
     return transcripts
+
+
+def compute_round_window(transcript_path: Path, cursor_uuid: str | None = None) -> dict:
+    """Capture an atomic snapshot of the transcript for one processing round.
+
+    Performs a single sequential scan of the file to collect:
+      - H_bytes / total_lines  (EOF at the moment of stat())
+      - compact_boundaries      (0-indexed line numbers)
+      - last_message_uuid       (last user/assistant uuid)
+      - cursor_line             (first line to process, derived from cursor_uuid)
+
+    cursor_uuid resolution:
+      - None  → cursor_line = None  (caller should start from line 0)
+      - Found → cursor_line = (that line index + 1), i.e. resume *after* it
+      - Not found → cursor_line = None + WARNING log  (fail-open: restart from 0)
+
+    Returns:
+        {
+            "transcript_path": str,
+            "H_bytes": int,
+            "total_lines": int,          # line-count-precision EOF cap
+            "last_message_uuid": str | None,
+            "compact_boundaries": list[int],
+            "cursor_line": int | None,
+            "cursor_uuid": str | None,
+            "captured_at": str,          # ISO timestamp
+        }
+    """
+    result: dict = {
+        "transcript_path": str(transcript_path),
+        "H_bytes": 0,
+        "total_lines": 0,
+        "last_message_uuid": None,
+        "compact_boundaries": [],
+        "cursor_line": None,
+        "cursor_uuid": cursor_uuid,
+        "captured_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    try:
+        stat_info = transcript_path.stat()
+        result["H_bytes"] = stat_info.st_size
+    except OSError as exc:
+        logger.warning("[dream-prep] compute_round_window: stat() failed for %s: %s", transcript_path, exc)
+        return result
+
+    # Single sequential scan — collect everything in one pass
+    boundaries: list[int] = []
+    last_uuid: str | None = None
+    cursor_line_found: int | None = None
+    total_lines = 0
+
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            for lineno, raw in enumerate(fh):
+                total_lines = lineno + 1
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = obj.get("type")
+
+                # Track compact boundaries
+                if msg_type == "user":
+                    content = obj.get("message", {}).get("content", "")
+                    if isinstance(content, str) and COMPACT_BOUNDARY_MARKER in content[:200]:
+                        boundaries.append(lineno)
+
+                # Track last uuid + cursor resolution
+                if msg_type in {"user", "assistant"}:
+                    uid = obj.get("uuid")
+                    if uid:
+                        last_uuid = uid
+                        if cursor_uuid is not None and uid == cursor_uuid:
+                            cursor_line_found = lineno
+
+    except OSError as exc:
+        logger.warning("[dream-prep] compute_round_window: read failed for %s: %s", transcript_path, exc)
+        return result
+
+    result["total_lines"] = total_lines
+    result["compact_boundaries"] = boundaries
+    result["last_message_uuid"] = last_uuid
+
+    if cursor_uuid is None:
+        # No cursor supplied — start from beginning
+        result["cursor_line"] = None
+    elif cursor_line_found is not None:
+        # Resume from the line *after* the cursor message
+        result["cursor_line"] = cursor_line_found + 1
+    else:
+        # cursor_uuid supplied but not found in file — fail-open
+        logger.warning(
+            "[dream-prep] compute_round_window: cursor_uuid %r not found in %s — resetting to line 0",
+            cursor_uuid, transcript_path,
+        )
+        result["cursor_line"] = None
+
+    return result
+
+
+def extract_partial_conversation(
+    transcript_path: Path,
+    cursor_uuid: str | None = None,
+    max_messages: int = ROUND_MAX_MESSAGES,
+    max_chars: int = ROUND_MAX_CHARS,
+    max_chunks: int | None = None,
+) -> tuple[list[dict], str | None, dict]:
+    """Extract a bounded slice of conversation from cursor_uuid up to cap limits.
+
+    Bounded extraction for large / active transcripts. Processes lines from
+    cursor_uuid (exclusive) forward, stopping at the first cap reached.
+
+    Args:
+        transcript_path: Path to the JSONL transcript.
+        cursor_uuid: UUID of the last already-processed message. None = start from line 0.
+        max_messages: Stop after accumulating this many user/assistant messages.
+        max_chars: Stop after accumulated content characters exceed this threshold.
+        max_chunks: Stop after this many compact-boundary chunks have been entered.
+                    None = no chunk cap.
+
+    Returns:
+        (conversation, next_cursor_uuid, stats)
+
+        conversation:
+            List of dicts in extract_conversation format:
+            {"role": "user"|"assistant", "text": str, "time": str}
+
+        next_cursor_uuid:
+            UUID of the last message added to conversation.
+            None if no messages were processed.
+
+        stats:
+            {
+                "messages_processed": int,
+                "chars_processed": int,
+                "chunks_processed": int,
+                "hit_cap": "messages"|"chars"|"chunks"|"end_of_window"|"none",
+                "window": dict,   # full compute_round_window output
+            }
+    """
+    window = compute_round_window(transcript_path, cursor_uuid)
+    start_line = window["cursor_line"] if window["cursor_line"] is not None else 0
+    eof_line = window["total_lines"]  # lines 0 .. eof_line-1 are valid
+
+    conversation: list[dict] = []
+    next_cursor_uuid: str | None = None
+    messages_processed = 0
+    chars_processed = 0
+    chunks_processed = 0
+    hit_cap: str | None = None
+
+    boundary_set: set[int] = set(window["compact_boundaries"])
+
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            for lineno, raw in enumerate(fh):
+                # Honour EOF cap (lines written after stat() are next round's job)
+                if lineno >= eof_line:
+                    break
+
+                # Skip lines before cursor
+                if lineno < start_line:
+                    continue
+
+                # Compact boundary encountered → increment chunk counter
+                # (Check before parse to avoid double-parsing; re-parse is cheap)
+                if lineno in boundary_set:
+                    chunks_processed += 1
+                    if max_chunks is not None and chunks_processed >= max_chunks:
+                        hit_cap = "chunks"
+                        break
+
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = obj.get("type")
+                if msg_type not in {"user", "assistant"}:
+                    continue
+
+                timestamp = obj.get("timestamp", "")
+                uid = obj.get("uuid")
+
+                if msg_type == "user":
+                    content = obj.get("message", {}).get("content", "")
+                    if isinstance(content, str):
+                        text = content.strip()
+                        if not text or text.startswith("<") or len(text) <= 2:
+                            continue
+                        turn = {"role": "user", "text": text, "time": timestamp}
+                    else:
+                        continue
+
+                else:  # assistant
+                    content = obj.get("message", {}).get("content", [])
+                    if isinstance(content, list):
+                        texts = []
+                        tool_names = []
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") == "text":
+                                t = block.get("text", "").strip()
+                                if t:
+                                    texts.append(t)
+                            elif block.get("type") == "tool_use":
+                                tool_names.append(block.get("name", "?"))
+                        if texts:
+                            turn = {
+                                "role": "assistant",
+                                "text": "\n".join(texts),
+                                "time": timestamp,
+                            }
+                        elif tool_names:
+                            turn = {
+                                "role": "assistant",
+                                "text": f"[도구 호출: {', '.join(tool_names)}]",
+                                "time": timestamp,
+                            }
+                        else:
+                            continue
+                    else:
+                        continue
+
+                # Accumulate
+                turn_chars = len(str(turn["text"]))
+                conversation.append(turn)
+                if uid:
+                    next_cursor_uuid = uid
+                messages_processed += 1
+                chars_processed += turn_chars
+
+                # Cap checks (evaluated after adding so the triggering message is included)
+                if messages_processed >= max_messages:
+                    hit_cap = "messages"
+                    break
+                if chars_processed >= max_chars:
+                    hit_cap = "chars"
+                    break
+
+    except OSError as exc:
+        logger.warning("[dream-prep] extract_partial_conversation: read failed for %s: %s", transcript_path, exc)
+
+    if hit_cap is None:
+        hit_cap = "end_of_window" if messages_processed > 0 else "none"
+
+    stats = {
+        "messages_processed": messages_processed,
+        "chars_processed": chars_processed,
+        "chunks_processed": chunks_processed,
+        "hit_cap": hit_cap,
+        "window": window,
+    }
+
+    return conversation, next_cursor_uuid, stats
 
 
 def _compress_code_blocks(text: str) -> str:
