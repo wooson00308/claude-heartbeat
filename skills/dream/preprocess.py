@@ -4,6 +4,8 @@ Extracts user text + assistant text from raw transcript JSONL files,
 outputs lightweight markdown files ready for LLM consumption.
 """
 
+from __future__ import annotations
+
 import argparse
 import contextlib
 import fcntl
@@ -19,6 +21,11 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+# 활성/거대 transcript 처리 게이트
+ACTIVE_MTIME_QUIET_SEC = 30 * 60          # 30분 — 이 시간 이상 조용하면 비활성으로 간주
+HUGE_FILE_SIZE_BYTES = 10 * 1024 * 1024   # 10MB — 이 크기 이상이면 mtime 무시하고 강제 처리
+COMPACT_BOUNDARY_MARKER = "This session is being continued from a previous conversation"
 
 
 def get_project_dir(slug: str) -> Path:
@@ -266,15 +273,145 @@ def _mark_processed_locked(meta_path: Path, filename: str, last_uuid: str, statu
         raise RuntimeError(f"atomic write failed: {exc}") from exc
 
 
+def extract_last_message_uuid(transcript_path: Path) -> str | None:
+    """Return the uuid of the last user or assistant message line in the transcript.
+
+    Scans forward and keeps the latest match (simple, correct for append-only jsonl).
+    Returns None if the file is missing, unreadable, or has no qualifying lines.
+    """
+    try:
+        last_uuid: str | None = None
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") in {"user", "assistant"}:
+                    uid = obj.get("uuid")
+                    if uid:
+                        last_uuid = uid
+        return last_uuid
+    except OSError:
+        return None
+
+
+def extract_last_prompt_leaf_uuid(transcript_path: Path) -> str | None:
+    """Return the leafUuid of the last last-prompt entry in the transcript.
+
+    Returns None if not found or on any error.
+    """
+    try:
+        last_leaf: str | None = None
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "last-prompt":
+                    leaf = obj.get("leafUuid")
+                    if leaf:
+                        last_leaf = leaf
+        return last_leaf
+    except OSError:
+        return None
+
+
+def detect_compact_boundaries(transcript_path: Path) -> list[int]:
+    """Return 0-indexed line numbers where a compact boundary message appears.
+
+    A boundary line satisfies both:
+      - obj["type"] == "user"
+      - obj["message"]["content"] is a str containing COMPACT_BOUNDARY_MARKER
+        within the first 200 characters
+
+    Returns an empty list on any error or when no boundary is found.
+    """
+    result: list[int] = []
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            for lineno, raw in enumerate(fh):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "user":
+                    continue
+                content = obj.get("message", {}).get("content", "")
+                if not isinstance(content, str):
+                    continue
+                if COMPACT_BOUNDARY_MARKER in content[:200]:
+                    result.append(lineno)
+    except OSError:
+        pass
+    return result
+
+
+def classify_transcript(transcript_path: Path) -> dict:
+    """Return a diagnostic dict describing the processing eligibility of a transcript.
+
+    Keys:
+        path            — absolute path string
+        size_bytes      — file size in bytes
+        mtime_age_seconds — seconds since last modification
+        is_active       — True if mtime_age < ACTIVE_MTIME_QUIET_SEC
+        is_huge         — True if size_bytes >= HUGE_FILE_SIZE_BYTES
+        should_process  — True when eligible: (not is_active) or is_huge
+    """
+    import time
+
+    try:
+        stat = transcript_path.stat()
+        size_bytes = stat.st_size
+        mtime_age = time.time() - stat.st_mtime
+    except OSError:
+        return {
+            "path": str(transcript_path),
+            "size_bytes": 0,
+            "mtime_age_seconds": float("inf"),
+            "is_active": False,
+            "is_huge": False,
+            "should_process": False,
+        }
+
+    is_active = mtime_age < ACTIVE_MTIME_QUIET_SEC
+    is_huge = size_bytes >= HUGE_FILE_SIZE_BYTES
+    should_process = (not is_active) or is_huge
+
+    return {
+        "path": str(transcript_path),
+        "size_bytes": size_bytes,
+        "mtime_age_seconds": mtime_age,
+        "is_active": is_active,
+        "is_huge": is_huge,
+        "should_process": should_process,
+    }
+
+
 def find_unprocessed_transcripts(slug: str) -> list[Path]:
-    """Find transcript JSONL files not yet processed by /dream."""
+    """Find transcript JSONL files not yet processed by /dream.
+
+    Applies classify_transcript gate: active small files are excluded.
+    Huge active files bypass the mtime gate and are included.
+    """
     project_dir = get_project_dir(slug)
     processed = get_combined_processed(slug)
 
     transcripts = []
     for f in sorted(project_dir.glob("*.jsonl")):
         if f.name not in processed:
-            transcripts.append(f)
+            if classify_transcript(f)["should_process"]:
+                transcripts.append(f)
 
     return transcripts
 
@@ -529,6 +666,10 @@ def main() -> None:
     p_status = sub.add_parser("status", help="Show processing status for a project")
     p_status.add_argument("--slug", "-s", required=True, help="Project slug")
 
+    # classify
+    p_classify = sub.add_parser("classify", help="Show processing eligibility for all transcripts in a project")
+    p_classify.add_argument("--slug", "-s", required=True, help="Project slug")
+
     # mark
     p_mark = sub.add_parser("mark", help="Mark a transcript as processed (v2 format)")
     p_mark.add_argument("--slug", "-s", required=True, help="Project slug")
@@ -548,6 +689,24 @@ def main() -> None:
         unprocessed = find_unprocessed_transcripts(args.slug)
         total = len(list(get_project_dir(args.slug).glob("*.jsonl")))
         print(f"  전체: {total}, 처리됨: {total - len(unprocessed)}, 미처리: {len(unprocessed)}")
+    elif args.command == "classify":
+        project_dir = get_project_dir(args.slug)
+        jsonl_files = sorted(project_dir.glob("*.jsonl"))
+        if not jsonl_files:
+            print(f"  [{args.slug}] jsonl 파일 없음")
+        else:
+            header = f"{'filename':<50} {'size_MB':>8} {'mtime_age_min':>14} {'is_active':>9} {'is_huge':>8} {'should_process':>14}"
+            print(header)
+            print("-" * len(header))
+            for f in jsonl_files:
+                info = classify_transcript(f)
+                size_mb = info["size_bytes"] / (1024 * 1024)
+                age_min = info["mtime_age_seconds"] / 60
+                print(
+                    f"{f.name:<50} {size_mb:>8.2f} {age_min:>14.1f}"
+                    f" {str(info['is_active']):>9} {str(info['is_huge']):>8}"
+                    f" {str(info['should_process']):>14}"
+                )
     elif args.command == "mark":
         mark_processed(args.slug, args.filename, args.last_uuid, args.status)
         print(f"  [{args.slug}] marked: {args.filename} ({args.status})")
