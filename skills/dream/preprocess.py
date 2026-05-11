@@ -866,43 +866,154 @@ def conversation_to_markdown(session_id: str, conversation: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def preprocess_project(slug: str, output_dir: Path | None = None, limit: int = 5) -> None:
-    """Preprocess unprocessed transcripts for a project."""
+def preprocess_project(
+    slug: str,
+    output_dir: Path | None = None,
+    limit: int = 5,
+    dry_run: bool = False,
+) -> None:
+    """Preprocess unprocessed transcripts for a project.
+
+    Branches per transcript:
+      - sealed-candidate (not active AND not huge): full extract → status="sealed"
+      - active-or-huge (active OR huge): partial extract from cursor_uuid → status="active"
+
+    dry_run=True suppresses mark_processed calls (no dream_meta.md side effects).
+    """
     unprocessed = find_unprocessed_transcripts(slug)
 
     if not unprocessed:
         print(f"[{slug}] 미처리 transcript 없음")
         return
 
-    print(f"[{slug}] 미처리 transcript {len(unprocessed)}개 발견, {min(limit, len(unprocessed))}개 처리")
+    print(f"[{slug}] 미처리 transcript {len(unprocessed)}개 발견, {min(limit, len(unprocessed))}개 처리"
+          + (" [dry-run]" if dry_run else ""))
 
     # Output directory
     if output_dir is None:
         output_dir = get_project_dir(slug) / "memory" / "_dream_prep"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load v2 meta for cursor_uuid resolution (active files)
+    meta_v2 = parse_meta_v2(slug)
+
     batch = unprocessed[:limit]
-    all_sections = []
+    processed_count = 0
 
     for transcript_path in batch:
         session_id = transcript_path.stem
-        conversation = extract_conversation(transcript_path)
+        filename = transcript_path.name
+        cls = classify_transcript(transcript_path)
 
-        if not conversation:
-            continue
+        is_active = cls["is_active"]
+        is_huge = cls["is_huge"]
+        use_partial = is_active or is_huge
 
-        md = conversation_to_markdown(session_id, conversation)
-        if md:
-            all_sections.append(md)
+        if use_partial:
+            # --- 분기 B: active OR huge — 부분 처리 ---
+            file_meta = meta_v2.get(filename, {})
+            cursor_uuid: str | None = file_meta.get("last_uuid") or None
 
-    if all_sections:
-        output_file = output_dir / f"prep_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-        content = f"# Dream Prep — {slug}\n\n처리 대상: {len(batch)}개 transcript\n\n---\n\n"
-        content += "\n---\n\n".join(all_sections)
-        output_file.write_text(content, encoding="utf-8")
-        print(f"[{slug}] → {output_file} ({len(all_sections)}개 세션)")
-    else:
-        print(f"[{slug}] 의미 있는 대화 없음")
+            print(
+                f"[{slug}] {filename} → active-or-huge"
+                f" (active={is_active}, huge={is_huge},"
+                f" size={cls['size_bytes'] // 1024}KB,"
+                f" cursor={'set' if cursor_uuid else 'none'})"
+            )
+
+            conversation, next_cursor_uuid, stats = extract_partial_conversation(
+                transcript_path,
+                cursor_uuid=cursor_uuid,
+                max_chunks=ROUND_MAX_CHUNKS_ACTIVE,
+            )
+
+            print(
+                f"[{slug}] {filename} partial result:"
+                f" messages={stats['messages_processed']},"
+                f" chars={stats['chars_processed']},"
+                f" hit_cap={stats['hit_cap']},"
+                f" next_cursor={'set' if next_cursor_uuid else 'none'}"
+            )
+
+            if not conversation:
+                print(f"[{slug}] {filename} 처리 가능한 메시지 없음 (skip mark)")
+                continue
+
+            md = conversation_to_markdown(session_id, conversation)
+            if not md:
+                continue
+
+            # Active 파일은 같은 세션이 여러 라운드에 걸침 → round timestamp suffix
+            round_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_short = session_id[:12]
+            output_file = output_dir / f"prep_{session_short}_partial_{round_ts}.md"
+            output_file.write_text(
+                f"# Dream Prep (partial) — {slug}\n\n"
+                f"파일: {filename}\ncursor: {cursor_uuid or 'start'} → {next_cursor_uuid}\n"
+                f"hit_cap: {stats['hit_cap']}\n\n---\n\n{md}",
+                encoding="utf-8",
+            )
+            print(f"[{slug}] → {output_file}")
+
+            if next_cursor_uuid is None:
+                print(f"[{slug}] {filename} next_cursor_uuid=None → mark_processed 스킵")
+            else:
+                _maybe_mark(dry_run, slug, filename, next_cursor_uuid, "active")
+
+        else:
+            # --- 분기 A: sealed-candidate — 전체 처리 ---
+            print(
+                f"[{slug}] {filename} → sealed-candidate"
+                f" (size={cls['size_bytes'] // 1024}KB,"
+                f" age={cls['mtime_age_seconds'] / 60:.1f}min)"
+            )
+
+            conversation = extract_conversation(transcript_path)
+
+            if not conversation:
+                print(f"[{slug}] {filename} 의미 있는 대화 없음")
+                continue
+
+            md = conversation_to_markdown(session_id, conversation)
+            if not md:
+                continue
+
+            # uuid 보존 안 됨(extract_conversation은 role/text/time만) → 별도 호출
+            last_uuid = extract_last_message_uuid(transcript_path)
+
+            print(
+                f"[{slug}] {filename} sealed result:"
+                f" turns={len(conversation)},"
+                f" last_uuid={'set' if last_uuid else 'none'}"
+            )
+
+            # 기존 prep 파일 네이밍 패턴 유지 (sealed는 파일마다 단일 섹션)
+            round_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_short = session_id[:12]
+            output_file = output_dir / f"prep_{session_short}_{round_ts}.md"
+            output_file.write_text(
+                f"# Dream Prep — {slug}\n\n처리 대상: {filename}\n\n---\n\n{md}",
+                encoding="utf-8",
+            )
+            print(f"[{slug}] → {output_file}")
+
+            _maybe_mark(dry_run, slug, filename, last_uuid or "", "sealed")
+
+        processed_count += 1
+
+    print(f"[{slug}] 완료: {processed_count}개 처리" + (" [dry-run]" if dry_run else ""))
+
+
+def _maybe_mark(dry_run: bool, slug: str, filename: str, last_uuid: str, status: str) -> None:
+    """Call mark_processed unless dry_run is set. Logs but never raises."""
+    if dry_run:
+        print(f"[dry-run] mark_processed({filename!r}, last_uuid={last_uuid!r}, status={status!r})")
+        return
+    try:
+        mark_processed(slug, filename, last_uuid, status)
+        print(f"[{slug}] marked: {filename} ({status})")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[dream-prep] mark_processed call failed for %s: %s — continuing", filename, exc)
 
 
 def list_projects() -> list[str]:
@@ -927,6 +1038,7 @@ def main() -> None:
     p_prep = sub.add_parser("prep", help="Preprocess transcripts for a project")
     p_prep.add_argument("--slug", "-s", required=True, help="Project slug (e.g. -Users-yourname)")
     p_prep.add_argument("--limit", "-n", type=int, default=5, help="Max transcripts to process")
+    p_prep.add_argument("--dry-run", action="store_true", help="Skip mark_processed calls (no dream_meta.md changes)")
 
     # list
     sub.add_parser("list", help="List projects with transcripts")
@@ -949,7 +1061,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "prep":
-        preprocess_project(args.slug, limit=args.limit)
+        preprocess_project(args.slug, limit=args.limit, dry_run=args.dry_run)
     elif args.command == "list":
         for slug in list_projects():
             count = len(list(get_project_dir(slug).glob("*.jsonl")))
