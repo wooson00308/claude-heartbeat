@@ -25,6 +25,11 @@ JSONL (수 MB) → 파이썬 전처리 (경량 마크다운) → 본체가 읽�
 - 메타: `~/.claude/projects/{slug}/memory/dream_meta.md`
 - project-slug: CWD 경로의 `/` → `-` 변환. 예) `/Users/yourname` → `-Users-yourname`
 
+## 실행 모드
+
+- `/dream` — 전체 실행 (Phase 1~5)
+- `/dream --lint-only` — lint만 실행 (Phase 5만). transcript 처리 없이 메모리 건강성만 점검
+
 ## 실행 프로세스
 
 ### Phase 1: Orient
@@ -93,13 +98,70 @@ transcript JSONL을 직접 읽지 않는다. 전처리 스크립트가 기계적
 
 ### Phase 5: Lint
 
-처리 결과 정합성 검사.
+메모리 저장소의 건강성을 점검한다. 드림 실행 시 매번 같이 돌리며, 문제 발견 시 즉시 조치한다.
 
-1. Check 1 — 고아 감지:
-   - MEMORY.md에 포인터가 있으나 실제 파일이 없는 항목 → 경고
-   - legacy `processed:` 라인과 `processed_v2:` 항목에 동일 파일이 양쪽 다 있는 경우 → 정상 (마이그레이션 진행 중). lint는 경고만 출력하고 자동 제거하지 않는다.
-2. Check 2 — 중복 포인터: MEMORY.md에 동일 파일명이 두 번 이상 등장 → 하나 제거
-3. last_lint 타임스탬프 갱신 (dream_meta.md)
+#### Check 1: 고아 감지 (Orphan)
+
+MEMORY.md 인덱스와 실제 파일의 불일치를 찾는다.
+
+1. MEMORY.md에서 참조하는 파일명 목록 추출
+2. memory/ 디렉토리의 실제 .md 파일 목록과 비교 (MEMORY.md, dream_meta.md, _dream_prep/ 제외)
+3. 조치:
+   - 인덱스에 있는데 파일 없음 → MEMORY.md에서 해당 줄 제거
+   - 파일은 있는데 인덱스에 없음 → 파일 내용 읽고, 유효하면 MEMORY.md에 추가. 내용이 비었거나 의미 없으면 삭제
+4. legacy `processed:` 라인과 `processed_v2:` 항목에 동일 파일이 양쪽 다 있는 경우 → 정상 (마이그레이션 진행 중). lint는 경고만 출력하고 자동 제거하지 않는다.
+
+#### Check 2: stale 메모리
+
+project 타입 메모리 중 오래된 것을 찾는다.
+
+1. frontmatter에 type: project인 파일을 찾는다
+2. 파일 수정일이 30일 이상 경과한 것을 플래그
+3. 조치: 내용을 읽고 판단
+   - 이미 완료된 작업/결정 → 삭제
+   - 아직 유효한 장기 계획 → 유지하되, description에 "(장기)" 표기 추가
+   - 판단 불가 → 보고만 하고 유지
+
+#### Check 3: 모순 감지 (Contradiction)
+
+같은 주제를 다루는 메모리 간 내용 충돌을 찾는다.
+
+1. 파일명이나 description이 유사한 메모리 쌍을 식별
+2. 양쪽 내용을 읽고 사실 충돌 여부 확인 (예: 다른 시점에 기록된 상반된 선호, 바뀐 결정)
+3. 조치:
+   - 최신 정보가 명확하면 → 오래된 쪽을 갱신하거나 삭제
+   - 두 관점이 공존 가능하면 → 하나로 합치고 맥락 보존
+
+#### Check 4: 중복 감지 (Duplicate)
+
+비슷한 내용이 다른 파일에 분산된 것을 찾는다.
+
+1. 모든 메모리 파일의 description을 비교
+2. 내용이 70% 이상 겹치는 쌍을 식별
+3. 조치: 하나로 병합 → 나머지 삭제 → MEMORY.md 갱신
+
+#### Check 5: frontmatter 규칙 위반 (Schema)
+
+메모리 파일의 형식 규칙 준수 여부를 점검한다.
+
+1. 필수 필드 누락: name, description, type 중 하나라도 없는 파일
+2. 잘못된 type: user, feedback, project, reference 4종 외의 값
+3. 조치: 내용 기반으로 올바른 frontmatter를 추론하여 수정
+
+#### Lint 완료
+
+1. dream_meta.md의 last_lint 타임스탬프 갱신
+2. 결과 보고: 체크별 발견 건수와 조치 내역
+
+```
+Lint 결과:
+──────────────────────────
+고아:       {N}건 조치
+stale:      {N}건 ({삭제}건 삭제, {유지}건 유지)
+모순:       {N}건 조치
+중복:       {N}건 병합
+frontmatter: {N}건 수정
+```
 
 ## 주의사항
 

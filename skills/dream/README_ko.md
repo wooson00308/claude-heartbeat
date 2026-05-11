@@ -81,7 +81,7 @@ Claude가 깨어나서 `/dream` 스킬을 실행합니다. KAIROS autoDream의 4
 | 2 | Gather | 전처리된 마크다운을 읽습니다 (마킹은 dream-prep CLI가 보장) |
 | 3 | Consolidate | 기존 메모리와 병합하여 topic 파일을 생성하거나 수정합니다 |
 | 4 | Prune & Index | 중복을 제거하고 MEMORY.md 인덱스를 갱신합니다 (LLM은 타임스탬프만 갱신) |
-| 5 | Lint | 정합성 검사 및 고아 포인터 감지 |
+| 5 | Lint | 5종 check: 고아/stale/모순/중복/frontmatter |
 
 ### 4. Memory --- 결과
 
