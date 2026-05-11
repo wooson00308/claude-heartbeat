@@ -80,9 +80,10 @@ Claude wakes up and runs the `/dream` skill. It follows the 4 phases of KAIROS a
 | Phase | Name | Action |
 |-------|------|--------|
 | 1 | Orient | Survey current memory state |
-| 2 | Gather | Read preprocessed markdown |
+| 2 | Gather | Read preprocessed markdown (marking owned by dream-prep CLI) |
 | 3 | Consolidate | Merge with existing memory, create/update topic files |
-| 4 | Prune & Index | Deduplicate, update MEMORY.md index |
+| 4 | Prune & Index | Deduplicate, update MEMORY.md index (LLM updates timestamps only) |
+| 5 | Lint | Integrity check, orphan pointer detection |
 
 ### 4. Memory --- Result
 
