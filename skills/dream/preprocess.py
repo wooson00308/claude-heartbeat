@@ -32,6 +32,12 @@ ROUND_MAX_MESSAGES = 300
 ROUND_MAX_CHARS = 1500 * 1024          # 1500 KB 마크다운
 ROUND_MAX_CHUNKS_ACTIVE = 2            # 활성 transcript는 라운드당 최대 N개 compact 청크
 
+# processed_v2 GC: sealed 항목 누적 시 dream_meta.md가 비대해진다 (UUID 36자 × N).
+# 누적 임계 초과 시 오래된 sealed 항목의 last_uuid/status 라인을 제거하고
+# 파일명 한 줄로 압축한다. 파일명은 그대로 남아서 "이미 처리됨" 판단은 유지된다.
+SEALED_GC_THRESHOLD = 200              # sealed 항목이 이 개수 초과 시 GC 트리거
+SEALED_GC_KEEP_FULL = 100              # 최신 N개 sealed 항목만 full 형태 유지
+
 
 def get_project_dir(slug: str) -> Path:
     return PROJECTS_DIR / slug
@@ -172,17 +178,42 @@ def _acquire_meta_lock(slug: str):
             pass
 
 
+INITIAL_META_TEMPLATE = """\
+---
+name: dream_meta
+description: /dream 프로세스 메타데이터
+type: reference
+---
+last_dream:
+last_lint:
+
+processed_v2:
+"""
+
+
+def _create_initial_meta(meta_path: Path) -> None:
+    """dream_meta.md 정규 포맷 초기 생성. 이미 존재하면 no-op."""
+    if meta_path.exists():
+        return
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(INITIAL_META_TEMPLATE, encoding="utf-8")
+    logger.info("[dream-prep] dream_meta.md 초기 생성: %s", meta_path)
+
+
 def mark_processed(slug: str, filename: str, last_uuid: str, status: str = "sealed") -> None:
     """Append or update a processed_v2 entry in dream_meta.md.
 
     Thread/process safe via fcntl lock + atomic rename.
     Never raises; logs and returns on any error.
+
+    메타 파일이 없으면 정규 포맷으로 자동 초기화한 뒤 마킹을 진행한다.
+    이전엔 warning + return으로 빠져서 첫 라운드 메타를 LLM이 비표준 형태로 만드는
+    부작용이 있었다 (v0.2.0).
     """
     meta_path = get_project_dir(slug) / "memory" / "dream_meta.md"
 
     if not meta_path.exists():
-        logger.warning("[dream-prep] mark_processed: dream_meta.md not found at %s", meta_path)
-        return
+        _create_initial_meta(meta_path)
 
     try:
         with _acquire_meta_lock(slug):
@@ -257,6 +288,9 @@ def _mark_processed_locked(meta_path: Path, filename: str, last_uuid: str, statu
         lines.append("processed_v2:")
         lines.extend(new_entry_lines)
 
+    # GC: 오래된 sealed 항목 압축 (dream_meta.md 비대화 방지)
+    lines = _gc_compact_old_sealed(lines)
+
     new_content = "\n".join(lines)
 
     # Atomic write: tmp file in same dir, then rename
@@ -276,6 +310,78 @@ def _mark_processed_locked(meta_path: Path, filename: str, last_uuid: str, statu
             raise
     except Exception as exc:
         raise RuntimeError(f"atomic write failed: {exc}") from exc
+
+
+def _gc_compact_old_sealed(
+    lines: list[str],
+    threshold: int = SEALED_GC_THRESHOLD,
+    keep_full: int = SEALED_GC_KEEP_FULL,
+) -> list[str]:
+    """processed_v2 섹션의 오래된 sealed 항목을 한 줄로 압축.
+
+    sealed 총 개수가 threshold 초과 시, 위에서부터 (total - keep_full)개의
+    full-form sealed 항목을 `- file: xxx.jsonl` 한 줄로 줄인다.
+    파일명은 그대로 남아서 get_combined_processed의 "이미 처리됨" 판정은 유지된다.
+    active 항목은 절대 건드리지 않는다 (last_uuid가 cursor 역할).
+    """
+    # 1. processed_v2 섹션 안의 entry 위치/상태 수집
+    entries: list[tuple[int, int, str, str, bool]] = []
+    # (start_line, end_line_exclusive, file, status, is_compact)
+
+    in_v2 = False
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+
+        if stripped == "processed_v2:":
+            in_v2 = True
+            i += 1
+            continue
+
+        if in_v2:
+            # 섹션 종료 판정: non-indented, non-list, non-empty 라인
+            if stripped and not raw.startswith(" ") and not raw.startswith("-") and not raw.startswith("\t"):
+                break
+
+            if stripped.startswith("- file:"):
+                start = i
+                file = stripped[len("- file:"):].strip()
+                status = "sealed"  # 기본 (sub-line 없으면 압축된 sealed로 간주)
+                j = i + 1
+                while j < len(lines):
+                    sub = lines[j].strip()
+                    if sub.startswith("last_uuid:"):
+                        j += 1
+                    elif sub.startswith("status:"):
+                        status = sub[len("status:"):].strip()
+                        j += 1
+                    else:
+                        break
+                end = j
+                is_compact = (end == start + 1)
+                entries.append((start, end, file, status, is_compact))
+                i = end
+                continue
+
+        i += 1
+
+    # 2. sealed 카운트 + 압축 후보 추리기
+    sealed_total = sum(1 for e in entries if e[3] == "sealed")
+    if sealed_total <= threshold:
+        return lines
+
+    excess = sealed_total - keep_full
+    compactable = [e for e in entries if e[3] == "sealed" and not e[4]]
+    to_compact = compactable[:excess]
+    if not to_compact:
+        return lines
+
+    # 3. 인덱스 안정성을 위해 뒤에서 앞으로 치환
+    for start, end, file, _, _ in sorted(to_compact, key=lambda e: e[0], reverse=True):
+        lines[start:end] = [f"- file: {file}"]
+
+    return lines
 
 
 def extract_last_message_uuid(transcript_path: Path) -> str | None:
@@ -421,7 +527,15 @@ def find_unprocessed_transcripts(slug: str) -> list[Path]:
     return transcripts
 
 
-def compute_round_window(transcript_path: Path, cursor_uuid: str | None = None) -> dict:
+class CursorNotFoundError(RuntimeError):
+    """cursor_uuid가 transcript에 없을 때. allow_reset=True가 아니면 발생."""
+
+
+def compute_round_window(
+    transcript_path: Path,
+    cursor_uuid: str | None = None,
+    allow_reset: bool = False,
+) -> dict:
     """Capture an atomic snapshot of the transcript for one processing round.
 
     Performs a single sequential scan of the file to collect:
@@ -433,7 +547,9 @@ def compute_round_window(transcript_path: Path, cursor_uuid: str | None = None) 
     cursor_uuid resolution:
       - None  → cursor_line = None  (caller should start from line 0)
       - Found → cursor_line = (that line index + 1), i.e. resume *after* it
-      - Not found → cursor_line = None + WARNING log  (fail-open: restart from 0)
+      - Not found:
+          - allow_reset=True  → cursor_line = None + WARNING log (restart from 0)
+          - allow_reset=False → raise CursorNotFoundError (default; safer)
 
     Returns:
         {
@@ -514,9 +630,17 @@ def compute_round_window(transcript_path: Path, cursor_uuid: str | None = None) 
         # Resume from the line *after* the cursor message
         result["cursor_line"] = cursor_line_found + 1
     else:
-        # cursor_uuid supplied but not found in file — fail-open
+        # cursor_uuid supplied but not found in file
+        # 이전엔 fail-open으로 처음부터 재처리 → LLM이 같은 내용을 두 번 흡수하는 사고 가능.
+        # 기본은 hard fail. --reset-cursor 같은 명시 의사가 있을 때만 restart 허용.
+        if not allow_reset:
+            raise CursorNotFoundError(
+                f"cursor_uuid {cursor_uuid!r} not found in {transcript_path}. "
+                f"Pass --reset-cursor to restart from line 0 explicitly."
+            )
         logger.warning(
-            "[dream-prep] compute_round_window: cursor_uuid %r not found in %s — resetting to line 0",
+            "[dream-prep] compute_round_window: cursor_uuid %r not found in %s — "
+            "allow_reset=True, restarting from line 0",
             cursor_uuid, transcript_path,
         )
         result["cursor_line"] = None
@@ -530,6 +654,7 @@ def extract_partial_conversation(
     max_messages: int = ROUND_MAX_MESSAGES,
     max_chars: int = ROUND_MAX_CHARS,
     max_chunks: int | None = None,
+    allow_reset: bool = False,
 ) -> tuple[list[dict], str | None, dict]:
     """Extract a bounded slice of conversation from cursor_uuid up to cap limits.
 
@@ -564,7 +689,7 @@ def extract_partial_conversation(
                 "window": dict,   # full compute_round_window output
             }
     """
-    window = compute_round_window(transcript_path, cursor_uuid)
+    window = compute_round_window(transcript_path, cursor_uuid, allow_reset=allow_reset)
     start_line = window["cursor_line"] if window["cursor_line"] is not None else 0
     eof_line = window["total_lines"]  # lines 0 .. eof_line-1 are valid
 
@@ -871,6 +996,7 @@ def preprocess_project(
     output_dir: Path | None = None,
     limit: int = 5,
     dry_run: bool = False,
+    reset_cursor: bool = False,
 ) -> None:
     """Preprocess unprocessed transcripts for a project.
 
@@ -879,6 +1005,8 @@ def preprocess_project(
       - active-or-huge (active OR huge): partial extract from cursor_uuid → status="active"
 
     dry_run=True suppresses mark_processed calls (no dream_meta.md side effects).
+    reset_cursor=True allows restarting from line 0 when cursor_uuid is missing
+    (default: hard fail to prevent duplicate memory ingestion).
     """
     unprocessed = find_unprocessed_transcripts(slug)
 
@@ -921,11 +1049,17 @@ def preprocess_project(
                 f" cursor={'set' if cursor_uuid else 'none'})"
             )
 
-            conversation, next_cursor_uuid, stats = extract_partial_conversation(
-                transcript_path,
-                cursor_uuid=cursor_uuid,
-                max_chunks=ROUND_MAX_CHUNKS_ACTIVE,
-            )
+            try:
+                conversation, next_cursor_uuid, stats = extract_partial_conversation(
+                    transcript_path,
+                    cursor_uuid=cursor_uuid,
+                    max_chunks=ROUND_MAX_CHUNKS_ACTIVE,
+                    allow_reset=reset_cursor,
+                )
+            except CursorNotFoundError as exc:
+                print(f"[{slug}] {filename} cursor 미스 (skip): {exc}")
+                print(f"[{slug}] {filename} 재처리하려면 --reset-cursor 플래그 사용")
+                continue
 
             print(
                 f"[{slug}] {filename} partial result:"
@@ -1039,6 +1173,11 @@ def main() -> None:
     p_prep.add_argument("--slug", "-s", required=True, help="Project slug (e.g. -Users-yourname)")
     p_prep.add_argument("--limit", "-n", type=int, default=5, help="Max transcripts to process")
     p_prep.add_argument("--dry-run", action="store_true", help="Skip mark_processed calls (no dream_meta.md changes)")
+    p_prep.add_argument(
+        "--reset-cursor",
+        action="store_true",
+        help="cursor_uuid가 transcript에 없을 때 처음부터 재처리 허용 (기본: hard fail)",
+    )
 
     # list
     sub.add_parser("list", help="List projects with transcripts")
@@ -1061,7 +1200,12 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "prep":
-        preprocess_project(args.slug, limit=args.limit, dry_run=args.dry_run)
+        preprocess_project(
+            args.slug,
+            limit=args.limit,
+            dry_run=args.dry_run,
+            reset_cursor=args.reset_cursor,
+        )
     elif args.command == "list":
         for slug in list_projects():
             count = len(list(get_project_dir(slug).glob("*.jsonl")))

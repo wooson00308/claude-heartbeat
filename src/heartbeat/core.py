@@ -276,6 +276,13 @@ def run_job(job: dict, state: dict) -> bool:
     # Check condition
     if not _check_condition(job):
         log.info(f"[{name}] condition 불충족, 스킵")
+        # condition 불충족도 last_run을 갱신한다. 갱신하지 않으면 interval 만료된 잡이
+        # 매 tick마다 condition 체크를 반복하면서 로그 폭주 + 외부 프로세스 호출이 누적된다.
+        with _state_lock:
+            job_state["last_run"] = datetime.now().isoformat()
+            job_state["last_result"] = "skipped"
+            job_state["last_duration"] = 0
+            _save_state(state)
         return False
 
     cwd = _slug_to_cwd(slug)
