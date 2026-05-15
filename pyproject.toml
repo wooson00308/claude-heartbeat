@@ -1,12 +1,16 @@
 [project]
 name = "claude-heartbeat"
-version = "0.3.0"
+version = "0.4.0"
 description = "Periodic claude agent scheduler — wake Claude on schedule, run skills automatically"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "portalocker>=2.7",  # cross-platform file lock (replaces fcntl)
+    "psutil>=5.9",       # cross-platform process tree termination
+]
 
 [project.optional-dependencies]
 dream = []
+notify = ["plyer>=2.1"]  # cross-platform desktop notifications (optional)
 dev = ["pytest>=7.0", "pytest-cov>=4.0"]
 
 [build-system]

@@ -179,7 +179,7 @@ claude-heartbeat + /dream은 Claude 메모리/세션 기능을 "확장"하되 "�
 
 - transcript 원본 (*.jsonl)은 read-only로만 접근. 어떤 경우에도 flock을 잡지 않는다.
 - Claude Code가 대화를 기록 중인 파일과 동시 접근 시 read-during-write 안전 보장: O_RDONLY + 라운드 윈도우 동결(H 기준) 조합으로 처리.
-- dream_meta.md 수정은 atomic rename + fcntl 락으로만 수행. race condition 없음.
+- dream_meta.md 수정은 atomic rename + portalocker 기반 파일 락으로만 수행. race condition 없음.
 - 기존 메모리 파일 (`~/.claude/projects/{slug}/memory/*.md`) 동작에 영향 0. dream이 쓰는 파일은 dream이 생성한 topic 파일과 MEMORY.md 인덱스뿐.
 - Claude 메모리/세션 내부 메커니즘(CLAUDE.md 로딩, 시스템 프롬프트 주입 등)은 건드리지 않는다.
 
@@ -212,8 +212,8 @@ processed_v2:
 
 - `last_dream` / `last_lint`: LLM이 갱신하는 유일한 필드. 타임스탬프만.
 - `processed:` (legacy): 구파서 호환용 + 마이그레이션 안전망. 신규 코드에서는 읽기만 하고 쓰지 않는다. 두 섹션을 합쳐서 "처리된 파일 전체" 판단.
-- `processed_v2:`: dream-prep CLI가 단독으로 관리. `dream-prep mark` 명령이 fcntl 락 + atomic rename으로 기록. `last_uuid`는 해당 라운드 윈도우의 마지막 leafUuid. `status: active`는 대용량 파일 부분 처리 중임을 의미.
-- 동시성 보장: dream_meta.md 쓰기는 fcntl 락 + atomic rename 조합으로 race condition 제거.
+- `processed_v2:`: dream-prep CLI가 단독으로 관리. `dream-prep mark` 명령이 cross-platform 파일 락 + atomic rename으로 기록. `last_uuid`는 해당 라운드 윈도우의 마지막 leafUuid. `status: active`는 대용량 파일 부분 처리 중임을 의미.
+- 동시성 보장: dream_meta.md 쓰기는 cross-platform 파일 락 + atomic rename 조합으로 race condition 제거.
 
 ## 저장하지 않는 것
 

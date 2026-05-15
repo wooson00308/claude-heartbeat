@@ -1,18 +1,17 @@
 """dream_meta.md 관리.
 
-processed_v2 섹션 파싱 / 마킹 / GC + fcntl lock + atomic rename.
+processed_v2 섹션 파싱 / 마킹 / GC + atomic rename.
+동시성 락은 _lock 모듈에 격리.
 """
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import logging
 import os
 import tempfile
-import time
 from pathlib import Path
 
+from ._lock import _acquire_meta_lock
 from .paths import get_project_dir
 
 logger = logging.getLogger(__name__)
@@ -125,50 +124,6 @@ def get_combined_processed(slug: str) -> set[str]:
     return legacy | v2_keys
 
 
-@contextlib.contextmanager
-def _acquire_meta_lock(slug: str):
-    """Context manager: acquire fcntl exclusive lock on .dream.lock file.
-
-    Waits up to 30 seconds; if lock cannot be acquired, logs and yields anyway
-    (fail-open for operational safety).
-    """
-    lock_path = get_project_dir(slug) / "memory" / ".dream.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        lock_fd = open(lock_path, "w")  # noqa: WPS515
-    except OSError as exc:
-        logger.warning("[dream-prep] lock file open failed: %s — proceeding without lock", exc)
-        yield
-        return
-
-    acquired = False
-    try:
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError:
-                time.sleep(0.1)
-
-        if not acquired:
-            logger.warning("[dream-prep] could not acquire lock within 30 s — proceeding without lock")
-
-        yield
-    finally:
-        if acquired:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        try:
-            lock_fd.close()
-        except OSError:
-            pass
-
-
 def _create_initial_meta(meta_path: Path) -> None:
     """dream_meta.md 정규 포맷 초기 생성. 이미 존재하면 no-op."""
     if meta_path.exists():
@@ -181,7 +136,7 @@ def _create_initial_meta(meta_path: Path) -> None:
 def mark_processed(slug: str, filename: str, last_uuid: str, status: str = "sealed") -> None:
     """Append or update a processed_v2 entry in dream_meta.md.
 
-    Thread/process safe via fcntl lock + atomic rename.
+    Thread/process safe via cross-platform file lock + atomic rename.
     Never raises; logs and returns on any error.
 
     메타 파일이 없으면 정규 포맷으로 자동 초기화한 뒤 마킹을 진행한다.
@@ -263,7 +218,9 @@ def _mark_processed_locked(meta_path: Path, filename: str, last_uuid: str, statu
 
     new_content = "\n".join(lines)
 
-    # Atomic write: tmp file in same dir, then rename
+    # Atomic write: tmp file in same dir, then replace.
+    # os.rename은 윈도우에서 destination이 이미 있으면 실패한다. os.replace는
+    # POSIX/Windows 모두 atomic + 덮어쓰기 보장.
     dir_path = meta_path.parent
     try:
         fd, tmp_path_str = tempfile.mkstemp(dir=dir_path, prefix=".dream_meta_", suffix=".tmp")
@@ -271,7 +228,7 @@ def _mark_processed_locked(meta_path: Path, filename: str, last_uuid: str, statu
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(new_content)
-            os.rename(tmp_path, meta_path)
+            os.replace(tmp_path, meta_path)
         except Exception:
             try:
                 tmp_path.unlink(missing_ok=True)

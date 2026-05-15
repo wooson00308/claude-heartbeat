@@ -1,23 +1,13 @@
 """dream_meta.md 파싱/마킹/GC 회귀 방지 테스트.
 
-특히 v0.2.1 hotfix 보호:
+v0.2.1 hotfix 보호:
 - mark_processed: meta 없을 때 자동 초기화
 - _gc_compact_old_sealed: sealed 누적 시 압축, active 보존
 """
 
 from __future__ import annotations
 
-import sys
-
-import pytest
-
-# fcntl은 POSIX 전용. 윈도우 CI는 Phase 2 전까지 이 테스트 모듈 통째로 스킵.
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="meta module uses fcntl (POSIX only) — cross-platform 작업은 Phase 2",
-)
-
-from skills.dream import meta  # noqa: E402
+from skills.dream import meta
 
 
 def test_parse_meta_v2_missing_file(project_dir, slug):

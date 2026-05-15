@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -216,6 +217,13 @@ def main() -> None:
     p_status = sub.add_parser("status", help="Show processing status for a project")
     p_status.add_argument("--slug", "-s", required=True, help="Project slug")
 
+    # check-unprocessed (heartbeat condition용 — exit code만 보면 됨, 셸 의존 0)
+    p_check = sub.add_parser(
+        "check-unprocessed",
+        help="Exit 0 if there are unprocessed transcripts, else exit 1 (for heartbeat condition)",
+    )
+    p_check.add_argument("--slug", "-s", required=True, help="Project slug")
+
     # classify
     p_classify = sub.add_parser("classify", help="Show processing eligibility for all transcripts in a project")
     p_classify.add_argument("--slug", "-s", required=True, help="Project slug")
@@ -244,6 +252,9 @@ def main() -> None:
         unprocessed = find_unprocessed_transcripts(args.slug)
         total = len(list(get_project_dir(args.slug).glob("*.jsonl")))
         print(f"  전체: {total}, 처리됨: {total - len(unprocessed)}, 미처리: {len(unprocessed)}")
+    elif args.command == "check-unprocessed":
+        unprocessed = find_unprocessed_transcripts(args.slug)
+        sys.exit(0 if unprocessed else 1)
     elif args.command == "classify":
         project_dir = get_project_dir(args.slug)
         jsonl_files = sorted(project_dir.glob("*.jsonl"))
