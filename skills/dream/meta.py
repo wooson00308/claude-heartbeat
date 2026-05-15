@@ -218,7 +218,9 @@ def _mark_processed_locked(meta_path: Path, filename: str, last_uuid: str, statu
 
     new_content = "\n".join(lines)
 
-    # Atomic write: tmp file in same dir, then rename
+    # Atomic write: tmp file in same dir, then replace.
+    # os.rename은 윈도우에서 destination이 이미 있으면 실패한다. os.replace는
+    # POSIX/Windows 모두 atomic + 덮어쓰기 보장.
     dir_path = meta_path.parent
     try:
         fd, tmp_path_str = tempfile.mkstemp(dir=dir_path, prefix=".dream_meta_", suffix=".tmp")
@@ -226,7 +228,7 @@ def _mark_processed_locked(meta_path: Path, filename: str, last_uuid: str, statu
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(new_content)
-            os.rename(tmp_path, meta_path)
+            os.replace(tmp_path, meta_path)
         except Exception:
             try:
                 tmp_path.unlink(missing_ok=True)
