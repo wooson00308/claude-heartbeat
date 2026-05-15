@@ -175,3 +175,54 @@ def test_run_job_condition_failed_persists_to_disk(isolated_state, monkeypatch):
     persisted = json.loads(state_file.read_text(encoding="utf-8"))
     assert persisted["test-job"]["last_result"] == "skipped"
     assert persisted["test-job"]["last_run"]
+
+
+# --- v0.6.0: condition 검사 fail-closed (issue #10) ---
+#
+# 이전엔 timeout / exception 시 True 반환(fail-open)이라 dream-prep 깨지면
+# 매 tick마다 claude를 깨워서 토큰 비용 누적. 이제 둘 다 False (skip).
+
+def test_check_condition_timeout_returns_false(monkeypatch):
+    """condition 명령이 타임아웃 → fail-closed (skip)."""
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0] if args else "x", timeout=10)
+
+    monkeypatch.setattr(core.subprocess, "run", _timeout)
+    assert core._check_condition({"name": "j", "condition": "sleep 999"}) is False
+
+
+def test_check_condition_exception_returns_false(monkeypatch):
+    """condition 명령에서 예외(예: bin 없음, OSError) → fail-closed."""
+    def _boom(*args, **kwargs):
+        raise FileNotFoundError("dream-prep: command not found")
+
+    monkeypatch.setattr(core.subprocess, "run", _boom)
+    assert core._check_condition({"name": "j", "condition": "dream-prep status"}) is False
+
+
+def test_check_condition_empty_condition_returns_true():
+    """condition 미지정 시 무조건 통과 (디폴트 동작 그대로)."""
+    assert core._check_condition({"name": "j", "condition": ""}) is True
+    assert core._check_condition({"name": "j"}) is True
+
+
+def test_check_condition_zero_exit_returns_true(monkeypatch):
+    """exit 0 → True (정상 흐름이 깨지지 않았는지)."""
+    monkeypatch.setattr(
+        core.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""),
+    )
+    assert core._check_condition({"name": "j", "condition": "true"}) is True
+
+
+def test_check_condition_nonzero_exit_returns_false(monkeypatch):
+    """exit non-zero → False (정상 흐름이 깨지지 않았는지)."""
+    monkeypatch.setattr(
+        core.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""),
+    )
+    assert core._check_condition({"name": "j", "condition": "false"}) is False
+
+
+# `subprocess` 모듈은 fixture에서 monkeypatch하지만 ImportError 방지용 top-level import.
+import subprocess  # noqa: E402, I001  (intentionally placed here for the tests above)

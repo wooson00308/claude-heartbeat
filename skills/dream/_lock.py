@@ -1,7 +1,11 @@
 """dream_meta.md 동시성 보호 락.
 
 portalocker 기반 cross-platform 파일 락. 윈도우/macOS/Linux 동일 동작.
-fcntl 직접 호출은 Phase 2에서 제거됨 (v0.4.0).
+
+v0.6.0: 락 타임아웃 시 fail-closed (이전엔 warning 후 lock 없이 yield).
+LockTimeout 예외를 raise하고, 호출처(mark_processed)의 try/except가 잡아서
+logger.warning + return 처리. dream_meta.md cursor state의 race로 인한
+중복 흡수 / 라운드 윈도우 누락 위험 차단.
 """
 
 from __future__ import annotations
@@ -19,12 +23,17 @@ logger = logging.getLogger(__name__)
 LOCK_TIMEOUT_SEC = 30.0
 
 
+class LockTimeout(RuntimeError):
+    """LOCK_TIMEOUT_SEC 안에 dream_meta.md 락을 잡지 못함."""
+
+
 @contextlib.contextmanager
 def _acquire_meta_lock(slug: str):
     """Context manager: acquire exclusive lock on .dream.lock file.
 
-    Waits up to LOCK_TIMEOUT_SEC; if lock cannot be acquired, logs and yields
-    anyway (fail-open for operational safety).
+    Waits up to LOCK_TIMEOUT_SEC. 못 잡으면 LockTimeout raise (fail-closed).
+    lock 파일 자체를 못 열면 fail-open으로 yield (lock 디렉토리 권한 등은
+    main flow를 죽일 만한 사고는 아니라고 판단).
     """
     lock_path = get_project_dir(slug) / "memory" / ".dream.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,9 +57,8 @@ def _acquire_meta_lock(slug: str):
                 time.sleep(0.1)
 
         if not acquired:
-            logger.warning(
-                "[dream-prep] could not acquire lock within %.0f s — proceeding without lock",
-                LOCK_TIMEOUT_SEC,
+            raise LockTimeout(
+                f"could not acquire dream meta lock within {LOCK_TIMEOUT_SEC:.0f}s"
             )
 
         yield

@@ -35,7 +35,7 @@ The daemon never calls the LLM itself. It only decides when to wake it.
 
 ## What can you run?
 
-The `prompt` field accepts anything — a plain sentence, a skill command, or a reference to documentation. Heartbeat doesn't care what the prompt says. It just passes it to `claude -p`.
+The `prompt` field accepts any single-line value — a plain sentence, a skill command, or a reference to documentation. Heartbeat doesn't care what the prompt says; it just passes it to `claude -p`. For longer or multi-step prompts, write a Claude skill and reference it (e.g. `prompt: /dream`).
 
 ### Plain prompts
 
