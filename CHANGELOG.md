@@ -2,6 +2,29 @@
 
 이 프로젝트의 주요 변경사항을 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/) 1.1.0을 따른다.
 
+## [0.3.0] - 2026-05-15
+
+### Changed
+
+- dream-prep: 단일 1240줄 `preprocess.py`를 책임 단위 4모듈로 분리. 외부 동작 변화 없음.
+  - `skills/dream/paths.py`: 공통 PROJECTS_DIR / get_project_dir
+  - `skills/dream/meta.py`: dream_meta.md 파싱·마킹·GC·fcntl lock
+  - `skills/dream/window.py`: classify_transcript / compute_round_window / find_unprocessed
+  - `skills/dream/extract.py`: 대화 추출·코드 압축·도구 호출 합치기·라운드 캡
+  - `skills/dream/cli.py`: argparse + main + preprocess_project
+- pyproject: `dream-prep` entry point를 `skills.dream.preprocess:main` → `skills.dream.cli:main`으로 갱신.
+
+### Added
+
+- `tests/`: pytest 기반 단위 테스트 32개. v0.2.1 hotfix(자동 초기화 / GC / cursor hard fail / huge bypass) 회귀 방지 포함.
+- `pip install -e .[dev]`로 pytest + pytest-cov 설치 가능.
+- `.github/workflows/ci.yml`: ubuntu / macOS × Python 3.11 / 3.12 매트릭스 CI. windows는 Phase 2(POSIX 의존 제거) 전까지 `continue-on-error` 자리만 잡아둠.
+
+### Migration
+
+- 호환성 변경 없음. `dream-prep` / `heartbeat` CLI 시그니처, HEARTBEAT.md, dream_meta.md 모두 그대로 동작.
+- `from skills.dream.preprocess import ...`로 직접 import 하던 외부 코드가 있다면 모듈명 변경 필요 (없을 것으로 가정하고 shim 안 둠).
+
 ## [0.2.1] - 2026-05-14
 
 ### Fixed

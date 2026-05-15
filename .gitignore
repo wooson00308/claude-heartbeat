@@ -4,3 +4,7 @@ __pycache__/
 dist/
 build/
 .DS_Store
+.serena/
+.pytest_cache/
+.coverage
+htmlcov/
