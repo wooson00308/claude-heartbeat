@@ -2,6 +2,32 @@
 
 이 프로젝트의 주요 변경사항을 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/) 1.1.0을 따른다.
 
+## [0.5.0] - 2026-05-15
+
+### Added
+
+- Linux systemd 통합. `heartbeat install-service`가 Linux에서 `~/.config/systemd/user/claude-heartbeat.service` user unit을 자동 생성하고 `systemctl --user daemon-reload && systemctl --user enable --now claude-heartbeat.service`까지 실행한다. 로그아웃 후에도 돌리려면 `loginctl enable-linger $USER`를 별도 안내.
+- `heartbeat uninstall-service`가 Linux에서 `disable --now` + unit 파일 삭제 + `daemon-reload`까지 처리. 환경 이전(systemctl 부재 + unit 파일만 잔존) 케이스도 정리.
+- `--print-only` 모드에서 systemd unit 내용 + install/enable 명령 + 자가검증용 `systemctl --user status` + linger 안내 + DBUS/XDG_RUNTIME_DIR 주의 문구까지 출력. 실제 부수효과 0.
+- `heartbeat uninstall-service`도 `--print-only` 지원 (어댑터 인터페이스 비대칭 해소).
+- 어댑터별 회귀 테스트 5종: systemctl 부재 graceful fail / 부분 실패(daemon-reload OK / enable FAIL) 시 unit 파일 보존 + 재시도 안내 / print-only 부수효과 0 / uninstall 환경 이전 / unit 파일 write 권한 실패.
+
+### Changed
+
+- `service.py`(317줄) → `service/` 패키지로 분리: `base.py` (ServiceAdapter 추상) / `launchd.py` / `task_scheduler.py` / `systemd.py` / `__init__.py` (디스패처).
+- 어댑터 클래스화 — `ServiceAdapter`를 상속해 `render` / `install` / `uninstall`만 구현. 새 어댑터 추가는 `ADAPTERS` dict 한 줄 등록 (linux는 startswith라 별도 분기).
+- `install_service` / `uninstall_service` 디스패처가 `sys.platform` 분기 1곳으로 통일. 이전엔 install / uninstall 함수에 분기가 두 군데 복붙됐음.
+- 어댑터 인터페이스 일관성: `_install_task_scheduler`에 `render` 분리, `_uninstall_*`에 `print_only` 추가, 모든 어댑터가 동일 시그니처.
+- systemd 어댑터: `daemon-reload`와 `enable --now`를 분리 실행. enable에서만 실패하면 unit 파일을 보존하고 "enable만 다시 시도" 안내 + 가능 원인(SSH 세션의 DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR 미설정) 한 줄.
+- `cli.py`의 install-service / uninstall-service 지연 import 제거 → top-level (이득 0이었음).
+- README Prerequisites: "macOS / Windows / Linux".
+
+### Migration
+
+- 호환성 변경 없음. CLI 시그니처 / HEARTBEAT.md / 기존 launchd plist 모두 그대로 동작.
+- Linux 사용자: `heartbeat install-service` 한 줄로 등록 완료. enable-linger는 선택.
+- `from heartbeat.service import install_service, uninstall_service`는 동일 (패키지 분리는 internal).
+
 ## [0.4.0] - 2026-05-15
 
 ### Added

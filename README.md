@@ -74,7 +74,7 @@ See [skills/dream/README.md](skills/dream/README.md) for details.
 
 ## Prerequisites
 
-- macOS / Windows (Linux systemd integration is Phase 3)
+- macOS / Windows / Linux
 - Python 3.11+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 
@@ -153,7 +153,7 @@ heartbeat once                 # Run all jobs once
 heartbeat once -j "name"       # Run specific job once
 heartbeat skills               # List available skills
 heartbeat install <name>       # Install a skill
-heartbeat install-service      # Register with launchd (macOS) / Task Scheduler (Windows)
+heartbeat install-service      # Register with launchd (macOS) / Task Scheduler (Windows) / systemd (Linux)
 heartbeat uninstall-service    # Remove the OS scheduler entry
 ```
 
