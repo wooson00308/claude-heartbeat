@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .meta import get_combined_processed
+from .meta import get_dream_meta, parse_meta_v2
 from .paths import get_project_dir
 
 logger = logging.getLogger(__name__)
@@ -150,17 +150,29 @@ def classify_transcript(transcript_path: Path) -> dict:
 def find_unprocessed_transcripts(slug: str) -> list[Path]:
     """Find transcript JSONL files not yet processed by /dream.
 
-    Applies classify_transcript gate: active small files are excluded.
-    Huge active files bypass the mtime gate and are included.
+    처리됨 판정:
+    - legacy `processed:` 항목 → 완전히 끝남, 스킵
+    - v2 `status: sealed` → 완전히 끝남, 스킵
+    - v2 `status: active` → 부분 처리, 다음 라운드에서 cursor부터 이어 처리.
+      classify gate(active small은 제외 / huge는 강제 처리)가 통과시키면 잡힘
+    - 마킹 없음 → 신규 파일, classify gate 통과 시 잡힘
+
+    이전엔 active도 "처리됨" set에 들어가서 영영 안 잡혔다 (issue #9).
     """
     project_dir = get_project_dir(slug)
-    processed = get_combined_processed(slug)
+    legacy = get_dream_meta(slug).get("processed", set())
+    v2 = parse_meta_v2(slug)
 
     transcripts = []
     for f in sorted(project_dir.glob("*.jsonl")):
-        if f.name not in processed:
-            if classify_transcript(f)["should_process"]:
-                transcripts.append(f)
+        if f.name in legacy:
+            continue
+        meta = v2.get(f.name)
+        if meta and meta.get("status") == "sealed":
+            continue
+        # 신규 또는 active → classify gate
+        if classify_transcript(f)["should_process"]:
+            transcripts.append(f)
 
     return transcripts
 

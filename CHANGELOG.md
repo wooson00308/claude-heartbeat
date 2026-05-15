@@ -2,6 +2,24 @@
 
 이 프로젝트의 주요 변경사항을 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/) 1.1.0을 따른다.
 
+## [0.5.2] - 2026-05-15
+
+### Fixed
+
+- `find_unprocessed_transcripts()`가 v2 `status: active` 마킹된 파일을 영영 스킵하던 회귀 (issue #9). 이전 구현은 `get_combined_processed()`로 legacy + v2 모든 파일명을 union해서 active도 "처리됨"으로 간주했다. 결과: 라운드 윈도우 동결 후 Claude가 transcript에 더 append해도 다음 라운드에서 잡히지 않음 → cursor 이어쓰기 자체가 망가짐.
+
+### Changed
+
+- `find_unprocessed_transcripts()` 판정 로직: legacy entry는 sealed로, v2 entry는 `status` 필드 분기 (sealed면 skip / active면 classify gate가 통과시키면 잡힘). 신규 파일은 그대로 gate만 통과하면 잡힘.
+
+### Added
+
+- 회귀 테스트 5종: 신규 파일 / legacy 마킹 / v2 sealed / v2 active huge(핵심 회귀) / active 작은 파일(gate 차단).
+
+### Migration
+
+- 호환성 변경 없음. dream_meta.md 형식 그대로. 기존 active 마킹된 파일들이 다음 dream 사이클부터 다시 잡혀서 cursor 이어쓰기가 정상 동작.
+
 ## [0.5.1] - 2026-05-15
 
 ### Fixed
