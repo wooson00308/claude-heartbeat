@@ -73,54 +73,11 @@ def extract_partial_conversation(
                 except json.JSONDecodeError:
                     continue
 
-                msg_type = obj.get("type")
-                if msg_type not in {"user", "assistant"}:
+                turn = _parse_turn(obj)
+                if turn is None:
                     continue
 
-                timestamp = obj.get("timestamp", "")
                 uid = obj.get("uuid")
-
-                if msg_type == "user":
-                    content = obj.get("message", {}).get("content", "")
-                    if isinstance(content, str):
-                        text = content.strip()
-                        if not text or text.startswith("<") or len(text) <= 2:
-                            continue
-                        turn = {"role": "user", "text": text, "time": timestamp}
-                    else:
-                        continue
-
-                else:  # assistant
-                    content = obj.get("message", {}).get("content", [])
-                    if isinstance(content, list):
-                        texts = []
-                        tool_names = []
-                        for block in content:
-                            if not isinstance(block, dict):
-                                continue
-                            if block.get("type") == "text":
-                                t = block.get("text", "").strip()
-                                if t:
-                                    texts.append(t)
-                            elif block.get("type") == "tool_use":
-                                tool_names.append(block.get("name", "?"))
-                        if texts:
-                            turn = {
-                                "role": "assistant",
-                                "text": "\n".join(texts),
-                                "time": timestamp,
-                            }
-                        elif tool_names:
-                            turn = {
-                                "role": "assistant",
-                                "text": f"[도구 호출: {', '.join(tool_names)}]",
-                                "time": timestamp,
-                            }
-                        else:
-                            continue
-                    else:
-                        continue
-
                 turn_chars = len(str(turn["text"]))
                 conversation.append(turn)
                 if uid:
@@ -150,6 +107,60 @@ def extract_partial_conversation(
     }
 
     return conversation, next_cursor_uuid, stats
+
+
+def _parse_turn(obj: dict) -> dict | None:
+    """JSONL line 객체에서 user/assistant turn 추출.
+
+    user: 문자열 content + 3자 초과 + `<` 시작 안 함 (system message 노이즈 제거).
+    assistant: text 블록(우선) 또는 tool_use 블록 합쳐서 "[도구 호출: ...]" 형식.
+
+    반환: {"role", "text", "time"} 또는 조건 위반 시 None.
+
+    extract_conversation(전체)과 extract_partial_conversation(부분) 둘 다 호출.
+    한쪽 버그 수정이 다른 쪽으로 드리프트하던 위험 차단.
+    """
+    msg_type = obj.get("type")
+    if msg_type not in {"user", "assistant"}:
+        return None
+
+    timestamp = obj.get("timestamp", "")
+
+    if msg_type == "user":
+        content = obj.get("message", {}).get("content", "")
+        if not isinstance(content, str):
+            return None
+        text = content.strip()
+        if not text or text.startswith("<") or len(text) <= 2:
+            return None
+        return {"role": "user", "text": text, "time": timestamp}
+
+    # assistant
+    content = obj.get("message", {}).get("content", [])
+    if not isinstance(content, list):
+        return None
+
+    texts: list[str] = []
+    tool_names: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            t = block.get("text", "").strip()
+            if t:
+                texts.append(t)
+        elif block.get("type") == "tool_use":
+            tool_names.append(block.get("name", "?"))
+
+    if texts:
+        return {"role": "assistant", "text": "\n".join(texts), "time": timestamp}
+    if tool_names:
+        return {
+            "role": "assistant",
+            "text": f"[도구 호출: {', '.join(tool_names)}]",
+            "time": timestamp,
+        }
+    return None
 
 
 def _compress_code_blocks(text: str) -> str:
@@ -195,55 +206,17 @@ def _compress_code_blocks(text: str) -> str:
 def extract_conversation(transcript_path: Path) -> list[dict]:
     """Extract meaningful conversation turns from a transcript JSONL."""
     lines = transcript_path.read_text(encoding="utf-8").strip().split("\n")
-    conversation = []
+    conversation: list[dict] = []
 
     for line in lines:
         try:
             obj = json.loads(line)
-            msg_type = obj.get("type", "")
-            timestamp = obj.get("timestamp", "")
-
-            if msg_type == "user":
-                content = obj.get("message", {}).get("content", "")
-                if isinstance(content, str):
-                    text = content.strip()
-                    if text and not text.startswith("<") and len(text) > 2:
-                        conversation.append({
-                            "role": "user",
-                            "text": text,
-                            "time": timestamp,
-                        })
-
-            elif msg_type == "assistant":
-                content = obj.get("message", {}).get("content", [])
-                if isinstance(content, list):
-                    texts = []
-                    tool_names = []
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        if block.get("type") == "text":
-                            t = block.get("text", "").strip()
-                            if t:
-                                texts.append(t)
-                        elif block.get("type") == "tool_use":
-                            tool_names.append(block.get("name", "?"))
-
-                    if texts:
-                        conversation.append({
-                            "role": "assistant",
-                            "text": "\n".join(texts),
-                            "time": timestamp,
-                        })
-                    elif tool_names:
-                        conversation.append({
-                            "role": "assistant",
-                            "text": f"[도구 호출: {', '.join(tool_names)}]",
-                            "time": timestamp,
-                        })
-
         except (json.JSONDecodeError, KeyError, TypeError):
             continue
+
+        turn = _parse_turn(obj)
+        if turn is not None:
+            conversation.append(turn)
 
     return conversation
 

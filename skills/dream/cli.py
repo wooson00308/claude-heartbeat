@@ -35,9 +35,9 @@ def preprocess_project(
 ) -> None:
     """Preprocess unprocessed transcripts for a project.
 
-    Branches per transcript:
-      - sealed-candidate (not active AND not huge): full extract → status="sealed"
-      - active-or-huge (active OR huge): partial extract from cursor_uuid → status="active"
+    각 transcript는 classify_transcript 결과에 따라 두 갈래로 위임된다:
+      - sealed-candidate (not active AND not huge) → _process_sealed
+      - active-or-huge (active OR huge)            → _process_active_or_huge
 
     dry_run=True suppresses mark_processed calls (no dream_meta.md side effects).
     reset_cursor=True allows restarting from line 0 when cursor_uuid is missing
@@ -62,111 +62,140 @@ def preprocess_project(
     processed_count = 0
 
     for transcript_path in batch:
-        session_id = transcript_path.stem
-        filename = transcript_path.name
         cls = classify_transcript(transcript_path)
-
-        is_active = cls["is_active"]
-        is_huge = cls["is_huge"]
-        use_partial = is_active or is_huge
+        use_partial = cls["is_active"] or cls["is_huge"]
 
         if use_partial:
-            # --- 분기 B: active OR huge — 부분 처리 ---
-            file_meta = meta_v2.get(filename, {})
-            cursor_uuid: str | None = file_meta.get("last_uuid") or None
-
-            print(
-                f"[{slug}] {filename} → active-or-huge"
-                f" (active={is_active}, huge={is_huge},"
-                f" size={cls['size_bytes'] // 1024}KB,"
-                f" cursor={'set' if cursor_uuid else 'none'})"
+            handled = _process_active_or_huge(
+                transcript_path, slug, cls, meta_v2, output_dir, dry_run, reset_cursor,
             )
-
-            try:
-                conversation, next_cursor_uuid, stats = extract_partial_conversation(
-                    transcript_path,
-                    cursor_uuid=cursor_uuid,
-                    max_chunks=ROUND_MAX_CHUNKS_ACTIVE,
-                    allow_reset=reset_cursor,
-                )
-            except CursorNotFoundError as exc:
-                print(f"[{slug}] {filename} cursor 미스 (skip): {exc}")
-                print(f"[{slug}] {filename} 재처리하려면 --reset-cursor 플래그 사용")
-                continue
-
-            print(
-                f"[{slug}] {filename} partial result:"
-                f" messages={stats['messages_processed']},"
-                f" chars={stats['chars_processed']},"
-                f" hit_cap={stats['hit_cap']},"
-                f" next_cursor={'set' if next_cursor_uuid else 'none'}"
-            )
-
-            if not conversation:
-                print(f"[{slug}] {filename} 처리 가능한 메시지 없음 (skip mark)")
-                continue
-
-            md = conversation_to_markdown(session_id, conversation)
-            if not md:
-                continue
-
-            round_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_short = session_id[:12]
-            output_file = output_dir / f"prep_{session_short}_partial_{round_ts}.md"
-            output_file.write_text(
-                f"# Dream Prep (partial) — {slug}\n\n"
-                f"파일: {filename}\ncursor: {cursor_uuid or 'start'} → {next_cursor_uuid}\n"
-                f"hit_cap: {stats['hit_cap']}\n\n---\n\n{md}",
-                encoding="utf-8",
-            )
-            print(f"[{slug}] → {output_file}")
-
-            if next_cursor_uuid is None:
-                print(f"[{slug}] {filename} next_cursor_uuid=None → mark_processed 스킵")
-            else:
-                _maybe_mark(dry_run, slug, filename, next_cursor_uuid, "active")
-
         else:
-            # --- 분기 A: sealed-candidate — 전체 처리 ---
-            print(
-                f"[{slug}] {filename} → sealed-candidate"
-                f" (size={cls['size_bytes'] // 1024}KB,"
-                f" age={cls['mtime_age_seconds'] / 60:.1f}min)"
+            handled = _process_sealed(
+                transcript_path, slug, cls, output_dir, dry_run,
             )
 
-            conversation = extract_conversation(transcript_path)
-
-            if not conversation:
-                print(f"[{slug}] {filename} 의미 있는 대화 없음")
-                continue
-
-            md = conversation_to_markdown(session_id, conversation)
-            if not md:
-                continue
-
-            # uuid 보존 안 됨(extract_conversation은 role/text/time만) → 별도 호출
-            last_uuid = extract_last_message_uuid(transcript_path)
-
-            print(
-                f"[{slug}] {filename} sealed result:"
-                f" turns={len(conversation)},"
-                f" last_uuid={'set' if last_uuid else 'none'}"
-            )
-
-            round_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_short = session_id[:12]
-            output_file = output_dir / f"prep_{session_short}_{round_ts}.md"
-            output_file.write_text(
-                f"# Dream Prep — {slug}\n\n처리 대상: {filename}\n\n---\n\n{md}",
-                encoding="utf-8",
-            )
-            print(f"[{slug}] → {output_file}")
-
-            _maybe_mark(dry_run, slug, filename, last_uuid or "", "sealed")
-
-        processed_count += 1
+        if handled:
+            processed_count += 1
 
     print(f"[{slug}] 완료: {processed_count}개 처리" + (" [dry-run]" if dry_run else ""))
+
+
+def _process_active_or_huge(
+    transcript_path: Path,
+    slug: str,
+    cls: dict,
+    meta_v2: dict,
+    output_dir: Path,
+    dry_run: bool,
+    reset_cursor: bool,
+) -> bool:
+    """active 또는 huge transcript에 대한 부분 처리. processed=True if handled, False if skipped."""
+    session_id = transcript_path.stem
+    filename = transcript_path.name
+    file_meta = meta_v2.get(filename, {})
+    cursor_uuid: str | None = file_meta.get("last_uuid") or None
+
+    print(
+        f"[{slug}] {filename} → active-or-huge"
+        f" (active={cls['is_active']}, huge={cls['is_huge']},"
+        f" size={cls['size_bytes'] // 1024}KB,"
+        f" cursor={'set' if cursor_uuid else 'none'})"
+    )
+
+    try:
+        conversation, next_cursor_uuid, stats = extract_partial_conversation(
+            transcript_path,
+            cursor_uuid=cursor_uuid,
+            max_chunks=ROUND_MAX_CHUNKS_ACTIVE,
+            allow_reset=reset_cursor,
+        )
+    except CursorNotFoundError as exc:
+        print(f"[{slug}] {filename} cursor 미스 (skip): {exc}")
+        print(f"[{slug}] {filename} 재처리하려면 --reset-cursor 플래그 사용")
+        return False
+
+    print(
+        f"[{slug}] {filename} partial result:"
+        f" messages={stats['messages_processed']},"
+        f" chars={stats['chars_processed']},"
+        f" hit_cap={stats['hit_cap']},"
+        f" next_cursor={'set' if next_cursor_uuid else 'none'}"
+    )
+
+    if not conversation:
+        print(f"[{slug}] {filename} 처리 가능한 메시지 없음 (skip mark)")
+        return False
+
+    md = conversation_to_markdown(session_id, conversation)
+    if not md:
+        return False
+
+    round_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_short = session_id[:12]
+    output_file = output_dir / f"prep_{session_short}_partial_{round_ts}.md"
+    output_file.write_text(
+        f"# Dream Prep (partial) — {slug}\n\n"
+        f"파일: {filename}\ncursor: {cursor_uuid or 'start'} → {next_cursor_uuid}\n"
+        f"hit_cap: {stats['hit_cap']}\n\n---\n\n{md}",
+        encoding="utf-8",
+    )
+    print(f"[{slug}] → {output_file}")
+
+    if next_cursor_uuid is None:
+        print(f"[{slug}] {filename} next_cursor_uuid=None → mark_processed 스킵")
+    else:
+        _maybe_mark(dry_run, slug, filename, next_cursor_uuid, "active")
+
+    return True
+
+
+def _process_sealed(
+    transcript_path: Path,
+    slug: str,
+    cls: dict,
+    output_dir: Path,
+    dry_run: bool,
+) -> bool:
+    """sealed-candidate transcript의 전체 처리. processed=True if handled, False if skipped."""
+    session_id = transcript_path.stem
+    filename = transcript_path.name
+
+    print(
+        f"[{slug}] {filename} → sealed-candidate"
+        f" (size={cls['size_bytes'] // 1024}KB,"
+        f" age={cls['mtime_age_seconds'] / 60:.1f}min)"
+    )
+
+    conversation = extract_conversation(transcript_path)
+
+    if not conversation:
+        print(f"[{slug}] {filename} 의미 있는 대화 없음")
+        return False
+
+    md = conversation_to_markdown(session_id, conversation)
+    if not md:
+        return False
+
+    # uuid 보존 안 됨(extract_conversation은 role/text/time만) → 별도 호출
+    last_uuid = extract_last_message_uuid(transcript_path)
+
+    print(
+        f"[{slug}] {filename} sealed result:"
+        f" turns={len(conversation)},"
+        f" last_uuid={'set' if last_uuid else 'none'}"
+    )
+
+    round_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_short = session_id[:12]
+    output_file = output_dir / f"prep_{session_short}_{round_ts}.md"
+    output_file.write_text(
+        f"# Dream Prep — {slug}\n\n처리 대상: {filename}\n\n---\n\n{md}",
+        encoding="utf-8",
+    )
+    print(f"[{slug}] → {output_file}")
+
+    _maybe_mark(dry_run, slug, filename, last_uuid or "", "sealed")
+    return True
 
 
 def _maybe_mark(dry_run: bool, slug: str, filename: str, last_uuid: str, status: str) -> None:
