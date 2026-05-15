@@ -74,7 +74,7 @@ See [skills/dream/README.md](skills/dream/README.md) for details.
 
 ## Prerequisites
 
-- macOS (launchd-based automation)
+- macOS / Windows (Linux systemd integration is Phase 3)
 - Python 3.11+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 
@@ -92,11 +92,14 @@ heartbeat jobs
 # Test run
 heartbeat once
 
-# Start daemon
+# Register with the OS background scheduler (launchd / Task Scheduler)
+heartbeat install-service
+
+# Or run in the foreground for testing
 heartbeat start
 ```
 
-For launchd registration and detailed setup, see the [Setup Guide](docs/setup.md).
+For manual setup, log paths, and the launchd / Task Scheduler details, see the [Setup Guide](docs/setup.md).
 
 ## Configuration
 
@@ -142,15 +145,16 @@ Global settings go before any `##` job header:
 ## CLI
 
 ```bash
-heartbeat start           # Start daemon (background)
-heartbeat start -f        # Foreground mode
-heartbeat stop            # Stop daemon
-heartbeat status          # Status + job states + recent logs
-heartbeat jobs            # List configured jobs
-heartbeat once            # Run all jobs once
-heartbeat once -j "name"  # Run specific job once
-heartbeat skills          # List available skills
-heartbeat install <name>  # Install a skill
+heartbeat start                # Start in foreground (since v0.4.0; OS scheduler handles backgrounding)
+heartbeat stop                 # Stop running heartbeat
+heartbeat status               # Status + job states + recent logs
+heartbeat jobs                 # List configured jobs
+heartbeat once                 # Run all jobs once
+heartbeat once -j "name"       # Run specific job once
+heartbeat skills               # List available skills
+heartbeat install <name>       # Install a skill
+heartbeat install-service      # Register with launchd (macOS) / Task Scheduler (Windows)
+heartbeat uninstall-service    # Remove the OS scheduler entry
 ```
 
 ## Migration from v0.1

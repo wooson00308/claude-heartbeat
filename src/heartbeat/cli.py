@@ -195,8 +195,12 @@ def main() -> None:
     sub.add_parser("init", help="Initialize heartbeat (create HEARTBEAT.md)")
 
     # start
-    p_start = sub.add_parser("start", help="Start heartbeat daemon")
-    p_start.add_argument("--foreground", "-f", action="store_true", help="Run in foreground")
+    p_start = sub.add_parser("start", help="Start heartbeat (foreground)")
+    p_start.add_argument(
+        "--foreground", "-f",
+        action="store_true",
+        help="(deprecated since v0.4.0) start는 항상 foreground 동작. 인자만 유지.",
+    )
 
     # stop
     sub.add_parser("stop", help="Stop heartbeat daemon")
@@ -219,6 +223,20 @@ def main() -> None:
     p_install.add_argument("skill", help="Skill name to install")
     p_install.add_argument("--slug", "-s", help="Project slug (auto-detected if omitted)")
 
+    # install-service / uninstall-service (OS background scheduler 등록)
+    p_install_service = sub.add_parser(
+        "install-service",
+        help="Register heartbeat with the OS background scheduler (launchd / Task Scheduler)",
+    )
+    p_install_service.add_argument(
+        "--print-only", action="store_true",
+        help="실제 등록 없이 등록 명령/파일 내용만 출력",
+    )
+    sub.add_parser(
+        "uninstall-service",
+        help="Remove heartbeat from the OS background scheduler",
+    )
+
     args = parser.parse_args()
 
     if args.command == "start":
@@ -227,42 +245,23 @@ def main() -> None:
             print(f"Heartbeat 이미 실행 중 (PID {existing})")
             sys.exit(1)
 
+        # v0.4.0: 데몬 detach(os.fork/os.setsid) 제거. 항상 foreground 동작.
+        # 백그라운드 실행은 OS 스케줄러(launchd / systemd / Task Scheduler)에
+        # 위임한다. 윈도우는 fork 자체가 없어 cross-platform 일관성을 위해
+        # detach 모드를 일괄 제거. --foreground 플래그는 호환을 위해 인자만
+        # 유지하며 동작상 noop.
         _setup_log_file()
+        _write_pid()
 
-        if args.foreground:
-            _write_pid()
+        def _shutdown(_sig, _frame):
+            from heartbeat.core import log
+            log.info("Heartbeat 종료")
+            _remove_pid()
+            sys.exit(0)
 
-            def _shutdown(_sig, _frame):
-                from heartbeat.core import log
-                log.info("Heartbeat 종료")
-                _remove_pid()
-                sys.exit(0)
-
-            signal.signal(signal.SIGTERM, _shutdown)
-            signal.signal(signal.SIGINT, _shutdown)
-            heartbeat_loop()
-        else:
-            pid = os.fork()
-            if pid > 0:
-                print(f"Heartbeat 시작 (PID {pid})")
-                sys.exit(0)
-
-            os.setsid()
-            _write_pid()
-            _setup_log_file()
-
-            sys.stdout = open(LOG_DIR / "stdout.log", "a")
-            sys.stderr = open(LOG_DIR / "stderr.log", "a")
-
-            def _shutdown(_sig, _frame):
-                from heartbeat.core import log
-                log.info("Heartbeat 종료")
-                _remove_pid()
-                sys.exit(0)
-
-            signal.signal(signal.SIGTERM, _shutdown)
-            signal.signal(signal.SIGINT, _shutdown)
-            heartbeat_loop()
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+        heartbeat_loop()
 
     elif args.command == "stop":
         existing = _is_running()
@@ -324,6 +323,14 @@ def main() -> None:
 
     elif args.command == "install":
         cmd_install(args)
+
+    elif args.command == "install-service":
+        from heartbeat.service import install_service
+        sys.exit(install_service(print_only=args.print_only))
+
+    elif args.command == "uninstall-service":
+        from heartbeat.service import uninstall_service
+        sys.exit(uninstall_service())
 
     else:
         parser.print_help()

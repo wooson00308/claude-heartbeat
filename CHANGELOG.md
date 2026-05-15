@@ -2,6 +2,33 @@
 
 이 프로젝트의 주요 변경사항을 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/) 1.1.0을 따른다.
 
+## [0.4.0] - 2026-05-15
+
+### Added
+
+- 윈도우 호환. `pip install claude-heartbeat`이 macOS / Windows 양쪽에서 동작한다 (Linux systemd 통합은 Phase 3 예정).
+- `heartbeat install-service` / `heartbeat uninstall-service` 명령. OS 감지하여 launchd plist (macOS) 또는 Task Scheduler 잡 (Windows)을 자동 등록 / 해제. `--print-only`로 실제 등록 없이 명령만 출력 가능.
+- `dream-prep check-unprocessed --slug=...` 명령. 미처리 transcript가 있으면 exit 0, 없으면 exit 1. 셸-의존 0의 exit-code 게이트로 heartbeat condition에서 `grep` 같은 유닉스 도구 없이 동작한다.
+- `[notify]` extras로 옵셔널 plyer 의존: `pip install claude-heartbeat[notify]`. 미설치 시 알림은 silently 로그로만 남는다.
+- 테스트 39개 (32 → 39): _lock 동시성(ProcessPoolExecutor), check-unprocessed exit code, install-service print-only 모드, condition hotfix 회귀 방지.
+
+### Changed
+
+- 동시성 락: `fcntl` (POSIX 전용) → `portalocker` (cross-platform). meta.py의 락 코드는 `skills/dream/_lock.py`로 격리되어 한 파일 diff로 교체.
+- 프로세스 트리 종료: `os.killpg` + `signal` → `psutil.Process.children()` 기반 cross-platform 트리 walk + terminate/kill. macOS / Windows 일관 동작.
+- subprocess.Popen process group 분리: `start_new_session=True` (POSIX) / `creationflags=CREATE_NEW_PROCESS_GROUP` (Windows)을 OS별 분기.
+- `heartbeat start`는 항상 foreground 동작. 데몬 detach (`os.fork` / `os.setsid`)는 제거. 백그라운드 실행은 OS 스케줄러(launchd / Task Scheduler)에 위임. `--foreground` 플래그는 호환을 위해 인자만 유지하고 동작 noop.
+- notification: macOS osascript subprocess 호출 → plyer (cross-platform).
+- dream skill heartbeat.md 템플릿의 condition을 `dream-prep check-unprocessed --slug={slug}`로 교체 (B안). 기존 HEARTBEAT.md의 셸 condition은 그대로 동작 (사용자 책임).
+- CI matrix가 ubuntu / macOS / Windows × Python 3.11 / 3.12를 모두 머지 게이트로 검사.
+
+### Migration
+
+- 기존 launchd plist 사용자: 변경 불필요. 이미 `heartbeat start --foreground`를 호출하던 plist는 그대로 동작 (start가 foreground로 통일됐고 `--foreground` 인자도 noop으로 유지됨).
+- 기존 HEARTBEAT.md의 dream condition: 그대로 동작. 새 install부터만 `check-unprocessed` 명령을 사용. 기존 잡을 갱신하려면 HEARTBEAT.md를 직접 편집하거나 `heartbeat install dream`을 다시 실행.
+- 기존 `heartbeat start`(detach 모드)를 터미널에서 직접 호출하던 사용자: 이제 foreground로 돌므로 `nohup heartbeat start &` 또는 `heartbeat install-service`로 OS 스케줄러에 위임 권장.
+- 신규 의존성: `portalocker`, `psutil`. `pip install -U claude-heartbeat`로 자동 설치.
+
 ## [0.3.0] - 2026-05-15
 
 ### Changed

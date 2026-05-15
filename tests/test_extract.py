@@ -6,18 +6,9 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
-import pytest
-
-# extract → window → meta(fcntl). 윈도우는 Phase 2 전까지 통째 skip.
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="extract → window → meta 체인이 fcntl 의존",
-)
-
-from skills.dream.extract import (  # noqa: E402
+from skills.dream.extract import (
     _compress_code_blocks,
     _merge_consecutive_tool_calls,
     _summarize_tools,

@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 import logging
 import threading
@@ -15,6 +16,17 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
+import psutil
+
+# subprocess.Popen 호출 시 OS별 process group / session 분리 옵션.
+# POSIX: start_new_session=True → setsid()로 새 session leader, killpg 가능.
+# Windows: creationflags=CREATE_NEW_PROCESS_GROUP → CTRL+BREAK_EVENT 분리, 부모와 시그널 격리.
+_POPEN_GROUP_KWARGS: dict = (
+    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}  # type: ignore[attr-defined]
+    if sys.platform == "win32"
+    else {"start_new_session": True}
+)
 
 HEARTBEAT_FILE = Path.home() / ".claude" / "HEARTBEAT.md"
 LOG_DIR = Path.home() / ".claude" / "heartbeat"
@@ -81,14 +93,19 @@ def _save_state(state: dict) -> None:
 # --- macOS notifications ---
 
 def _notify(title: str, message: str) -> None:
-    """Send macOS native notification via osascript."""
+    """Cross-platform desktop notification.
+
+    plyer가 설치돼있으면 plyer.notification.notify()를 호출 (macOS / Windows /
+    Linux 자동 처리). 미설치 / 백엔드 누락 시 조용히 로그로만 남기고 끝낸다.
+
+    plyer는 [notify] extras로만 설치된다: pip install claude-heartbeat[notify]
+    """
     try:
-        subprocess.run(
-            ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
-            capture_output=True, timeout=5,
-        )
+        from plyer import notification  # type: ignore[import-not-found]
+        notification.notify(title=title, message=message, timeout=5)
     except Exception:
-        pass
+        # plyer 미설치 / 백엔드 없음 / 호출 실패 — main flow 멈추지 않음
+        log.info(f"[notify] {title}: {message}")
 
 
 def _should_notify(job: dict, event: str) -> bool:
@@ -200,39 +217,43 @@ def _check_condition(job: dict) -> bool:
 
 
 def _kill_process_group(proc: subprocess.Popen, grace: float = 10.0) -> None:
-    """Forcefully terminate process group with SIGTERM, then SIGKILL fallback.
+    """Cross-platform 프로세스 트리 종료.
 
-    Required because `subprocess.run(timeout=...)` only sends SIGKILL to the
-    direct child. If the child spawned grandchildren that hold stdout/stderr
-    pipes open, the parent's `wait()` blocks forever. Sending the signal to
-    the entire process group (created via `start_new_session=True`) ensures
-    grandchildren are cleaned up too.
+    psutil로 자식들까지 모아서 SIGTERM(POSIX) / terminate(Windows) → grace 대기
+    → 안 죽으면 SIGKILL / kill. 손자가 stdout/stderr 파이프를 들고 있어도
+    parent.wait()가 블록되지 않도록 트리 전체를 잡는다.
     """
     try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, PermissionError):
+        parent = psutil.Process(proc.pid)
+    except psutil.NoSuchProcess:
         return
 
     try:
-        os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return
+        children = parent.children(recursive=True)
+    except psutil.NoSuchProcess:
+        children = []
 
-    try:
-        proc.wait(timeout=grace)
-        return
-    except subprocess.TimeoutExpired:
-        pass
+    targets = children + [parent]
 
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        return
+    for p in targets:
+        try:
+            p.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
 
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        log.error(f"process group {pgid} kill failed after SIGKILL")
+    _, alive = psutil.wait_procs(targets, timeout=grace)
+
+    for p in alive:
+        try:
+            p.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    if alive:
+        _, still_alive = psutil.wait_procs(alive, timeout=5)
+        if still_alive:
+            pids = [p.pid for p in still_alive]
+            log.error(f"process tree {proc.pid} kill failed after SIGKILL: {pids}")
 
 
 def _slug_to_cwd(slug: str) -> Path:
@@ -304,7 +325,7 @@ def run_job(job: dict, state: dict) -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,  # 새 process group → killpg로 손자까지 잡음
+            **_POPEN_GROUP_KWARGS,  # OS별 process group / session 분리
         )
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
