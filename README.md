@@ -70,6 +70,16 @@ Automatically consolidates session transcripts into long-term memory. Claude Cod
 
 See [skills/dream/README.md](skills/dream/README.md) for details.
 
+### heartbeat-register (helper skill)
+
+Turns natural-language requests into HEARTBEAT.md jobs. Classifies single-line commands vs multi-step workflows; for multi-step, it asks for confirmation, then creates a paired SKILL.md so the prompt stays as a clean `prompt: /your-skill`. Recognizes quota expressions like "하루 5번" and writes `max_per: 5/24h`.
+
+```bash
+heartbeat install heartbeat-register
+```
+
+See [skills/heartbeat-register/README.md](skills/heartbeat-register/README.md) for details.
+
 ---
 
 ## Prerequisites
@@ -127,14 +137,15 @@ Jobs are defined in `~/.claude/HEARTBEAT.md`:
 ```
 
 
-| Field     | Description                                            | Default           |
-| --------- | ------------------------------------------------------ | ----------------- |
-| slug      | Project slug (`~/.claude/projects/` subdirectory name) | Required          |
-| prompt    | Prompt passed to `claude -p`                           | Required          |
-| interval  | Run interval (s/m/h/d)                                 | 1h                |
-| timeout   | Timeout (s/m/h/d)                                      | 600s              |
-| condition | Pre-run shell check (exit 0 = run)                     | None (always run) |
-| notify    | macOS notification level: `all`, `failure`, `none`     | all               |
+| Field     | Description                                                            | Default           |
+| --------- | ---------------------------------------------------------------------- | ----------------- |
+| slug      | Project slug (`~/.claude/projects/` subdirectory name)                 | Required          |
+| prompt    | Prompt passed to `claude -p`                                           | Required          |
+| interval  | Run interval (s/m/h/d)                                                 | 1h                |
+| timeout   | Timeout (s/m/h/d)                                                      | 600s              |
+| condition | Pre-run shell check (exit 0 = run)                                     | None (always run) |
+| notify    | Desktop notification level: `all`, `failure`, `none`                   | all               |
+| max_per   | Sliding-window quota (e.g. `5/24h` = at most 5 runs in any 24h window) | None (no quota)   |
 
 Global settings go before any `##` job header:
 

@@ -1,6 +1,6 @@
 [project]
 name = "claude-heartbeat"
-version = "0.6.0"
+version = "0.7.0"
 description = "Periodic claude agent scheduler — wake Claude on schedule, run skills automatically"
 requires-python = ">=3.11"
 dependencies = [

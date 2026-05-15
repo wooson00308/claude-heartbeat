@@ -2,6 +2,30 @@
 
 이 프로젝트의 주요 변경사항을 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/) 1.1.0을 따른다.
 
+## [0.7.0] - 2026-05-15
+
+### Added
+
+- HEARTBEAT.md에 `max_per` 필드 추가. 슬라이딩 윈도우 quota — `max_per: 5/24h` = "지난 24시간 안에 최대 5번 실행". 윈도우 가득 차면 그 다음 요청은 `last_result: quota_skipped`로 자동 skip. 자정 리셋 안 씀(timezone 의존 0).
+- `heartbeat-register` 스킬 신규. 자연어 한 줄로 잡 등록:
+  - 단순 명령(예: "git log 요약") → prompt 직접 박음
+  - 복잡 multi-step(예: "웹 리서치 + 디스코드 포스트") → 사용자 동의 후 새 SKILL.md 생성 + 잡과 페어로 등록
+  - quota 자연어 표현("하루 N번", "주 M번") 인식 → `max_per` 자동 박음
+  - `~/.claude/skills/` 또는 `~/.claude/HEARTBEAT.md`에 사용자 명시적 동의 없이 변경 금지 — 모르는 스킬이 갑자기 늘어나는 일 차단
+- 회귀 테스트 13종: max_per 파싱(정상/위반/단위 fallback), 잡 파싱, 윈도우 정리, run_job quota skip, claude 호출 시 timestamp 기록, max_per 없는 잡 영향 0, 윈도우 슬라이드.
+
+### Changed
+
+- `parse_heartbeat_md`: 잡 dict에 `max_per` 키 추가 (None 또는 (count, window_sec) 튜플).
+- `run_job`: condition 체크 직전에 quota 체크. claude 호출 시점에 `state["recent_runs"]`에 timestamp append (success/failure/timeout 모두 포함 — 토큰은 이미 소비됐으므로).
+- `state.json` 스키마에 `recent_runs` 키 추가 (잡별, 옵션). 기존 잡은 max_per가 None이라 안 만들어짐.
+
+### Migration
+
+- 100% 하위호환. 기존 HEARTBEAT.md / state.json 그대로 동작.
+- `pip install -U claude-heartbeat` 한 줄로 업그레이드.
+- quota를 쓰려면 잡 블록에 `- max_per: N/Mh` 한 줄 추가하거나 `heartbeat install heartbeat-register` 후 자연어로 등록.
+
 ## [0.6.0] - 2026-05-15
 
 ### Changed (정책 — 동작 변화 있음)
