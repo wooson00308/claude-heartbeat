@@ -392,6 +392,11 @@ def run_job(job: dict, state: dict) -> bool:
         _notify("Heartbeat", f"[{name}] 실행 시작")
 
     start_time = time.time()
+    # active(monotonic) vs wall(time.time) 분리 측정.
+    # macOS sleep 등으로 wall은 흐르지만 monotonic은 멈추는 케이스를 timeout
+    # 로그에서 구분하기 위함. communicate(timeout=N)은 monotonic 기반이라
+    # configured ≈ active << wall 패턴이 나오면 sleep 정황으로 판단 가능.
+    start_mono = time.monotonic()
 
     try:
         proc = subprocess.Popen(
@@ -445,14 +450,17 @@ def run_job(job: dict, state: dict) -> bool:
 
     except subprocess.TimeoutExpired:
         elapsed = round(time.time() - start_time, 1)
-        log.error(f"[{name}] 타임아웃 ({timeout}초)")
+        active = round(time.monotonic() - start_mono, 1)
+        log.error(
+            f"[{name}] 타임아웃 (설정 {timeout}s, active {active}s, wall {elapsed}s)"
+        )
         with _state_lock:
             job_state["last_run"] = datetime.now().isoformat()
             job_state["last_result"] = "timeout"
             job_state["last_duration"] = elapsed
             _save_state(state)
         if _should_notify(job, "failure"):
-            _notify("Heartbeat", f"[{name}] 타임아웃 ({timeout}초)")
+            _notify("Heartbeat", f"[{name}] 타임아웃 ({elapsed}s)")
         return False
     except FileNotFoundError:
         log.error("claude CLI를 찾을 수 없음")
