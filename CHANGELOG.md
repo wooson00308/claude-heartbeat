@@ -2,6 +2,21 @@
 
 이 프로젝트의 주요 변경사항을 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/) 1.1.0을 따른다.
 
+## [0.5.1] - 2026-05-15
+
+### Fixed
+
+- `heartbeat install dream` / `heartbeat skills`가 일반 `pip install claude-heartbeat`(wheel install)에서 "사용 가능한 스킬 없음"으로 실패하던 회귀 (issue #7). `_get_package_skills_dir`의 fallback이 `site-packages/heartbeat/skills`를 가리켰는데, pyproject.toml의 `packages = ["src/heartbeat", "skills"]`로 인해 실제 설치 위치는 top-level `site-packages/skills/`. `import skills; Path(skills.__file__).parent`로 통일해서 editable / wheel / zipapp 모두 동작.
+
+### Added
+
+- CI에 `wheel-install-smoke` 잡 추가. wheel build → 격리 venv install → `heartbeat skills`가 `dream`을 디스커버리하는지 검증. editable install에선 안 잡히던 패키징 회귀를 영구 차단.
+- 단위 테스트: `_get_package_skills_dir` / `_list_available_skills`의 sanity 회귀 방지.
+
+### Migration
+
+- 호환성 변경 없음. 0.5.0 wheel install이 깨졌던 사용자만 0.5.1로 업그레이드하면 됨.
+
 ## [0.5.0] - 2026-05-15
 
 ### Added

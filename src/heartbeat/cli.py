@@ -22,14 +22,16 @@ SKILLS_DIR = Path.home() / ".claude" / "skills"
 
 
 def _get_package_skills_dir() -> Path:
-    """Get the skills/ directory from the installed package."""
-    # Editable install: repo_root/skills/
-    pkg_root = Path(__file__).resolve().parent.parent.parent
-    candidate = pkg_root / "skills"
-    if candidate.exists():
-        return candidate
-    # Regular install: installed alongside heartbeat package
-    return Path(__file__).resolve().parent / "skills"
+    """Get the skills/ directory.
+
+    skills는 pyproject.toml에서 top-level 패키지로 install된다
+    (`packages = ["src/heartbeat", "skills"]`). editable / wheel / zipapp 모두
+    `import skills`로 정확한 위치를 받는다. 이전엔 `Path(__file__).parent / "skills"`
+    fallback이 site-packages/heartbeat/skills를 가리켜서 wheel install 시
+    "사용 가능한 스킬 없음"이 나오는 회귀가 있었다 (issue #7).
+    """
+    import skills
+    return Path(skills.__file__).resolve().parent
 
 
 def _list_available_skills() -> list[str]:

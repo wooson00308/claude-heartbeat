@@ -34,3 +34,37 @@ jobs:
 
       - name: Run pytest
         run: pytest tests/ -v
+
+  # 별도 잡: wheel build → 격리 venv install → 번들 스킬 디스커버리 sanity.
+  # editable install에선 안 보이는 패키징 회귀(예: 이슈 #7 "사용 가능한 스킬 없음")를
+  # 영구 차단한다. ubuntu 한 OS만으로 충분 — packaging 동작은 OS 무관.
+  wheel-install-smoke:
+    name: wheel install smoke (ubuntu / py3.12)
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        run: |
+          pip install build
+          python -m build --wheel
+
+      - name: Install in isolated venv
+        run: |
+          python -m venv /tmp/smoke-env
+          /tmp/smoke-env/bin/pip install dist/*.whl
+
+      - name: heartbeat skills must list dream
+        run: |
+          out=$(/tmp/smoke-env/bin/heartbeat skills)
+          echo "$out"
+          echo "$out" | grep -q "dream" || (echo "::error::dream skill not discovered in wheel install" && exit 1)
+
+      - name: dream-prep CLI must work
+        run: /tmp/smoke-env/bin/dream-prep --help
