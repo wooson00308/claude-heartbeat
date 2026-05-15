@@ -1,0 +1,161 @@
+"""Linux systemd user unit 어댑터.
+
+daemon-reload와 enable --now를 분리해서 어디서 실패했는지 정확히 보고한다.
+SSH 세션 등에서 systemctl --user가 깨지는 케이스(DBUS / XDG_RUNTIME_DIR 미설정)도
+가이드에 한 줄 명시.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from .base import ServiceAdapter
+
+UNIT_NAME = "claude-heartbeat.service"
+
+UNIT_TEMPLATE = """[Unit]
+Description=Claude Heartbeat — periodic claude agent scheduler
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={heartbeat_bin} start
+Restart=always
+RestartSec=5
+StandardOutput=append:{log_dir}/systemd_stdout.log
+StandardError=append:{log_dir}/systemd_stderr.log
+Environment=PATH={path_env}
+Environment=HOME={home}
+
+[Install]
+WantedBy=default.target
+"""
+
+
+class SystemdAdapter(ServiceAdapter):
+    name = "systemd"
+
+    def _unit_path(self) -> Path:
+        return Path.home() / ".config" / "systemd" / "user" / UNIT_NAME
+
+    def render(self) -> str | None:
+        bin_path = self._heartbeat_bin()
+        if not bin_path:
+            print("⚠ heartbeat CLI를 PATH에서 찾을 수 없음. pip install 후 다시 시도.")
+            return None
+
+        home = str(Path.home())
+        bin_dir = str(Path(bin_path).parent)
+        path_env = f"{bin_dir}:/usr/local/bin:/usr/bin:/bin"
+
+        return UNIT_TEMPLATE.format(
+            heartbeat_bin=bin_path,
+            log_dir=f"{home}/.claude/heartbeat",
+            path_env=path_env,
+            home=home,
+        )
+
+    def install(self, print_only: bool = False) -> int:
+        unit = self.render()
+        if unit is None:
+            return 1
+
+        unit_path = self._unit_path()
+
+        if print_only:
+            print(f"# {unit_path}")
+            print(unit)
+            print("# Install commands:")
+            print("systemctl --user daemon-reload")
+            print(f"systemctl --user enable --now {UNIT_NAME}")
+            print("# 확인:")
+            print(f"systemctl --user status {UNIT_NAME}")
+            print("# (선택) 로그아웃 후에도 돌리려면:")
+            print("loginctl enable-linger $USER")
+            print("# 주의: SSH 세션 등에서 DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR")
+            print("#       미설정 시 systemctl --user 자체가 실패할 수 있음")
+            return 0
+
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        Path(f"{Path.home()}/.claude/heartbeat").mkdir(parents=True, exist_ok=True)
+
+        try:
+            unit_path.write_text(unit, encoding="utf-8")
+        except (OSError, PermissionError) as exc:
+            print(f"⚠ unit 파일 쓰기 실패: {exc}")
+            print(f"  대상: {unit_path}")
+            print("  ~/.config 권한을 확인하거나 수동으로 unit 파일을 작성.")
+            return 1
+
+        # daemon-reload 단계
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "daemon-reload"],
+                check=True, capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            print("⚠ systemctl 명령을 찾을 수 없음 (systemd가 없는 환경?)")
+            print(f"  unit 파일은 등록됨: {unit_path}")
+            print(f"  수동: systemctl --user daemon-reload && systemctl --user enable --now {UNIT_NAME}")
+            return 1
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            print(f"⚠ systemctl daemon-reload 실패: {stderr}")
+            print(f"  unit 파일은 등록됨: {unit_path}")
+            return 1
+
+        # enable --now 단계 (이 단계에서 실패하면 unit은 살아있고 enable만 누락)
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "enable", "--now", UNIT_NAME],
+                check=True, capture_output=True, text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            print(f"⚠ systemctl enable 실패: {stderr}")
+            print(f"  unit 파일은 등록됨: {unit_path}")
+            print(f"  enable만 다시 시도: systemctl --user enable --now {UNIT_NAME}")
+            print(f"  상태 확인: systemctl --user status {UNIT_NAME}")
+            print("  SSH 세션에서 DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR 미설정 시 실패 가능.")
+            return 1
+
+        print(f"✓ systemd user unit 등록 완료: {unit_path}")
+        print(f"  확인: systemctl --user status {UNIT_NAME}")
+        print("  로그아웃 후에도 돌리려면: loginctl enable-linger $USER")
+        return 0
+
+    def uninstall(self, print_only: bool = False) -> int:
+        unit_path = self._unit_path()
+
+        if print_only:
+            print(f"# Uninstall: systemctl --user disable --now {UNIT_NAME}")
+            print(f"# Then: rm {unit_path}")
+            print("# Then: systemctl --user daemon-reload")
+            return 0
+
+        if not unit_path.exists():
+            print(f"  {unit_path} 없음 (이미 해제 상태)")
+            return 0
+
+        # systemctl이 없는 환경(다른 머신으로 dotfile 옮긴 케이스)에서도 unit 파일은 정리.
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "disable", "--now", UNIT_NAME],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            pass
+
+        unit_path.unlink()
+
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "daemon-reload"],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            pass
+
+        print(f"✓ systemd user unit 해제 완료: {unit_path}")
+        return 0

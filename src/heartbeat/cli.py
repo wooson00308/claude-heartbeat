@@ -15,6 +15,7 @@ from heartbeat.core import (
     run_job,
     LOG_DIR,
 )
+from heartbeat.service import install_service, uninstall_service
 
 HEARTBEAT_FILE = Path.home() / ".claude" / "HEARTBEAT.md"
 SKILLS_DIR = Path.home() / ".claude" / "skills"
@@ -226,15 +227,19 @@ def main() -> None:
     # install-service / uninstall-service (OS background scheduler 등록)
     p_install_service = sub.add_parser(
         "install-service",
-        help="Register heartbeat with the OS background scheduler (launchd / Task Scheduler)",
+        help="Register heartbeat with the OS background scheduler (launchd / Task Scheduler / systemd)",
     )
     p_install_service.add_argument(
         "--print-only", action="store_true",
         help="실제 등록 없이 등록 명령/파일 내용만 출력",
     )
-    sub.add_parser(
+    p_uninstall_service = sub.add_parser(
         "uninstall-service",
         help="Remove heartbeat from the OS background scheduler",
+    )
+    p_uninstall_service.add_argument(
+        "--print-only", action="store_true",
+        help="실제 해제 없이 해제 명령만 출력",
     )
 
     args = parser.parse_args()
@@ -325,12 +330,10 @@ def main() -> None:
         cmd_install(args)
 
     elif args.command == "install-service":
-        from heartbeat.service import install_service
         sys.exit(install_service(print_only=args.print_only))
 
     elif args.command == "uninstall-service":
-        from heartbeat.service import uninstall_service
-        sys.exit(uninstall_service())
+        sys.exit(uninstall_service(print_only=args.print_only))
 
     else:
         parser.print_help()
