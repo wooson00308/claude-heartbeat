@@ -204,8 +204,13 @@ def _compress_code_blocks(text: str) -> str:
 
 
 def extract_conversation(transcript_path: Path) -> list[dict]:
-    """Extract meaningful conversation turns from a transcript JSONL."""
-    lines = transcript_path.read_text(encoding="utf-8").strip().split("\n")
+    """Extract meaningful conversation turns from a transcript JSONL.
+
+    errors="replace": Claude Code가 transcript 쓰는 중 invalid utf-8 byte가
+    들어가도 crash 안 함. extract_partial_conversation은 처음부터 errors=replace
+    였는데 이 함수만 누락이라 sealed-candidate 처리 흐름에서만 회복력 부재였음.
+    """
+    lines = transcript_path.read_text(encoding="utf-8", errors="replace").strip().split("\n")
     conversation: list[dict] = []
 
     for line in lines:
