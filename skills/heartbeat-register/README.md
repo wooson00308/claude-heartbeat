@@ -2,6 +2,8 @@
 
 _Turn natural-language requests into HEARTBEAT.md jobs._
 
+**[한국어](README_ko.md)**
+
 ---
 
 자연어 한 줄로 heartbeat 잡을 등록한다. 단순 명령이면 prompt 직접 박고, 복잡한 multi-step 요청이면 사용자 동의 받고 새 SKILL.md를 생성해서 잡과 페어로 정착시킨다.

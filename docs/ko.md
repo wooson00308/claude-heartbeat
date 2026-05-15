@@ -25,7 +25,7 @@ Heartbeat는 이를 능동형으로 바꿔줍니다.
 
 ## 동작 방식
 
-1. Heartbeat 데몬이 백그라운드에서 실행됩니다 (launchd 기반)
+1. Heartbeat 데몬이 OS 백그라운드 스케줄러로 실행됩니다 (macOS launchd / Windows Task Scheduler / Linux systemd)
 2. 60초마다 등록된 잡을 확인합니다
 3. interval이 경과한 잡에 대해 condition을 체크합니다
 4. condition을 통과하면 `claude -p "{prompt}"`로 Claude를 깨웁니다
@@ -35,7 +35,7 @@ Heartbeat는 이를 능동형으로 바꿔줍니다.
 
 ## 무엇을 실행할 수 있나요?
 
-`prompt` 필드에는 무엇이든 넣을 수 있습니다. 평문 한 줄, 스킬 명령어, 문서 참조 등 형식에 제한이 없습니다. Heartbeat는 그 내용을 그대로 `claude -p`에 전달합니다.
+`prompt` 필드에는 한 줄 명령, 스킬 호출, 문서 참조 등 단일 라인 값을 넣을 수 있습니다. Heartbeat는 그 내용을 그대로 `claude -p`에 전달합니다. 긴 프롬프트나 멀티스텝 작업은 Claude 스킬로 작성한 뒤 `prompt: /your-skill`처럼 참조하는 게 정석입니다.
 
 ### 평문 프롬프트
 
@@ -57,7 +57,7 @@ Heartbeat는 이를 능동형으로 바꿔줍니다.
 
 Claude Code는 [사용자 정의 스킬](https://docs.anthropic.com/en/docs/claude-code)을 지원합니다. 재사용 가능한 프롬프트를 만들어 Claude가 필요할 때 실행할 수 있는 프로토콜입니다. 더 복잡하거나 여러 단계가 필요한 작업은 스킬로 작성하여 prompt 필드에서 참조할 수 있습니다.
 
-`dream` 스킬은 이 조합의 예시로 포함되어 있습니다.
+기본 제공되는 스킬은 `dream`과 `heartbeat-register` 두 가지입니다.
 
 ```bash
 heartbeat skills              # 사용 가능한 스킬 목록
@@ -70,11 +70,21 @@ heartbeat install dream       # 스킬 설치
 
 자세한 내용은 [skills/dream/README_ko.md](../skills/dream/README_ko.md)를 참고하세요.
 
+### heartbeat-register (헬퍼 스킬)
+
+자연어 한 줄 요청을 HEARTBEAT.md 잡으로 등록해줍니다. 단순 명령은 prompt에 바로 박고, 멀티스텝 작업은 사용자 동의를 받은 뒤 새 SKILL.md를 만들어 잡과 페어로 등록합니다. "하루 5번"처럼 quota 표현이 들어가면 `max_per: 5/24h`를 자동으로 박아줍니다.
+
+```bash
+heartbeat install heartbeat-register
+```
+
+자세한 내용은 [skills/heartbeat-register/README.md](../skills/heartbeat-register/README.md)를 참고하세요.
+
 ---
 
 ## 요구사항
 
-- macOS (launchd 기반 자동화)
+- macOS / Windows / Linux
 - Python 3.11+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 
@@ -92,11 +102,14 @@ heartbeat jobs
 # 테스트 실행
 heartbeat once
 
-# 데몬 시작
+# OS 백그라운드 스케줄러에 등록 (launchd / Task Scheduler / systemd 자동 감지)
+heartbeat install-service
+
+# 또는 테스트용 포그라운드 실행
 heartbeat start
 ```
 
-launchd 등록 등 상세 설정은 [설정 가이드](setup.md)를 참고하세요.
+수동 설정, 로그 경로, launchd / Task Scheduler 상세는 [설정 가이드](setup.md)를 참고하세요.
 
 ## 설정
 
@@ -114,36 +127,38 @@ launchd 등록 등 상세 설정은 [설정 가이드](setup.md)를 참고하세
 - timeout: 5m
 - notify: failure
 
-## lint-check
+## llm-news-digest
 - slug: -Users-yourname-Git-myproject
-- prompt: npm run lint 돌려보고 에러 있으면 정리해줘
-- interval: 6h
-- timeout: 3m
-- condition: test -f package.json
+- prompt: /llm-news-digest
+- interval: 1h
+- timeout: 10m
+- max_per: 5/24h
 - notify: failure
 ```
 
-| 필드 | 설명 | 기본값 |
-|------|------|--------|
-| slug | 프로젝트 슬러그 (`~/.claude/projects/` 하위 디렉토리명) | 필수 |
-| prompt | claude -p에 전달할 프롬프트 | 필수 |
-| interval | 실행 간격 (s/m/h/d) | 1h |
-| timeout | 타임아웃 (s/m/h/d) | 600s |
-| condition | 실행 전 체크 (exit 0이면 실행) | 없음 |
-| notify | macOS 알림 수준: `all`, `failure`, `none` | all |
+| 필드      | 설명                                                                | 기본값            |
+|-----------|---------------------------------------------------------------------|-------------------|
+| slug      | 프로젝트 슬러그 (`~/.claude/projects/` 하위 디렉토리명)              | 필수              |
+| prompt    | `claude -p`에 전달할 프롬프트                                       | 필수              |
+| interval  | 실행 간격 (s/m/h/d)                                                 | 1h                |
+| timeout   | 타임아웃 (s/m/h/d)                                                  | 600s              |
+| condition | 실행 전 셸 체크 (exit 0이면 실행)                                   | 없음 (항상 실행)  |
+| notify    | 데스크탑 알림 수준: `all`, `failure`, `none`                        | all               |
+| max_per   | 슬라이딩 윈도우 quota (예: `5/24h` = 지난 24시간 안 최대 5회 실행) | 없음 (quota 없음) |
 
 ## CLI
 
 ```bash
-heartbeat start           # 데몬 시작 (백그라운드)
-heartbeat start -f        # 포그라운드 실행
-heartbeat stop            # 데몬 중지
-heartbeat status          # 상태 + 잡별 이력 + 최근 로그
-heartbeat jobs            # 등록된 잡 목록
-heartbeat once            # 모든 잡 1회 실행
-heartbeat once -j "name"  # 특정 잡 1회 실행
-heartbeat skills          # 사용 가능한 스킬 목록
-heartbeat install <name>  # 스킬 설치
+heartbeat start                # 포그라운드 실행 (백그라운드는 OS 스케줄러에 위임)
+heartbeat stop                 # 실행 중인 heartbeat 종료
+heartbeat status               # 상태 + 잡별 이력 + 최근 로그
+heartbeat jobs                 # 등록된 잡 목록
+heartbeat once                 # 모든 잡 1회 실행
+heartbeat once -j "name"       # 특정 잡 1회 실행
+heartbeat skills               # 사용 가능한 스킬 목록
+heartbeat install <name>       # 스킬 설치
+heartbeat install-service      # OS 백그라운드 스케줄러에 등록 (launchd / Task Scheduler / systemd)
+heartbeat uninstall-service    # OS 스케줄러에서 해제
 ```
 
 ## v0.1에서 마이그레이션
