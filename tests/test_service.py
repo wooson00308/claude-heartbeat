@@ -47,15 +47,23 @@ def test_install_service_print_only_windows(monkeypatch):
     assert r"C:\fake\heartbeat.exe" in out
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="systemd unit 출력은 Linux에서만")
+def test_install_service_print_only_linux(monkeypatch):
+    monkeypatch.setattr(service, "_heartbeat_bin", lambda: "/fake/bin/heartbeat")
+    rc, out = _capture_stdout(service.install_service, print_only=True)
+
+    assert rc == 0
+    assert "[Unit]" in out
+    assert "[Service]" in out
+    assert "Description=Claude Heartbeat" in out
+    assert "/fake/bin/heartbeat" in out
+    assert "systemctl --user enable --now claude-heartbeat.service" in out
+    assert "loginctl enable-linger" in out
+
+
 def test_install_service_missing_bin(monkeypatch):
     """heartbeat CLI가 PATH에 없으면 non-zero exit + 가이드 출력."""
     monkeypatch.setattr(service, "_heartbeat_bin", lambda: None)
-
-    if sys.platform.startswith("linux"):
-        # Linux는 어차피 1 반환 (Phase 3) — bin 체크 전 단계에서 끝남
-        rc, _ = _capture_stdout(service.install_service, print_only=True)
-        assert rc == 1
-        return
 
     rc, out = _capture_stdout(service.install_service, print_only=True)
     assert rc == 1

@@ -17,6 +17,7 @@ from pathlib import Path
 
 PLIST_LABEL = "com.claude-heartbeat"
 TASK_NAME = "claude-heartbeat"
+SYSTEMD_UNIT_NAME = "claude-heartbeat.service"
 
 PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -62,9 +63,7 @@ def install_service(print_only: bool = False) -> int:
     if sys.platform == "win32":
         return _install_task_scheduler(print_only)
     if sys.platform.startswith("linux"):
-        print("Linux(systemd user unit) 자동 등록은 Phase 3 예정.")
-        print("수동 등록 가이드: https://github.com/wooson00308/claude-heartbeat (docs/setup.md)")
-        return 1
+        return _install_systemd(print_only)
     print(f"지원하지 않는 플랫폼: {sys.platform}")
     return 1
 
@@ -75,8 +74,7 @@ def uninstall_service() -> int:
     if sys.platform == "win32":
         return _uninstall_task_scheduler()
     if sys.platform.startswith("linux"):
-        print("Linux 자동 해제 미지원 (Phase 3)")
-        return 1
+        return _uninstall_systemd()
     print(f"지원하지 않는 플랫폼: {sys.platform}")
     return 1
 
@@ -202,3 +200,117 @@ def _uninstall_task_scheduler() -> int:
     except FileNotFoundError:
         print("⚠ schtasks.exe 없음 (Windows 전용)")
         return 1
+
+
+# --- Linux / systemd user unit ---
+
+SYSTEMD_UNIT_TEMPLATE = """[Unit]
+Description=Claude Heartbeat — periodic claude agent scheduler
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={heartbeat_bin} start
+Restart=always
+RestartSec=5
+StandardOutput=append:{log_dir}/systemd_stdout.log
+StandardError=append:{log_dir}/systemd_stderr.log
+Environment=PATH={path_env}
+Environment=HOME={home}
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _systemd_unit_path() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME
+
+
+def _render_systemd_unit() -> str | None:
+    bin_path = _heartbeat_bin()
+    if not bin_path:
+        print("⚠ heartbeat CLI를 PATH에서 찾을 수 없음. pip install 후 다시 시도.")
+        return None
+
+    home = str(Path.home())
+    bin_dir = str(Path(bin_path).parent)
+    # 기본 PATH + heartbeat 설치된 dir + claude CLI가 있을 만한 곳
+    path_env = f"{bin_dir}:/usr/local/bin:/usr/bin:/bin"
+
+    return SYSTEMD_UNIT_TEMPLATE.format(
+        heartbeat_bin=bin_path,
+        log_dir=f"{home}/.claude/heartbeat",
+        path_env=path_env,
+        home=home,
+    )
+
+
+def _install_systemd(print_only: bool) -> int:
+    unit = _render_systemd_unit()
+    if unit is None:
+        return 1
+
+    unit_path = _systemd_unit_path()
+
+    if print_only:
+        print(f"# {unit_path}")
+        print(unit)
+        print("# Install commands:")
+        print(f"systemctl --user daemon-reload")
+        print(f"systemctl --user enable --now {SYSTEMD_UNIT_NAME}")
+        print("# (선택) 로그아웃 후에도 돌리려면:")
+        print("loginctl enable-linger $USER")
+        return 0
+
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{Path.home()}/.claude/heartbeat").mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(unit, encoding="utf-8")
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME],
+            check=True, capture_output=True, text=True,
+        )
+        print(f"✓ systemd user unit 등록 완료: {unit_path}")
+        print("  로그아웃 후에도 도는 게 필요하면: loginctl enable-linger $USER")
+        return 0
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        stderr = getattr(exc, "stderr", "") or str(exc)
+        print(f"⚠ systemctl 등록 실패: {stderr.strip()}")
+        print("  수동 등록:")
+        print("    systemctl --user daemon-reload")
+        print(f"    systemctl --user enable --now {SYSTEMD_UNIT_NAME}")
+        return 1
+
+
+def _uninstall_systemd() -> int:
+    unit_path = _systemd_unit_path()
+    if not unit_path.exists():
+        print(f"  {unit_path} 없음 (이미 해제 상태)")
+        return 0
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT_NAME],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        pass
+
+    unit_path.unlink()
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        pass
+
+    print(f"✓ systemd user unit 해제 완료: {unit_path}")
+    return 0

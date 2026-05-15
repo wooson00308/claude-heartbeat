@@ -2,6 +2,25 @@
 
 이 프로젝트의 주요 변경사항을 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/) 1.1.0을 따른다.
 
+## [0.5.0] - 2026-05-15
+
+### Added
+
+- Linux systemd 통합. `heartbeat install-service`가 Linux에서 `~/.config/systemd/user/claude-heartbeat.service` user unit을 자동 생성하고 `systemctl --user daemon-reload && systemctl --user enable --now claude-heartbeat.service`까지 실행한다. 로그아웃 후에도 돌리려면 `loginctl enable-linger $USER`를 별도 안내.
+- `heartbeat uninstall-service`가 Linux에서 `disable --now` + unit 파일 삭제 + `daemon-reload`까지 처리.
+- `--print-only` 모드에서 systemd unit 내용과 install/enable 명령을 출력 (실제 등록 없이 검증 가능).
+- 테스트: `test_install_service_print_only_linux` 추가. unit 헤더 / heartbeat 경로 / systemctl enable 명령 / linger 안내가 모두 출력에 포함됨을 검증.
+
+### Changed
+
+- `service.py`의 install/uninstall 디스패처가 macOS / Windows / Linux 3-way 분기로 통일. 더 이상 "Phase 3 예정" 자리표시자 없음.
+- README Prerequisites: "macOS / Windows / Linux".
+
+### Migration
+
+- 호환성 변경 없음. 기존 macOS / Windows 사용자에 영향 0.
+- Linux 사용자: `heartbeat install-service` 한 줄로 등록 완료. enable-linger는 선택 (세션이 살아있는 동안만 돌면 충분하면 생략 OK).
+
 ## [0.4.0] - 2026-05-15
 
 ### Added
