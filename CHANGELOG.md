@@ -2,6 +2,29 @@
 
 이 프로젝트의 주요 변경사항을 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/) 1.1.0을 따른다.
 
+## [0.6.0] - 2026-05-15
+
+### Changed (정책 — 동작 변화 있음)
+
+- `_check_condition()`이 timeout / 예외 시 `False` 반환 (fail-closed). 이전엔 `True` 반환(fail-open)이라 dream-prep CLI가 깨지거나 condition이 hang되면 매 tick마다 claude를 깨워 토큰 비용 누적. zero-cost gating 약속과 모순됐던 디폴트 정정 (issue #10). 명시적으로 fail-open이 필요한 잡은 condition에 `|| true`를 박는다.
+- `_acquire_meta_lock()`이 `LOCK_TIMEOUT_SEC` 안에 락을 잡지 못하면 `LockTimeout` 예외 raise (fail-closed). 이전엔 warning 후 lock 없이 yield해서 dream_meta.md cursor state의 race로 인한 중복 흡수 / 라운드 윈도우 누락 위험 (issue #11). `mark_processed`의 try/except가 LockTimeout을 잡아서 logger.warning + return — main flow는 안 죽지만 entry는 안 박힘 (race보다 안전).
+
+### Added
+
+- 회귀 테스트 8종: condition timeout / 예외 / 빈 condition / exit 0 / exit non-zero (5), lock 타임아웃 raise / mark_processed graceful 처리 / 정상 경로 (3).
+- `LockTimeout` 예외 클래스 (`skills.dream._lock`).
+
+### Documentation
+
+- README의 "prompt accepts anything" 문구를 "any single-line value ... 긴 프롬프트는 skill로"로 정정 (issue #12). 멀티라인 prompt 자체 지원은 백로그 (skill 패턴이 더 정석).
+
+### Migration
+
+- 동작 변화 두 가지 — 기존 사용자에게 영향 가능:
+  1. condition이 일시적으로 깨지던 잡은 이제 silent skip된다 (이전엔 그래도 claude 깨움). 의도가 "에러여도 돌리자"였다면 condition 명령에 `|| true` 추가.
+  2. `dream-prep prep`을 두 인스턴스 동시에 돌리면 한쪽이 LockTimeout으로 실패할 수 있다. 정상적인 단일 heartbeat 데몬 사용 패턴에선 영향 없음.
+- pyproject 버전: 0.5.x → 0.6.0 (정책 변경이라 minor bump).
+
 ## [0.5.2] - 2026-05-15
 
 ### Fixed

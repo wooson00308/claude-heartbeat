@@ -202,18 +202,28 @@ def parse_heartbeat_md() -> tuple[dict, list[dict]]:
 
 
 def _check_condition(job: dict) -> bool:
-    """Run condition command. Returns True if job should run."""
+    """Run condition command. Returns True if job should run.
+
+    v0.6.0: timeout / exception 시 fail-closed로 변경 (이전엔 fail-open이라
+    조건 검사가 깨져도 claude를 깨워서 zero-cost gating 약속과 모순됐다).
+    명시적으로 fail-open이 필요하면 condition에 `|| true`를 박는다.
+    """
     condition = job.get("condition", "")
     if not condition:
         return True
 
+    name = job.get("name", "?")
     try:
         result = subprocess.run(
             condition, shell=True, capture_output=True, timeout=10
         )
         return result.returncode == 0
-    except (subprocess.TimeoutExpired, Exception):
-        return True
+    except subprocess.TimeoutExpired:
+        log.warning(f"[{name}] condition 타임아웃 (10s) → 안전을 위해 skip")
+        return False
+    except Exception as exc:
+        log.warning(f"[{name}] condition 검사 실패 ({type(exc).__name__}: {exc}) → skip")
+        return False
 
 
 def _kill_process_group(proc: subprocess.Popen, grace: float = 10.0) -> None:
