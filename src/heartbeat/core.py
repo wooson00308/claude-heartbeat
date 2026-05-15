@@ -142,6 +142,30 @@ def _parse_timeout(s: str) -> int:
     return _parse_interval(s)
 
 
+def _parse_max_per(s: str) -> tuple[int, int] | None:
+    """Parse `max_per` value like '5/24h' or '3/1d' → (count, window_seconds).
+
+    슬라이딩 윈도우 quota: "지난 N초 안에 최대 M번". 자정 리셋 안 씀
+    (timezone 의존 0).
+
+    형식 위반 시 None — 파서는 quota 없는 잡으로 취급.
+    """
+    s = s.strip()
+    if "/" not in s:
+        return None
+    count_str, window_str = s.split("/", 1)
+    try:
+        count = int(count_str.strip())
+    except ValueError:
+        return None
+    if count <= 0:
+        return None
+    window = _parse_interval(window_str.strip())
+    if window <= 0:
+        return None
+    return (count, window)
+
+
 def parse_heartbeat_md() -> tuple[dict, list[dict]]:
     """Parse ~/.claude/HEARTBEAT.md and return (global_config, job_configs)."""
     if not HEARTBEAT_FILE.exists():
@@ -166,6 +190,7 @@ def parse_heartbeat_md() -> tuple[dict, list[dict]]:
                 "timeout": 600,
                 "condition": "",
                 "notify": "all",
+                "max_per": None,  # (count, window_sec) 튜플 또는 None
             }
         elif current_job and line.startswith("- "):
             kv = line[2:]
@@ -185,6 +210,10 @@ def parse_heartbeat_md() -> tuple[dict, list[dict]]:
                     current_job["condition"] = val
                 elif key == "notify":
                     current_job["notify"] = val
+                elif key == "max_per":
+                    parsed = _parse_max_per(val)
+                    if parsed is not None:
+                        current_job["max_per"] = parsed
         elif not current_job and line.startswith("- "):
             # Global config (before any ## job header)
             kv = line[2:]
@@ -294,15 +323,51 @@ def _slug_to_cwd(slug: str) -> Path:
     return path
 
 
+def _quota_exceeded(job_state: dict, max_per: tuple[int, int] | None) -> bool:
+    """슬라이딩 윈도우 quota 체크. 호출 시 윈도우 밖 timestamp는 정리한다.
+
+    max_per=(count, window_sec). 윈도우 안 timestamp 수가 count 이상이면 True.
+    """
+    if max_per is None:
+        return False
+    count, window_sec = max_per
+    now_ts = time.time()
+    recent = [t for t in job_state.get("recent_runs", []) if now_ts - t < window_sec]
+    job_state["recent_runs"] = recent
+    return len(recent) >= count
+
+
+def _record_quota_run(job_state: dict, max_per: tuple[int, int] | None) -> None:
+    """claude 호출 시점 timestamp를 recent_runs에 기록. count 초과분은 잘라낸다."""
+    if max_per is None:
+        return
+    count, _ = max_per
+    recent = job_state.setdefault("recent_runs", [])
+    recent.append(time.time())
+    job_state["recent_runs"] = recent[-(count * 2):]  # 안전상 두 배까지만 유지
+
+
 def run_job(job: dict, state: dict) -> bool:
     """Execute a single heartbeat job."""
     name = job["name"]
     slug = job["slug"]
     prompt = job["prompt"]
     timeout = job["timeout"]
+    max_per = job.get("max_per")
 
     with _state_lock:
         job_state = state.setdefault(name, {})
+
+    # Quota 체크 — condition보다 먼저 (quota 초과면 condition subprocess 비용도 아낌)
+    if _quota_exceeded(job_state, max_per):
+        count, window_sec = max_per  # type: ignore[misc]
+        log.info(f"[{name}] quota 초과 ({len(job_state['recent_runs'])}/{count} in {window_sec}s), 스킵")
+        with _state_lock:
+            job_state["last_run"] = datetime.now().isoformat()
+            job_state["last_result"] = "quota_skipped"
+            job_state["last_duration"] = 0
+            _save_state(state)
+        return False
 
     # Check condition
     if not _check_condition(job):
@@ -337,6 +402,11 @@ def run_job(job: dict, state: dict) -> bool:
             text=True,
             **_POPEN_GROUP_KWARGS,  # OS별 process group / session 분리
         )
+        # claude 호출 시점에 quota 카운팅 — success/failure/timeout 모두 포함
+        # (실패해도 토큰은 이미 소비된 거라 quota는 까야 함)
+        with _state_lock:
+            _record_quota_run(job_state, max_per)
+            _save_state(state)
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
