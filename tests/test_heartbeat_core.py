@@ -1,17 +1,16 @@
-"""heartbeat.core 파싱 단위 테스트.
+"""heartbeat.core 단위 테스트.
 
-HEARTBEAT.md 파서, interval 파싱, slug → cwd 변환.
+HEARTBEAT.md 파서, interval 파싱, slug → cwd 변환,
+그리고 v0.2.1 hotfix(condition 미충족 시 last_run 갱신) 회귀 방지.
 """
 
 from __future__ import annotations
 
+import json
 import sys
-from pathlib import Path
 
 import pytest
 
-# core가 fcntl/signal/fork에 직접 의존하진 않지만, 같은 패키지 import 시점에
-# 플랫폼 분기 없이 동작해야 한다. 윈도우 sanity check 차원으로 import만 통과시킴.
 from heartbeat import core  # noqa: E402
 
 
@@ -114,3 +113,65 @@ def test_slug_to_cwd_handles_hyphenated_folder(tmp_path):
 
     resolved = core._slug_to_cwd(slug)
     assert (resolved / "marker.txt").read_text(encoding="utf-8") == "ok"
+
+
+# --- v0.2.1 hotfix: condition 미충족 시 last_run 갱신 ---
+#
+# 갱신하지 않으면 interval 만료된 잡이 매 tick마다 condition 재체크를 반복하면서
+# 로그 폭주 + 외부 프로세스 호출이 누적된다. 이 회귀가 다시 들어오면 두 테스트가 빨간불.
+
+@pytest.fixture
+def isolated_state(tmp_path, monkeypatch):
+    """STATE_FILE을 tmp_path로 격리. 실제 ~/.claude/heartbeat/ 건드리지 않음."""
+    monkeypatch.setattr(core, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(core, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(core, "_notify", lambda *a, **k: None)
+    return tmp_path
+
+
+def _make_job(condition: str = "false") -> dict:
+    return {
+        "name": "test-job",
+        "slug": "-test",
+        "prompt": "irrelevant",
+        "timeout": 10,
+        "condition": condition,
+        "notify": "none",
+    }
+
+
+def test_run_job_condition_failed_updates_state_and_skips_claude(isolated_state, monkeypatch):
+    """condition 불충족 시 state 갱신 + claude 미호출 + skipped 마킹."""
+    monkeypatch.setattr(core, "_check_condition", lambda job: False)
+
+    def _no_call(*args, **kwargs):
+        raise RuntimeError("claude must NOT be invoked when condition fails")
+
+    monkeypatch.setattr(core.subprocess, "Popen", _no_call)
+
+    state: dict = {}
+    result = core.run_job(_make_job(), state)
+
+    assert result is False
+    assert "test-job" in state
+    assert state["test-job"]["last_result"] == "skipped"
+    assert state["test-job"]["last_run"]  # ISO timestamp string, non-empty
+    assert state["test-job"]["last_duration"] == 0
+
+
+def test_run_job_condition_failed_persists_to_disk(isolated_state, monkeypatch):
+    """state.json에 실제로 저장돼서 데몬 재시작 후에도 last_run 유지.
+
+    이게 깨지면 재시작 후 첫 tick에서 condition 재체크 폭주가 다시 시작된다.
+    """
+    monkeypatch.setattr(core, "_check_condition", lambda job: False)
+    monkeypatch.setattr(core.subprocess, "Popen", lambda *a, **k: pytest.fail("claude invoked"))
+
+    state: dict = {}
+    core.run_job(_make_job(), state)
+
+    state_file = isolated_state / "state.json"
+    assert state_file.exists()
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["test-job"]["last_result"] == "skipped"
+    assert persisted["test-job"]["last_run"]
