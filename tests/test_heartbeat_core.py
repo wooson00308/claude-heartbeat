@@ -31,6 +31,7 @@ def test_parse_interval_invalid_returns_default():
 
 def test_parse_heartbeat_md_missing_file(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "HEARTBEAT_FILE", tmp_path / "no-such.md")
+    monkeypatch.setattr(core, "JOBS_DIR", tmp_path / "jobs.d")
     config, jobs = core.parse_heartbeat_md()
     assert config == {"tick": 60}
     assert jobs == []
@@ -53,6 +54,7 @@ def test_parse_heartbeat_md_global_and_jobs(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr(core, "HEARTBEAT_FILE", f)
+    monkeypatch.setattr(core, "JOBS_DIR", tmp_path / "jobs.d")
 
     config, jobs = core.parse_heartbeat_md()
     assert config["tick"] == 30
@@ -70,6 +72,40 @@ def test_parse_heartbeat_md_global_and_jobs(tmp_path, monkeypatch):
     assert job_b["notify"] == "all"
 
 
+def test_check_condition_runs_in_slug_cwd(tmp_path, monkeypatch):
+    (tmp_path / "marker.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(core, "_slug_to_cwd", lambda slug: tmp_path)
+
+    job = {"name": "cwd-test", "slug": "-Users-test", "condition": "test -f marker.txt"}
+    assert core._check_condition(job) == (True, "")
+
+    job["condition"] = "test -f missing.txt"
+    assert core._check_condition(job) == (False, "")
+
+
+def test_parse_heartbeat_md_model_field(tmp_path, monkeypatch):
+    f = tmp_path / "HEARTBEAT.md"
+    f.write_text(
+        "# HEARTBEAT\n\n"
+        "## with-model\n"
+        "- slug: -Users-test\n"
+        "- prompt: do thing\n"
+        "- model: opus\n\n"
+        "## without-model\n"
+        "- slug: -Users-test\n"
+        "- prompt: another\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(core, "HEARTBEAT_FILE", f)
+    monkeypatch.setattr(core, "JOBS_DIR", tmp_path / "jobs.d")
+
+    _, jobs = core.parse_heartbeat_md()
+    with_model = next(j for j in jobs if j["name"] == "with-model")
+    without_model = next(j for j in jobs if j["name"] == "without-model")
+    assert with_model["model"] == "opus"
+    assert without_model["model"] == ""  # 기본값: CLI 기본 모델 사용
+
+
 def test_parse_heartbeat_md_skips_jobs_without_slug_or_prompt(tmp_path, monkeypatch):
     f = tmp_path / "HEARTBEAT.md"
     f.write_text(
@@ -78,6 +114,7 @@ def test_parse_heartbeat_md_skips_jobs_without_slug_or_prompt(tmp_path, monkeypa
         encoding="utf-8",
     )
     monkeypatch.setattr(core, "HEARTBEAT_FILE", f)
+    monkeypatch.setattr(core, "JOBS_DIR", tmp_path / "jobs.d")
     _, jobs = core.parse_heartbeat_md()
     assert [j["name"] for j in jobs] == ["good"]
 
@@ -126,6 +163,8 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "LOG_DIR", tmp_path)
     monkeypatch.setattr(core, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(core, "_notify", lambda *a, **k: None)
+    # CWD 확인이 condition보다 먼저 돌므로(v0.8.0) 잡의 slug가 실존 경로를 가리켜야 한다.
+    monkeypatch.setattr(core, "_slug_to_cwd", lambda slug: tmp_path)
     return tmp_path
 
 
@@ -142,7 +181,7 @@ def _make_job(condition: str = "false") -> dict:
 
 def test_run_job_condition_failed_updates_state_and_skips_claude(isolated_state, monkeypatch):
     """condition 불충족 시 state 갱신 + claude 미호출 + skipped 마킹."""
-    monkeypatch.setattr(core, "_check_condition", lambda job: False)
+    monkeypatch.setattr(core, "_check_condition", lambda job: (False, ""))
 
     def _no_call(*args, **kwargs):
         raise RuntimeError("claude must NOT be invoked when condition fails")
@@ -164,7 +203,7 @@ def test_run_job_condition_failed_persists_to_disk(isolated_state, monkeypatch):
 
     이게 깨지면 재시작 후 첫 tick에서 condition 재체크 폭주가 다시 시작된다.
     """
-    monkeypatch.setattr(core, "_check_condition", lambda job: False)
+    monkeypatch.setattr(core, "_check_condition", lambda job: (False, ""))
     monkeypatch.setattr(core.subprocess, "Popen", lambda *a, **k: pytest.fail("claude invoked"))
 
     state: dict = {}
@@ -188,7 +227,9 @@ def test_check_condition_timeout_returns_false(monkeypatch):
         raise subprocess.TimeoutExpired(cmd=args[0] if args else "x", timeout=10)
 
     monkeypatch.setattr(core.subprocess, "run", _timeout)
-    assert core._check_condition({"name": "j", "condition": "sleep 999"}) is False
+    ok, reason = core._check_condition({"name": "j", "condition": "sleep 999"})
+    assert ok is False
+    assert "타임아웃" in reason
 
 
 def test_check_condition_exception_returns_false(monkeypatch):
@@ -197,13 +238,15 @@ def test_check_condition_exception_returns_false(monkeypatch):
         raise FileNotFoundError("dream-prep: command not found")
 
     monkeypatch.setattr(core.subprocess, "run", _boom)
-    assert core._check_condition({"name": "j", "condition": "dream-prep status"}) is False
+    ok, reason = core._check_condition({"name": "j", "condition": "dream-prep status"})
+    assert ok is False
+    assert "실행 실패" in reason
 
 
 def test_check_condition_empty_condition_returns_true():
     """condition 미지정 시 무조건 통과 (디폴트 동작 그대로)."""
-    assert core._check_condition({"name": "j", "condition": ""}) is True
-    assert core._check_condition({"name": "j"}) is True
+    assert core._check_condition({"name": "j", "condition": ""}) == (True, "")
+    assert core._check_condition({"name": "j"}) == (True, "")
 
 
 def test_check_condition_zero_exit_returns_true(monkeypatch):
@@ -212,7 +255,43 @@ def test_check_condition_zero_exit_returns_true(monkeypatch):
         core.subprocess, "run",
         lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""),
     )
-    assert core._check_condition({"name": "j", "condition": "true"}) is True
+    assert core._check_condition({"name": "j", "condition": "true"}) == (True, "")
+
+
+# --- v0.8.0: condition stdout 첫 줄이 스킵 사유로 state에 실린다 ---
+
+def test_check_condition_captures_first_stdout_line(monkeypatch):
+    monkeypatch.setattr(
+        core.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 1, "no-target: 아이디어 전부 반영됨\n둘째 줄", ""),
+    )
+    assert core._check_condition({"name": "j", "condition": "check"}) == (
+        False, "no-target: 아이디어 전부 반영됨",
+    )
+
+
+def test_save_state_replaces_atomically_and_leaves_no_temp(isolated_state):
+    state = {"job": {"last_result": "success"}}
+    core._save_state(state)
+
+    persisted = json.loads((isolated_state / "state.json").read_text(encoding="utf-8"))
+    assert persisted == state
+    assert not list(isolated_state.glob("*.tmp"))
+
+
+def test_run_job_skip_stores_condition_reason(isolated_state, monkeypatch):
+    monkeypatch.setattr(core, "_check_condition", lambda job: (False, "no-target: 사유"))
+    monkeypatch.setattr(core.subprocess, "Popen", lambda *a, **k: pytest.fail("claude invoked"))
+
+    state: dict = {}
+    core.run_job(_make_job(), state)
+
+    assert state["test-job"]["last_condition_output"] == "no-target: 사유"
+
+    # 사유 없는 다음 스킵이 낡은 사유를 지운다.
+    monkeypatch.setattr(core, "_check_condition", lambda job: (False, ""))
+    core.run_job(_make_job(), state)
+    assert "last_condition_output" not in state["test-job"]
 
 
 def test_check_condition_nonzero_exit_returns_false(monkeypatch):
@@ -221,7 +300,7 @@ def test_check_condition_nonzero_exit_returns_false(monkeypatch):
         core.subprocess, "run",
         lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""),
     )
-    assert core._check_condition({"name": "j", "condition": "false"}) is False
+    assert core._check_condition({"name": "j", "condition": "false"}) == (False, "")
 
 
 # `subprocess` 모듈은 fixture에서 monkeypatch하지만 ImportError 방지용 top-level import.

@@ -140,14 +140,107 @@ def cmd_install(args) -> None:
     print(f"\n'{skill_name}' 스킬 설치 완료")
 
 
+def cmd_migrate(args) -> None:
+    """HEARTBEAT.md의 잡을 slug별 jobs.d/<slug>.md로 분리한다 (v0.8.0).
+
+    slug가 없는 잡 블록과 전역 설정은 HEARTBEAT.md에 남는다. 대상 파일이 이미 있으면
+    그 slug는 건너뛴다 — 덮어쓰기로 기존 프로젝트 파일을 깨지 않는다. HTML 주석 줄
+    (외부 도구의 관리 마커)은 옮기지 않고 짝이 맞은 채로 HEARTBEAT.md에 남긴다.
+    """
+    from datetime import datetime
+
+    from heartbeat import core
+
+    if not HEARTBEAT_FILE.exists():
+        print(f"{HEARTBEAT_FILE} 없음 — 옮길 잡이 없습니다.")
+        return
+
+    content = HEARTBEAT_FILE.read_text(encoding="utf-8")
+    preamble: list[str] = []
+    blocks: list[list[str]] = []
+    for line in content.split("\n"):
+        if line.strip().startswith("## "):
+            blocks.append([line])
+        elif blocks:
+            blocks[-1].append(line)
+        else:
+            preamble.append(line)
+
+    def _is_comment(line: str) -> bool:
+        stripped = line.strip()
+        return stripped.startswith("<!--") and stripped.endswith("-->")
+
+    def _block_slug(block: list[str]) -> str:
+        for raw in block:
+            stripped = raw.strip()
+            if stripped.lower().startswith("- slug:"):
+                return stripped.split(":", 1)[1].strip()
+        return ""
+
+    groups: dict[str, list[list[str]]] = {}
+    kept_blocks: list[list[str]] = []
+    kept_comments: list[str] = []
+    for block in blocks:
+        slug = _block_slug(block)
+        if slug:
+            kept_comments.extend(line for line in block if _is_comment(line))
+            groups.setdefault(slug, []).append([l for l in block if not _is_comment(l)])
+        else:
+            kept_blocks.append(block)
+
+    if not groups:
+        print("slug 있는 잡이 없음 — 옮길 것이 없습니다.")
+        return
+
+    moved = 0
+    for slug, slug_blocks in groups.items():
+        target = core.JOBS_DIR / f"{slug}.md"
+        if target.exists():
+            print(f"⚠ {target} 이미 존재 — {slug} 잡 {len(slug_blocks)}개는 HEARTBEAT.md에 남김")
+            kept_blocks.extend(slug_blocks)
+            continue
+        body = "\n\n".join("\n".join(b).strip() for b in slug_blocks) + "\n"
+        if args.dry_run:
+            print(f"[dry-run] {target} ← 잡 {len(slug_blocks)}개")
+        else:
+            core.JOBS_DIR.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            print(f"✓ {target} ← 잡 {len(slug_blocks)}개")
+        moved += len(slug_blocks)
+
+    parts = ["\n".join(preamble).strip()] + kept_comments + ["\n".join(b).strip() for b in kept_blocks]
+    parts = [p for p in parts if p]
+    new_content = ("\n\n".join(parts) + "\n") if parts else "# HEARTBEAT\n"
+
+    if args.dry_run:
+        print(f"[dry-run] HEARTBEAT.md에 남는 잡 블록 {len(kept_blocks)}개")
+        return
+
+    backup = HEARTBEAT_FILE.with_name(
+        HEARTBEAT_FILE.name + ".bak-" + datetime.now().strftime("%Y%m%d%H%M%S")
+    )
+    shutil.copy2(HEARTBEAT_FILE, backup)
+    HEARTBEAT_FILE.write_text(new_content, encoding="utf-8")
+    print(f"✓ 잡 {moved}개 이동, 원본 백업: {backup.name}")
+    print("데몬은 다음 사이클부터 jobs.d를 함께 읽습니다.")
+    print("주의: HEARTBEAT.md에 직접 쓰는 도구(구버전 앱·스킬)가 잡을 재설치하면 중복 정의가")
+    print("생기고, 파싱은 jobs.d가 이겨서 그쪽 편집이 조용히 무시됩니다. 도구를 먼저 전환하세요.")
+
+
 def cmd_init(_args) -> None:
-    """Initialize heartbeat: create HEARTBEAT.md if missing."""
+    """Initialize heartbeat: create HEARTBEAT.md + jobs.d if missing."""
+    from heartbeat import core
+
     if HEARTBEAT_FILE.exists():
         print(f"✓ {HEARTBEAT_FILE} 이미 존재")
     else:
         HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
         HEARTBEAT_FILE.write_text("# HEARTBEAT\n\n", encoding="utf-8")
         print(f"✓ {HEARTBEAT_FILE} 생성")
+
+    if not core.JOBS_DIR.exists():
+        core.JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"✓ {core.JOBS_DIR} 생성 (프로젝트별 잡 파일 자리)")
 
     # Check launchd
     plist_dir = Path.home() / "Library" / "LaunchAgents"
@@ -220,6 +313,13 @@ def main() -> None:
 
     # skills
     sub.add_parser("skills", help="List available skills")
+
+    # migrate
+    p_migrate = sub.add_parser(
+        "migrate",
+        help="Split HEARTBEAT.md jobs into per-project jobs.d/<slug>.md files",
+    )
+    p_migrate.add_argument("--dry-run", action="store_true", help="실제 쓰기 없이 결과만 출력")
 
     # install
     p_install = sub.add_parser("install", help="Install a skill")
@@ -304,6 +404,10 @@ def main() -> None:
                     print(f"  {l}")
 
     elif args.command == "once":
+        running = _is_running()
+        if running:
+            # once는 데몬과 다른 프로세스라 in-flight 가드를 공유하지 않는다.
+            print(f"⚠ 데몬 실행 중(PID {running}) — 같은 잡이 데몬과 겹쳐 실행될 수 있습니다.")
         _setup_log_file()
         state = _load_state()
         _, jobs = parse_heartbeat_md()
@@ -327,6 +431,9 @@ def main() -> None:
 
     elif args.command == "skills":
         cmd_skills(args)
+
+    elif args.command == "migrate":
+        cmd_migrate(args)
 
     elif args.command == "install":
         cmd_install(args)

@@ -146,6 +146,7 @@ Jobs are defined in `~/.claude/HEARTBEAT.md`:
 | condition | Pre-run shell check (exit 0 = run)                                     | None (always run) |
 | notify    | Desktop notification level: `all`, `failure`, `none`                   | all               |
 | max_per   | Sliding-window quota (e.g. `5/24h` = at most 5 runs in any 24h window) | None (no quota)   |
+| model     | Model passed to `claude --model` (e.g. `opus`, `sonnet`)               | None (CLI default) |
 
 Global settings go before any `##` job header:
 

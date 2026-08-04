@@ -13,7 +13,7 @@ import time
 import logging
 import threading
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +32,9 @@ HEARTBEAT_FILE = Path.home() / ".claude" / "HEARTBEAT.md"
 LOG_DIR = Path.home() / ".claude" / "heartbeat"
 PID_FILE = LOG_DIR / "heartbeat.pid"
 STATE_FILE = LOG_DIR / "state.json"
+# v0.8.0: 프로젝트당 잡 파일 하나. 여러 도구가 HEARTBEAT.md 한 파일을 나눠 쓰다
+# 서로의 잡을 지우는 사고(2026-08-04 실측)를 파일 단위 소유로 막는다.
+JOBS_DIR = LOG_DIR / "jobs.d"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,9 +88,15 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
-    """Save state to state.json."""
+    """Save state to state.json (원자적 교체).
+
+    소비자 앱이 이 파일을 폴링한다. write_text 직접 쓰기는 도중 상태(잘린 JSON)를
+    읽힐 수 있고, 앱은 파싱 실패를 조용히 무시해 그 틱의 데이터가 유실된다.
+    """
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = STATE_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, STATE_FILE)
 
 
 # --- macOS notifications ---
@@ -167,11 +176,53 @@ def _parse_max_per(s: str) -> tuple[int, int] | None:
 
 
 def parse_heartbeat_md() -> tuple[dict, list[dict]]:
-    """Parse ~/.claude/HEARTBEAT.md and return (global_config, job_configs)."""
-    if not HEARTBEAT_FILE.exists():
-        return {"tick": 60}, []
+    """Parse HEARTBEAT.md + jobs.d/*.md and return (global_config, job_configs).
 
-    content = HEARTBEAT_FILE.read_text(encoding="utf-8")
+    전역 설정(tick)은 HEARTBEAT.md만 읽는다. jobs.d/<slug>.md의 잡은 파일 이름의
+    slug 소속으로 강제된다. 잡 이름이 겹치면 jobs.d가 HEARTBEAT.md를 이기고,
+    jobs.d끼리 겹치면 정렬 순서상 먼저 읽은 파일이 이긴다 — 어느 쪽이든 경고를 남긴다.
+    """
+    if HEARTBEAT_FILE.exists():
+        global_config, base_jobs = _parse_jobs_text(HEARTBEAT_FILE.read_text(encoding="utf-8"))
+    else:
+        global_config, base_jobs = {"tick": 60}, []
+
+    merged: list[dict] = []
+    seen: set[str] = set()
+    if JOBS_DIR.exists():
+        for path in sorted(JOBS_DIR.glob("*.md")):
+            # `.md`로 끝나는 디렉토리 같은 비파일은 무시한다. 계약: jobs.d에서 읽는
+            # 것은 일반 `.md` 파일뿐이다.
+            if not path.is_file():
+                continue
+            slug = path.stem
+            # jobs.d 파일의 전역 설정은 버린다. 프로젝트 파일이 데몬 전체 tick을
+            # 바꿀 수 있으면 파일 단위 소유가 다시 깨진다.
+            _, file_jobs = _parse_jobs_text(path.read_text(encoding="utf-8"))
+            for job in file_jobs:
+                if job["slug"] and job["slug"] != slug:
+                    log.warning(
+                        f"[jobs.d/{path.name}] {job['name']}의 slug `{job['slug']}`를 "
+                        f"파일 소속 `{slug}`로 강제"
+                    )
+                job["slug"] = slug
+                if job["name"] in seen:
+                    log.warning(f"[jobs.d/{path.name}] 중복 잡 이름 `{job['name']}` — 먼저 읽은 정의 유지")
+                    continue
+                seen.add(job["name"])
+                merged.append(job)
+
+    for job in base_jobs:
+        if job["name"] in seen:
+            log.warning(f"[HEARTBEAT.md] `{job['name']}`은 jobs.d 정의가 우선")
+            continue
+        merged.append(job)
+
+    return global_config, [j for j in merged if j["slug"] and j["prompt"]]
+
+
+def _parse_jobs_text(content: str) -> tuple[dict, list[dict]]:
+    """잡 문법 텍스트 한 덩이를 (전역 설정, 잡 목록)으로 읽는다. 필터링은 호출자 몫."""
     global_config = {"tick": 60}
     jobs = []
     current_job = None
@@ -191,6 +242,7 @@ def parse_heartbeat_md() -> tuple[dict, list[dict]]:
                 "condition": "",
                 "notify": "all",
                 "max_per": None,  # (count, window_sec) 튜플 또는 None
+                "model": "",  # claude --model 값. 비어 있으면 CLI 기본 모델
             }
         elif current_job and line.startswith("- "):
             kv = line[2:]
@@ -210,6 +262,8 @@ def parse_heartbeat_md() -> tuple[dict, list[dict]]:
                     current_job["condition"] = val
                 elif key == "notify":
                     current_job["notify"] = val
+                elif key == "model":
+                    current_job["model"] = val
                 elif key == "max_per":
                     parsed = _parse_max_per(val)
                     if parsed is not None:
@@ -227,11 +281,16 @@ def parse_heartbeat_md() -> tuple[dict, list[dict]]:
     if current_job:
         jobs.append(current_job)
 
-    return global_config, [j for j in jobs if j["slug"] and j["prompt"]]
+    return global_config, jobs
 
 
-def _check_condition(job: dict) -> bool:
-    """Run condition command. Returns True if job should run.
+def _check_condition(job: dict) -> tuple[bool, str]:
+    """Run condition command. Returns (should_run, reason).
+
+    reason은 condition stdout의 첫 줄(최대 200자)이다. 스크립트가 아무것도 내지
+    않으면 빈 문자열 — 데몬은 사유의 통로만 보장하고 내용은 조건 소유자 몫이다.
+    v0.8.0: 소비자 화면이 "왜 건너뛰었는지"를 보여줄 길이 없던 문제(스크립트→데몬→앱
+    세 층 모두에서 사유 증발)의 데몬 몫.
 
     v0.6.0: timeout / exception 시 fail-closed로 변경 (이전엔 fail-open이라
     조건 검사가 깨져도 claude를 깨워서 zero-cost gating 약속과 모순됐다).
@@ -239,20 +298,29 @@ def _check_condition(job: dict) -> bool:
     """
     condition = job.get("condition", "")
     if not condition:
-        return True
+        return True, ""
 
     name = job.get("name", "?")
     try:
+        # claude 호출과 동일하게 프로젝트 cwd에서 실행한다. cwd 없이 돌리면
+        # launchd 데몬의 cwd 기준이 되어 상대 경로 condition이 전부 깨진다.
         result = subprocess.run(
-            condition, shell=True, capture_output=True, timeout=10
+            condition,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(_slug_to_cwd(job.get("slug", ""))),
         )
-        return result.returncode == 0
+        lines = (result.stdout or "").strip().splitlines()
+        reason = lines[0][:200] if lines else ""
+        return result.returncode == 0, reason
     except subprocess.TimeoutExpired:
         log.warning(f"[{name}] condition 타임아웃 (10s) → 안전을 위해 skip")
-        return False
+        return False, "condition 타임아웃 (10s)"
     except Exception as exc:
         log.warning(f"[{name}] condition 검사 실패 ({type(exc).__name__}: {exc}) → skip")
-        return False
+        return False, f"condition 실행 실패 ({type(exc).__name__})"
 
 
 def _kill_process_group(proc: subprocess.Popen, grace: float = 10.0) -> None:
@@ -354,12 +422,16 @@ def run_job(job: dict, state: dict) -> bool:
     prompt = job["prompt"]
     timeout = job["timeout"]
     max_per = job.get("max_per")
+    model = job.get("model", "")
 
+    # Quota 체크 — condition보다 먼저 (quota 초과면 condition subprocess 비용도 아낌).
+    # _quota_exceeded가 recent_runs를 정리(변이)하므로 락 안에서 부른다. 배리어 제거로
+    # 동시 그룹이 늘어 락 밖 변이는 직렬화 중인 json.dumps와 경합한다.
     with _state_lock:
         job_state = state.setdefault(name, {})
+        quota_hit = _quota_exceeded(job_state, max_per)
 
-    # Quota 체크 — condition보다 먼저 (quota 초과면 condition subprocess 비용도 아낌)
-    if _quota_exceeded(job_state, max_per):
+    if quota_hit:
         count, window_sec = max_per  # type: ignore[misc]
         log.info(f"[{name}] quota 초과 ({len(job_state['recent_runs'])}/{count} in {window_sec}s), 스킵")
         with _state_lock:
@@ -369,24 +441,36 @@ def run_job(job: dict, state: dict) -> bool:
             _save_state(state)
         return False
 
+    # CWD 확인 — condition보다 먼저. condition이 프로젝트 cwd에서 돌기 때문에,
+    # 없는 경로에서는 "condition 실행 실패"가 진짜 원인(CWD 없음)을 가린다.
+    cwd = _slug_to_cwd(slug)
+    if not cwd.exists():
+        log.warning(f"[{name}] CWD {cwd} 존재하지 않음, 스킵")
+        return False
+
     # Check condition
-    if not _check_condition(job):
-        log.info(f"[{name}] condition 불충족, 스킵")
+    condition_ok, condition_reason = _check_condition(job)
+    if not condition_ok:
+        log.info(f"[{name}] condition 불충족, 스킵" + (f" — {condition_reason}" if condition_reason else ""))
         # condition 불충족도 last_run을 갱신한다. 갱신하지 않으면 interval 만료된 잡이
         # 매 tick마다 condition 체크를 반복하면서 로그 폭주 + 외부 프로세스 호출이 누적된다.
         with _state_lock:
             job_state["last_run"] = datetime.now().isoformat()
             job_state["last_result"] = "skipped"
             job_state["last_duration"] = 0
+            # 빈 출력이면 낡은 사유를 지운다. 이전 스킵의 사유가 이번 스킵의 사유로 보이면 안 된다.
+            if condition_reason:
+                job_state["last_condition_output"] = condition_reason
+            else:
+                job_state.pop("last_condition_output", None)
             _save_state(state)
         return False
 
-    cwd = _slug_to_cwd(slug)
-    if not cwd.exists():
-        log.warning(f"[{name}] CWD {cwd} 존재하지 않음, 스킵")
-        return False
+    cmd = ["claude", "-p", prompt]
+    if model:
+        cmd += ["--model", model]
 
-    log.info(f"[{name}] 실행: claude -p \"{prompt}\" (cwd: {cwd})")
+    log.info(f"[{name}] 실행: claude -p \"{prompt}\"{f' --model {model}' if model else ''} (cwd: {cwd})")
 
     if _should_notify(job, "start"):
         _notify("Heartbeat", f"[{name}] 실행 시작")
@@ -395,7 +479,7 @@ def run_job(job: dict, state: dict) -> bool:
 
     try:
         proc = subprocess.Popen(
-            ["claude", "-p", prompt],
+            cmd,
             cwd=str(cwd),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -406,6 +490,10 @@ def run_job(job: dict, state: dict) -> bool:
         # (실패해도 토큰은 이미 소비된 거라 quota는 까야 함)
         with _state_lock:
             _record_quota_run(job_state, max_per)
+            if condition_reason:
+                job_state["last_condition_output"] = condition_reason
+            else:
+                job_state.pop("last_condition_output", None)
             _save_state(state)
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
@@ -464,8 +552,12 @@ def run_job(job: dict, state: dict) -> bool:
 _state_lock = threading.Lock()
 
 
-def _run_slug_group(_slug: str, jobs: list[dict], state: dict, now: float) -> None:
-    """Run all due jobs for a single slug, sequentially."""
+def _run_slug_group(_slug: str, jobs: list[dict], state: dict) -> None:
+    """Run all due jobs for a single slug, sequentially.
+
+    due 판정은 잡마다 그 시점 시각으로 한다. 디스패치 시각으로 고정하면 그룹 앞
+    잡이 오래 도는 동안 뒤 잡의 판정 기준이 낡아 한 라운드씩 밀린다.
+    """
     for job in jobs:
         name = job["name"]
         interval = job["interval"]
@@ -482,7 +574,7 @@ def _run_slug_group(_slug: str, jobs: list[dict], state: dict, now: float) -> No
         else:
             last_run_ts = 0
 
-        if now - last_run_ts >= interval:
+        if time.time() - last_run_ts >= interval:
             try:
                 run_job(job, state)
             except Exception as e:
@@ -492,45 +584,69 @@ def _run_slug_group(_slug: str, jobs: list[dict], state: dict, now: float) -> No
                     _save_state(state)
 
 
+# 실행 중인 slug 그룹. 배리어가 하던 역할 중 남겨야 하는 것은 "같은 그룹의 중복 실행
+# 금지" 하나뿐이고, 이 가드가 그 역할만 잇는다(v0.8.0).
+_inflight: set[str] = set()
+_inflight_lock = threading.Lock()
+
+
+def _dispatch_due_groups(
+    jobs: list[dict], state: dict, executor: ThreadPoolExecutor
+) -> dict:
+    """due 판정과 slug 그룹 제출만 하고 완료를 기다리지 않는다.
+
+    실행 중인 그룹은 due여도 건너뛴다. 반환값은 이번에 제출한 slug → Future 맵이다.
+    """
+    slug_groups: dict[str, list[dict]] = defaultdict(list)
+    for job in jobs:
+        slug_groups[job["slug"]].append(job)
+
+    futures: dict[str, object] = {}
+    for slug, group in slug_groups.items():
+        with _inflight_lock:
+            if slug in _inflight:
+                continue
+            _inflight.add(slug)
+
+        def _run(slug: str = slug, group: list[dict] = group) -> None:
+            try:
+                _run_slug_group(slug, group, state)
+            except Exception as e:
+                log.error(f"[{slug}] 그룹 실행 에러: {e}")
+            finally:
+                with _inflight_lock:
+                    _inflight.discard(slug)
+
+        futures[slug] = executor.submit(_run)
+    return futures
+
+
 def heartbeat_loop() -> None:
-    """Main heartbeat loop. Re-reads HEARTBEAT.md each cycle.
+    """Main heartbeat loop. Re-reads HEARTBEAT.md + jobs.d each cycle.
 
     Jobs with the same slug run sequentially (to avoid file conflicts).
-    Different slugs run in parallel.
+    Different slugs run independently — v0.8.0에서 사이클 배리어를 제거했다.
+    이전에는 전 그룹 완료를 기다린 뒤 다음 tick을 재서, 한 프로젝트의 장기 세션이
+    다른 프로젝트의 스케줄 전체를 세웠다(2026-08-04 실측: 10분짜리 세션이 다른
+    프로젝트의 due 잡을 그만큼 미룸).
     """
     log.info("Heartbeat 데몬 시작")
 
     state = _load_state()
+    # max_workers는 동시 slug 그룹 수의 상한이다. 그룹당 스레드 하나가 잡 완료까지
+    # 붙어 있으므로 프로젝트 수보다 넉넉하면 된다.
+    executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="hb-group")
 
     while True:
         config, jobs = parse_heartbeat_md()
         tick = config.get("tick", 60)
 
         if not jobs:
-            log.warning(f"HEARTBEAT.md에 잡이 없음, {tick}초 후 재확인")
+            log.warning(f"설정에 잡이 없음, {tick}초 후 재확인")
             time.sleep(tick)
             continue
 
-        # Group jobs by slug
-        slug_groups: dict[str, list[dict]] = defaultdict(list)
-        for job in jobs:
-            slug_groups[job["slug"]].append(job)
-
-        now = time.time()
-
-        # Run slug groups in parallel
-        with ThreadPoolExecutor(max_workers=len(slug_groups)) as executor:
-            futures = {
-                executor.submit(_run_slug_group, slug, group, state, now): slug
-                for slug, group in slug_groups.items()
-            }
-            for future in as_completed(futures):
-                slug = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    log.error(f"[{slug}] 그룹 실행 에러: {e}")
-
+        _dispatch_due_groups(jobs, state, executor)
         time.sleep(tick)
 
 

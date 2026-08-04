@@ -2,6 +2,53 @@
 
 이 프로젝트의 주요 변경사항을 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/) 1.1.0을 따른다.
 
+## [Unreleased] — 0.8.0 후보
+
+2026-08-04 도그푸딩에서 실측된 사고 두 건(프로젝트 간 잡 증발, 장기 세션의 전역 틱 블로킹)의
+구조적 해결. 배경은 `docs/planning/2026-08-04-productization.md`.
+
+### Added
+
+- 잡별 `model` 필드 — `claude --model <값>`으로 전달. 비어 있으면 CLI 기본 모델.
+  (이전 세션 WIP를 이번 릴리스에 포함)
+- `~/.claude/heartbeat/jobs.d/<slug>.md` — 프로젝트당 잡 파일 하나 (P0-A). 외부 도구는 자기
+  slug 파일만 통째로 쓰면 되고, 마커 블록·부분 병합이 계약에서 사라진다. 병합 우선순위와 잡
+  문법은 `docs/config-contract.md`에 고정.
+- `heartbeat migrate` — HEARTBEAT.md의 잡을 slug별 jobs.d 파일로 분리. slug 없는 블록·전역
+  설정·HTML 주석(외부 도구 마커)은 짝이 맞은 채 원본에 남고, 원본은 실행 전 백업. `--dry-run` 지원.
+- condition 스킵 사유 통로 — condition stdout 첫 줄(최대 200자)을 `state.json` 잡 항목의
+  `last_condition_output`에 저장. 소비자 화면이 "왜 건너뛰었는지"를 보여줄 수 있게 된다.
+  사유를 내는 것은 조건 스크립트 소유자의 선택이고 데몬은 통로만 보장한다.
+
+### Changed
+
+- 스케줄러 사이클 배리어 제거 (P0-B). 이전에는 매 tick마다 전 slug 그룹의 완료를 기다려 한
+  프로젝트의 장기 세션이 모든 프로젝트의 다음 tick을 세웠다. 이제 due 그룹을 상주 executor에
+  제출만 하고 바로 다음 tick으로 넘어가며, 실행 중인 그룹은 due여도 건너뛴다(in-flight 가드).
+  같은 slug 순차 실행과 데몬 안 같은 잡 중복 실행 금지는 그대로다.
+- `_check_condition`이 `(bool, 사유)` 튜플을 반환한다 (내부 API).
+- due 판정 시각을 디스패치 시각 고정에서 잡별 그 시점 시각으로 변경. 그룹 앞 잡이 오래 돌면
+  뒤 잡의 판정이 한 라운드 밀리던 문제 해소.
+- `heartbeat init`이 jobs.d 디렉토리도 만든다.
+
+### Fixed
+
+- condition을 프로젝트 cwd에서 실행. 이전에는 launchd 데몬의 cwd 기준이라 상대 경로
+  condition이 전부 깨졌다. (이전 세션 WIP를 이번 릴리스에 포함)
+- `state.json` 쓰기를 원자적 교체(temp + rename)로 변경. 소비자 앱이 폴링 중 잘린 JSON을
+  읽고 그 틱 데이터를 조용히 버리던 문제.
+- CWD 존재 확인을 condition 검사 앞으로 이동. 삭제된 프로젝트에서 "condition 실행 실패"가
+  진짜 원인(CWD 없음)을 가리던 문제.
+- quota 판정(`recent_runs` 정리·변이)을 상태 락 안으로 이동. 배리어 제거로 동시 그룹이 늘며
+  직렬화 중인 상태와 경합할 수 있던 문제.
+- jobs.d에서 일반 `.md` 파일만 읽는다(`.md` 이름의 디렉토리 등 무시).
+- 데몬 실행 중 `heartbeat once`를 돌리면 같은 잡이 겹칠 수 있음을 CLI가 경고한다.
+
+### Migration
+
+- 100% 하위호환. 기존 HEARTBEAT.md 그대로 동작하고, jobs.d는 옵트인이다.
+- 분리를 원하면 `heartbeat migrate` 한 번. 데몬 재시작 후 적용된다.
+
 ## [0.7.0] - 2026-05-15
 
 ### Added
