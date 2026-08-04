@@ -80,6 +80,10 @@
 
 ## P2. 프로덕트 완성도
 
+- quota 스킵 시 낡은 사유 잔존: 실행 한도 분기(`_quota_exceeded` 경로)가 `last_condition_output`을
+  지우지 않아, 한도 소진으로 건너뛴 잡에 이전 스킵의 사유가 남는다. 소비자(workflow-labs SPEC-023)는
+  quota_skipped에 사유를 표시하지 않는 것으로 우회 중 — 근본 수정은 이쪽. (2026-08-04 소비자 기획 중 발견)
+
 - 로그 로테이션 버그: 파일 핸들러가 데몬 시작일 이름으로 고정돼 8/4 로그가
   `heartbeat_20260803.log`에 쌓이는 것을 실측. `TimedRotatingFileHandler`로 교체.
 - 서비스 정체성 표준화: launchd 라벨이 설치 경로마다 다르다(실측: `com.catze.dream-heartbeat`).
