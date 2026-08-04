@@ -89,32 +89,34 @@ def cmd_install(args) -> None:
                 print("⚠ 프로젝트 slug를 자동 감지할 수 없음. --slug 옵션으로 지정하세요.")
                 return
 
-        HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        from heartbeat import core
 
-        existing = HEARTBEAT_FILE.read_text(encoding="utf-8") if HEARTBEAT_FILE.exists() else ""
+        # 잡은 프로젝트별 jobs.d/<slug>.md에 쓴다(v0.8.0 계약). HEARTBEAT.md는 읽기만 —
+        # 레거시에 있는 이름을 jobs.d에 또 쓰면 파싱은 jobs.d가 이겨서 레거시 정의가
+        # 조용히 무시되므로, 중복 판정에는 양쪽을 다 본다.
+        legacy = HEARTBEAT_FILE.read_text(encoding="utf-8") if HEARTBEAT_FILE.exists() else ""
 
         added = []
         for slug in slugs:
             short = _slug_short(slug)
             job_block = template.replace("{slug}", slug).replace("{slug_short}", short)
             job_name = f"{skill_name}-{short}"
+            target = core.JOBS_DIR / f"{slug}.md"
+            existing = target.read_text(encoding="utf-8") if target.exists() else ""
 
-            # Skip if already registered
-            if f"## {job_name}" in existing:
+            if f"## {job_name}" in existing or f"## {job_name}" in legacy:
                 print(f"  [{job_name}] 이미 등록됨, 스킵")
                 continue
 
-            existing = existing.rstrip() + "\n\n" + job_block
+            core.JOBS_DIR.mkdir(parents=True, exist_ok=True)
+            updated = (existing.rstrip() + "\n\n" if existing.strip() else "") + job_block
+            if not updated.endswith("\n"):
+                updated += "\n"
+            target.write_text(updated, encoding="utf-8")
+            print(f"✓ jobs.d/{target.name}에 [{job_name}] 등록")
             added.append(job_name)
 
-        if added:
-            # Ensure header
-            if not existing.strip().startswith("# HEARTBEAT"):
-                existing = "# HEARTBEAT\n\n" + existing.lstrip()
-            HEARTBEAT_FILE.write_text(existing, encoding="utf-8")
-            for name in added:
-                print(f"✓ HEARTBEAT.md에 [{name}] 등록")
-        else:
+        if not added:
             print("  추가할 잡 없음")
     else:
         print(f"  (heartbeat.md 템플릿 없음, 잡 등록 생략)")

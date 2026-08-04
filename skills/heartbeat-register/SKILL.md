@@ -1,5 +1,5 @@
 ---
-description: 사용자 자연어 요청을 HEARTBEAT.md 잡으로 등록한다. 단순 명령이면 prompt 직접 박고, 복잡한 multi-step이면 사용자 동의 받고 새 SKILL.md 페어로 정착시킨다. "하트비트에 등록", "이거 매일 돌게", "/heartbeat-register" 등으로 트리거.
+description: 사용자 자연어 요청을 하트비트 잡(jobs.d/<슬러그>.md)으로 등록한다. 단순 명령이면 prompt 직접 박고, 복잡한 multi-step이면 사용자 동의 받고 새 SKILL.md 페어로 정착시킨다. "하트비트에 등록", "이거 매일 돌게", "/heartbeat-register" 등으로 트리거.
 ---
 
 # /heartbeat-register — 자연어 잡 등록
@@ -7,7 +7,9 @@ description: 사용자 자연어 요청을 HEARTBEAT.md 잡으로 등록한다. 
 ## 핵심 원칙
 
 1. 사용자 명시적 동의 없이 `~/.claude/skills/`에 SKILL.md를 만들지 않는다. 사용자 입장에서 모르는 스킬이 갑자기 늘어나는 건 곤란하다.
-2. 사용자 명시적 동의 없이 `~/.claude/HEARTBEAT.md`를 수정하지 않는다.
+2. 사용자 명시적 동의 없이 `~/.claude/heartbeat/jobs.d/`의 잡 파일을 수정하지 않는다.
+   (잡은 프로젝트별 파일 `jobs.d/{슬러그}.md`에 산다. `~/.claude/HEARTBEAT.md`는 레거시라
+   새 잡을 거기 쓰지 않는다 — v0.8.0 계약, `docs/config-contract.md`.)
 3. 모호한 부분은 1~2개 짧게 묻는다. 사람을 길게 잡지 않는다.
 
 ## 절차
@@ -27,14 +29,14 @@ description: 사용자 자연어 요청을 HEARTBEAT.md 잡으로 등록한다. 
 
 ```markdown
 ## job-name
-- slug: {현재 CWD에서 추출한 슬러그}
 - prompt: {한 줄 명령}
 - interval: {추출한 주기}
 - timeout: 5m
 - notify: failure
 ```
 
-2. 동의(yes/ㅇㅇ/ㄱㄱ 등) 받으면 `~/.claude/HEARTBEAT.md` 끝에 추가.
+2. 동의(yes/ㅇㅇ/ㄱㄱ 등) 받으면 `~/.claude/heartbeat/jobs.d/{슬러그}.md` 끝에 추가
+   (파일 없으면 생성. 파일 이름이 곧 slug라 잡 블록에 `- slug:` 줄은 쓰지 않는다).
 3. `heartbeat jobs`로 등록 확인 출력.
 
 ### Phase 2B: 복잡 분기 — 스킬 페어 생성
@@ -66,11 +68,10 @@ description: {한 줄 설명. 트리거 키워드 포함}
 - {출력 포맷 약속}
 ```
 
-5. `~/.claude/HEARTBEAT.md`에 잡 등록:
+5. `~/.claude/heartbeat/jobs.d/{슬러그}.md`에 잡 등록:
 
 ```markdown
 ## {스킬-이름}
-- slug: {현재 CWD 슬러그}
 - prompt: /{스킬-이름}
 - interval: {추출한 주기}
 - timeout: 10m
@@ -97,7 +98,7 @@ quota 의미 한 줄 안내: "지난 24시간 안에 5번까지만 깨움. 5번 
 
 ### Phase 4: slug 자동 추출
 
-현재 CWD에서 슬러그 도출:
+현재 CWD에서 슬러그 도출 — 이 값이 잡 파일 이름(`jobs.d/{슬러그}.md`)이 된다:
 
 1. Bash `pwd`로 절대 경로 받기.
 2. `/`를 `-`로 교체, 맨 앞에 `-` 붙이기.
@@ -133,11 +134,10 @@ description: LLM 소식 웹 리서치 후 디스코드 #ai-news에 포스트
 4. mcp__plugin_discord_discord__reply로 #ai-news에 포스트
 ```
 
-7. (Phase 2B-5 + Phase 3) HEARTBEAT.md 등록:
+7. (Phase 2B-5 + Phase 3) `jobs.d/-Users-catze-Git-myproject.md` 등록:
 
 ```markdown
 ## llm-news-digest
-- slug: -Users-catze-Git-myproject
 - prompt: /llm-news-digest
 - interval: 1h
 - timeout: 10m
@@ -150,7 +150,9 @@ description: LLM 소식 웹 리서치 후 디스코드 #ai-news에 포스트
 ## 금지 사항
 
 - 사용자 동의 없이 `~/.claude/skills/`에 디렉토리/파일 생성 금지.
-- 사용자 동의 없이 `~/.claude/HEARTBEAT.md` 수정 금지.
+- 사용자 동의 없이 `~/.claude/heartbeat/jobs.d/` 잡 파일 수정 금지.
+- 새 잡을 `~/.claude/HEARTBEAT.md`에 쓰지 않는다(레거시). 거기 이미 있는 이름과도 충돌 확인 —
+  파싱은 jobs.d가 이겨서 한쪽이 조용히 무시된다.
 - 기존 잡 이름과 충돌하면 사용자에게 확인 ("같은 이름 잡 있어. 덮어쓸래 / 다른 이름?").
 - 슬러그가 의심스러우면(예: CWD가 home directory 그대로) 사용자에게 한 번 확인.
-- 너무 많은 질문으로 사용자 잡지 말 것 — 합리적 디폴트로 가고, 사용자가 원하면 나중에 HEARTBEAT.md 직접 편집.
+- 너무 많은 질문으로 사용자 잡지 말 것 — 합리적 디폴트로 가고, 사용자가 원하면 나중에 잡 파일 직접 편집.

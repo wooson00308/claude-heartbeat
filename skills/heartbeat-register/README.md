@@ -1,6 +1,6 @@
 # heartbeat-register skill
 
-_Turn natural-language requests into HEARTBEAT.md jobs._
+_Turn natural-language requests into heartbeat jobs (jobs.d)._
 
 **[한국어](README_ko.md)**
 
@@ -47,6 +47,6 @@ Claude가 분류하고, 복잡 분기면 동의 받고 SKILL.md를 만든다. �
 이 스킬은 사용자 명시적 동의 없이 다음을 하지 않는다:
 
 - `~/.claude/skills/`에 새 SKILL.md 생성
-- `~/.claude/HEARTBEAT.md` 수정
+- `~/.claude/heartbeat/jobs.d/` 잡 파일 수정
 
 갑자기 모르는 스킬이 늘어나거나 잡이 등록되는 일은 없다.

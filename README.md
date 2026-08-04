@@ -113,7 +113,24 @@ For manual setup, log paths, and the launchd / Task Scheduler details, see the [
 
 ## Configuration
 
-Jobs are defined in `~/.claude/HEARTBEAT.md`:
+Jobs live in per-project files under `~/.claude/heartbeat/jobs.d/` (v0.8.0+).
+Each file is named after the project slug and owns that project's jobs — no
+shared file, so tools writing jobs can never clobber another project:
+
+```markdown
+# ~/.claude/heartbeat/jobs.d/-Users-yourname-Git-myproject.md
+
+## daily-summary
+- prompt: Summarize today's git changes
+- interval: 1d
+- timeout: 5m
+- notify: failure
+```
+
+`~/.claude/HEARTBEAT.md` still works (legacy) and is where global settings
+like `tick` live. Run `heartbeat migrate` to split an existing HEARTBEAT.md
+into jobs.d files. On name collisions jobs.d wins. Full contract:
+[docs/config-contract.md](docs/config-contract.md).
 
 ```markdown
 # HEARTBEAT
@@ -139,7 +156,7 @@ Jobs are defined in `~/.claude/HEARTBEAT.md`:
 
 | Field     | Description                                                            | Default           |
 | --------- | ---------------------------------------------------------------------- | ----------------- |
-| slug      | Project slug (`~/.claude/projects/` subdirectory name)                 | Required          |
+| slug      | Project slug. In jobs.d files the filename is the slug, so the field is optional there | Required in HEARTBEAT.md |
 | prompt    | Prompt passed to `claude -p`                                           | Required          |
 | interval  | Run interval (s/m/h/d)                                                 | 1h                |
 | timeout   | Timeout (s/m/h/d)                                                      | 600s              |
@@ -164,7 +181,9 @@ heartbeat jobs                 # List configured jobs
 heartbeat once                 # Run all jobs once
 heartbeat once -j "name"       # Run specific job once
 heartbeat skills               # List available skills
-heartbeat install <name>       # Install a skill
+heartbeat install <name>       # Install a skill (registers jobs into jobs.d)
+heartbeat init                 # Create HEARTBEAT.md + jobs.d
+heartbeat migrate              # Split HEARTBEAT.md jobs into jobs.d files (--dry-run supported)
 heartbeat install-service      # Register with launchd (macOS) / Task Scheduler (Windows) / systemd (Linux)
 heartbeat uninstall-service    # Remove the OS scheduler entry
 ```

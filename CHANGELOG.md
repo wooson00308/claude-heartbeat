@@ -30,6 +30,10 @@
 - due 판정 시각을 디스패치 시각 고정에서 잡별 그 시점 시각으로 변경. 그룹 앞 잡이 오래 돌면
   뒤 잡의 판정이 한 라운드 밀리던 문제 해소.
 - `heartbeat init`이 jobs.d 디렉토리도 만든다.
+- `heartbeat install`의 잡 등록이 HEARTBEAT.md 대신 jobs.d/<slug>.md로 간다. 레거시에 같은
+  이름이 있으면 중복 정의를 만들지 않고 건너뛴다.
+- heartbeat-register 스킬이 잡을 jobs.d에 등록하도록 지시문 전환. README·setup.md·ko.md의
+  설정 절도 jobs.d 기준으로 갱신.
 
 ### Fixed
 

@@ -1,6 +1,6 @@
 # heartbeat-register 스킬
 
-_자연어 요청을 HEARTBEAT.md 잡으로 바꿔줍니다._
+_자연어 요청을 하트비트 잡(jobs.d)으로 바꿔줍니다._
 
 **[English](README.md)**
 
@@ -47,6 +47,6 @@ Claude가 자동으로 분류하고, 복잡한 분기면 사용자 동의를 받
 이 스킬은 사용자의 명시적 동의 없이 다음을 하지 않습니다:
 
 - `~/.claude/skills/` 아래에 새 SKILL.md 생성
-- `~/.claude/HEARTBEAT.md` 수정
+- `~/.claude/heartbeat/jobs.d/` 잡 파일 수정
 
 모르는 스킬이 갑자기 늘어나거나 잡이 등록되는 일은 없습니다.

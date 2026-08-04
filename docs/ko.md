@@ -113,7 +113,13 @@ heartbeat start
 
 ## 설정
 
-`~/.claude/HEARTBEAT.md`에 잡을 등록합니다:
+잡은 프로젝트별 파일 `~/.claude/heartbeat/jobs.d/<슬러그>.md`에 등록합니다(v0.8.0+).
+파일 이름이 곧 슬러그라 잡 블록에 `- slug:` 줄이 필요 없고, 도구들이 서로의 잡을
+지울 수 없습니다. `~/.claude/HEARTBEAT.md`는 레거시로 계속 동작하며 `tick` 같은
+전역 설정이 여기 삽니다. 기존 파일 분리는 `heartbeat migrate` 한 번이면 됩니다.
+전체 계약은 [config-contract.md](config-contract.md) 참고.
+
+레거시 `~/.claude/HEARTBEAT.md` 예시:
 
 ```markdown
 # HEARTBEAT
@@ -156,7 +162,9 @@ heartbeat jobs                 # 등록된 잡 목록
 heartbeat once                 # 모든 잡 1회 실행
 heartbeat once -j "name"       # 특정 잡 1회 실행
 heartbeat skills               # 사용 가능한 스킬 목록
-heartbeat install <name>       # 스킬 설치
+heartbeat install <name>       # 스킬 설치 (잡은 jobs.d에 등록)
+heartbeat init                 # HEARTBEAT.md + jobs.d 생성
+heartbeat migrate              # HEARTBEAT.md 잡을 jobs.d로 분리 (--dry-run 지원)
 heartbeat install-service      # OS 백그라운드 스케줄러에 등록 (launchd / Task Scheduler / systemd)
 heartbeat uninstall-service    # OS 스케줄러에서 해제
 ```
