@@ -4,13 +4,16 @@ import shutil
 import sys
 from pathlib import Path
 
+from heartbeat import __version__
 from heartbeat.core import (
+    DAEMON_STATE_KEY,
     _is_running,
     _load_state,
     _remove_pid,
     _setup_log_file,
     _write_pid,
     heartbeat_loop,
+    iter_job_states,
     parse_heartbeat_md,
     run_job,
     LOG_DIR,
@@ -287,10 +290,15 @@ def main() -> None:
         prog="heartbeat",
         description="Heartbeat — periodic claude agent scheduler"
     )
+    # 설치본 버전. 출력은 `heartbeat <X.Y.Z>` 한 줄로 고정된다(계약).
+    parser.add_argument("--version", action="version", version=f"heartbeat {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     # init
     sub.add_parser("init", help="Initialize heartbeat (create HEARTBEAT.md)")
+
+    # version (--version과 같은 출력. 서브커맨드로도 찾는 사람이 있다)
+    sub.add_parser("version", help="Print installed heartbeat version")
 
     # start
     p_start = sub.add_parser("start", help="Start heartbeat (foreground)")
@@ -322,6 +330,12 @@ def main() -> None:
         help="Split HEARTBEAT.md jobs into per-project jobs.d/<slug>.md files",
     )
     p_migrate.add_argument("--dry-run", action="store_true", help="실제 쓰기 없이 결과만 출력")
+
+    # update (설치본 갱신 + 데몬 재기동)
+    sub.add_parser(
+        "update",
+        help="Update this editable install (git pull --ff-only) and restart the daemon",
+    )
 
     # install
     p_install = sub.add_parser("install", help="Install a skill")
@@ -388,9 +402,15 @@ def main() -> None:
             print("실행 중인 heartbeat 없음")
 
         state = _load_state()
-        if state:
+        daemon = state.get(DAEMON_STATE_KEY) or {}
+        if existing and daemon:
+            # 도는 프로세스와 디스크 코드가 갈린 상태를 여기서 잡는다.
+            print(f"  데몬 v{daemon.get('version', '?')} / 설치본 v{__version__}")
+
+        jobs = list(iter_job_states(state))
+        if jobs:
             print()
-            for name, info in state.items():
+            for name, info in jobs:
                 last = info.get("last_run", "-")
                 result = info.get("last_result", "-")
                 duration = info.get("last_duration", "-")
@@ -439,6 +459,14 @@ def main() -> None:
 
     elif args.command == "install":
         cmd_install(args)
+
+    elif args.command == "version":
+        print(f"heartbeat {__version__}")
+
+    elif args.command == "update":
+        from heartbeat.update import cmd_update
+
+        sys.exit(cmd_update(args))
 
     elif args.command == "install-service":
         sys.exit(install_service(print_only=args.print_only))

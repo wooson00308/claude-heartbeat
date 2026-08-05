@@ -1,6 +1,6 @@
 [project]
 name = "claude-heartbeat"
-version = "0.7.0"
+dynamic = ["version"]  # 단일 원천: src/heartbeat/__init__.py의 __version__
 description = "Periodic claude agent scheduler — wake Claude on schedule, run skills automatically"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,6 +16,9 @@ dev = ["pytest>=7.0", "pytest-cov>=4.0"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/heartbeat/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/heartbeat", "skills"]

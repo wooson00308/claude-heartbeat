@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import plistlib
 import subprocess
 from pathlib import Path
 
-from .base import ServiceAdapter
+from .base import RestartResult, ServiceAdapter
 
 PLIST_LABEL = "com.claude-heartbeat"
 
@@ -48,6 +50,58 @@ class LaunchdAdapter(ServiceAdapter):
     def _plist_path(self) -> Path:
         return Path.home() / "Library" / "LaunchAgents" / f"{PLIST_LABEL}.plist"
 
+    def _heartbeat_plists(self) -> list[Path]:
+        """LaunchAgents에 있는 heartbeat 계열 plist 전부. 표준 라벨이 항상 앞이다.
+
+        코드의 표준 라벨(com.claude-heartbeat)보다 먼저 다른 이름으로 설치된
+        서비스가 실기기에 있다(실측: com.catze.dream-heartbeat). 재기동·중복 감지는
+        코드가 아는 이름이 아니라 실제로 등록된 파일을 봐야 한다.
+        """
+        agents = Path.home() / "Library" / "LaunchAgents"
+        if not agents.exists():
+            return []
+        found = sorted(p for p in agents.glob("*.plist") if "heartbeat" in p.stem.lower())
+        own = self._plist_path()
+        return [p for p in found if p == own] + [p for p in found if p != own]
+
+    def _label_of(self, plist_path: Path) -> str:
+        """plist의 Label 값. 못 읽으면 파일 이름으로 대신한다."""
+        try:
+            with plist_path.open("rb") as fh:
+                label = plistlib.load(fh).get("Label")
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            return plist_path.stem
+        return label or plist_path.stem
+
+    def detect(self) -> str | None:
+        plists = self._heartbeat_plists()
+        return self._label_of(plists[0]) if plists else None
+
+    def restart(self) -> RestartResult:
+        label = self.detect()
+        if label is None:
+            return RestartResult("skipped", "not-registered")
+
+        try:
+            listed = subprocess.run(
+                ["launchctl", "list", label], capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            return RestartResult("failed", "launchctl-missing", label)
+
+        if listed.returncode != 0:
+            # plist는 있는데 로드가 안 된 상태. 지금 도는 프로세스가 없으니 재기동할
+            # 것도 없고, 다음 로드 때 새 코드로 뜬다.
+            return RestartResult("skipped", "not-loaded", label)
+
+        kick = subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True,
+        )
+        if kick.returncode == 0:
+            return RestartResult("ok", "restarted", label)
+        return RestartResult("failed", "restart-failed", label)
+
     def render(self) -> str | None:
         bin_path = self._heartbeat_bin()
         if not bin_path:
@@ -69,12 +123,27 @@ class LaunchdAdapter(ServiceAdapter):
             return 1
 
         plist_path = self._plist_path()
+        # 다른 이름으로 이미 등록된 heartbeat 서비스가 있으면 새로 얹지 않는다.
+        # 얹으면 데몬이 둘 뜨고 같은 잡이 두 번 실행된다.
+        foreign = [p for p in self._heartbeat_plists() if p != plist_path]
 
         if print_only:
+            if foreign:
+                print(f"# ⚠ 이미 등록된 heartbeat 서비스: {', '.join(self._label_of(p) for p in foreign)}")
+                print("# 실제 등록은 거부된다 (데몬 중복 실행 방지). 아래는 참고용 내용.")
             print(f"# {plist_path}")
             print(plist)
             print(f"# Load:\nlaunchctl load {plist_path}")
             return 0
+
+        if foreign:
+            labels = ", ".join(self._label_of(p) for p in foreign)
+            print(f"⚠ 이미 등록된 heartbeat 서비스가 있음: {labels}")
+            print("  그대로 등록하면 데몬이 둘 뜨고 같은 잡이 두 번 실행됩니다.")
+            for p in foreign:
+                print(f"  기존 해제: launchctl unload {p} && rm {p}")
+            print("  해제 후 다시 실행하세요: heartbeat install-service")
+            return 1
 
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         Path(f"{Path.home()}/.claude/heartbeat").mkdir(parents=True, exist_ok=True)

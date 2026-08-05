@@ -19,6 +19,8 @@ from pathlib import Path
 
 import psutil
 
+from heartbeat import __version__
+
 # subprocess.Popen 호출 시 OS별 process group / session 분리 옵션.
 # POSIX: start_new_session=True → setsid()로 새 session leader, killpg 가능.
 # Windows: creationflags=CREATE_NEW_PROCESS_GROUP → CTRL+BREAK_EVENT 분리, 부모와 시그널 격리.
@@ -35,6 +37,10 @@ STATE_FILE = LOG_DIR / "state.json"
 # v0.8.0: 프로젝트당 잡 파일 하나. 여러 도구가 HEARTBEAT.md 한 파일을 나눠 쓰다
 # 서로의 잡을 지우는 사고(2026-08-04 실측)를 파일 단위 소유로 막는다.
 JOBS_DIR = LOG_DIR / "jobs.d"
+
+# state.json 최상위에서 밑줄로 시작하는 키는 데몬 예약 영역이다(잡 이름이 아니다).
+# 잡 목록을 훑는 소비자는 이 키들을 건너뛴다 — 계약은 docs/config-contract.md.
+DAEMON_STATE_KEY = "_daemon"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,6 +103,28 @@ def _save_state(state: dict) -> None:
     temporary = STATE_FILE.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, STATE_FILE)
+
+
+def _record_daemon_start(state: dict) -> None:
+    """기동한 데몬의 정체(버전·pid·시각)를 state.json에 남긴다.
+
+    소비자 앱이 "지금 도는 데몬이 몇 버전인가"를 알 원천이다. 설치본 버전
+    (`heartbeat --version`)과 다르면 코드는 갱신됐는데 프로세스가 옛 코드라는
+    뜻이고, 그게 2026-08-05 사고(디스크 main / 메모리 v0.8.0)의 신호다.
+
+    잡 항목과 같은 dict에 살지만 키가 `_`로 시작해 잡 이름과 섞이지 않는다.
+    """
+    state[DAEMON_STATE_KEY] = {
+        "version": __version__,
+        "pid": os.getpid(),
+        "started_at": datetime.now().isoformat(),
+    }
+    _save_state(state)
+
+
+def iter_job_states(state: dict):
+    """state.json에서 잡 항목만 (이름, 정보)로 훑는다. `_` 예약 키는 건너뛴다."""
+    return ((name, info) for name, info in state.items() if not name.startswith("_"))
 
 
 # --- macOS notifications ---
@@ -630,9 +658,10 @@ def heartbeat_loop() -> None:
     다른 프로젝트의 스케줄 전체를 세웠다(2026-08-04 실측: 10분짜리 세션이 다른
     프로젝트의 due 잡을 그만큼 미룸).
     """
-    log.info("Heartbeat 데몬 시작")
+    log.info(f"Heartbeat 데몬 시작 (v{__version__})")
 
     state = _load_state()
+    _record_daemon_start(state)
     # max_workers는 동시 slug 그룹 수의 상한이다. 그룹당 스레드 하나가 잡 완료까지
     # 붙어 있으므로 프로젝트 수보다 넉넉하면 된다.
     executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="hb-group")

@@ -19,6 +19,18 @@
 - condition 스킵 사유 통로 — condition stdout 첫 줄(최대 200자)을 `state.json` 잡 항목의
   `last_condition_output`에 저장. 소비자 화면이 "왜 건너뛰었는지"를 보여줄 수 있게 된다.
   사유를 내는 것은 조건 스크립트 소유자의 선택이고 데몬은 통로만 보장한다.
+- 버전 표면 — `heartbeat --version` / `heartbeat version`이 `heartbeat <X.Y.Z>` 한 줄을 낸다.
+  버전의 단일 원천은 `src/heartbeat/__init__.py`의 `__version__`이고 pyproject가 여기서 읽어 간다.
+  editable 설치의 패키지 메타데이터는 마지막 `pip install -e` 시점에 굳어 코드와 어긋나므로
+  런타임 원천으로 쓰지 않는다(실측: 메타데이터 0.5.1 / 코드 0.8.0).
+- `state.json`의 `_daemon` 항목 — 데몬 기동 때마다 그 프로세스의 `version`·`pid`·`started_at`을
+  기록한다. 소비자 앱이 "지금 도는 프로세스가 몇 버전인가"를 읽을 원천. 최상위에서 밑줄로
+  시작하는 키는 잡 이름이 아니라 데몬 예약 영역이다.
+- `heartbeat update` — editable 설치본을 fast-forward로 갱신하고(repo → deps → service) 필요하면
+  데몬을 새 코드로 재기동한다. 앱이 부르는 명령이라 stdout `key=value` 계약 줄과 원인별 종료
+  코드가 계약이고 사람용 진단은 stderr로 간다. 어휘·종료 코드는 `docs/config-contract.md`에 고정.
+  코드가 안 움직였어도 도는 데몬 버전이 디스크와 다르면 재기동한다 — 2026-08-05 실측 사고
+  (디스크는 갱신됐는데 메모리의 데몬은 옛 코드)가 그 모양이었다.
 
 ### Changed
 
@@ -34,6 +46,13 @@
   이름이 있으면 중복 정의를 만들지 않고 건너뛴다.
 - heartbeat-register 스킬이 잡을 jobs.d에 등록하도록 지시문 전환. README·setup.md·ko.md의
   설정 절도 jobs.d 기준으로 갱신.
+- `heartbeat status`가 도는 데몬 버전과 설치본 버전을 같이 보여준다. 두 값이 갈리면 프로세스가
+  옛 코드라는 뜻이다.
+- ServiceAdapter에 `detect`·`restart` 추가 (launchd·systemd·Task Scheduler). 재기동 대상은 코드가
+  아는 표준 이름이 아니라 이 머신에 실제로 등록된 서비스다.
+- macOS `install-service`가 다른 이름으로 이미 등록된 heartbeat plist를 발견하면 등록을 거부하고
+  해제 명령을 안내한다. 그대로 얹으면 데몬이 둘 뜨고 같은 잡이 두 번 실행된다(실측:
+  `com.catze.dream-heartbeat`).
 
 ### Fixed
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from .base import ServiceAdapter
+from .base import RestartResult, ServiceAdapter
 
 UNIT_NAME = "claude-heartbeat.service"
 
@@ -38,6 +38,32 @@ class SystemdAdapter(ServiceAdapter):
 
     def _unit_path(self) -> Path:
         return Path.home() / ".config" / "systemd" / "user" / UNIT_NAME
+
+    def detect(self) -> str | None:
+        return UNIT_NAME if self._unit_path().exists() else None
+
+    def restart(self) -> RestartResult:
+        unit = self.detect()
+        if unit is None:
+            return RestartResult("skipped", "not-registered")
+
+        try:
+            active = subprocess.run(
+                ["systemctl", "--user", "is-active", unit], capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            return RestartResult("failed", "systemctl-missing", unit)
+
+        if active.returncode != 0:
+            # unit은 있는데 지금 안 돌고 있다. 재기동할 프로세스가 없다.
+            return RestartResult("skipped", "not-loaded", unit)
+
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", unit], capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return RestartResult("ok", "restarted", unit)
+        return RestartResult("failed", "restart-failed", unit)
 
     def render(self) -> str | None:
         bin_path = self._heartbeat_bin()
