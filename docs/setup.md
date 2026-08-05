@@ -24,7 +24,7 @@ heartbeat skills
 heartbeat install dream
 ```
 
-This copies the skill file to `~/.claude/skills/dream/` and registers heartbeat jobs in `~/.claude/HEARTBEAT.md`.
+This copies the skill file to `~/.claude/skills/dream/` and registers heartbeat jobs in per-project files under `~/.claude/heartbeat/jobs.d/` (v0.8.0+).
 
 To install for a specific project only:
 
@@ -112,7 +112,7 @@ Unload:
 launchctl unload ~/Library/LaunchAgents/com.claude-heartbeat.plist
 ```
 
-> launchd requires `--foreground` mode to work properly.
+> Since v0.4.0 `heartbeat start` always runs in the foreground — backgrounding is the OS scheduler's job.
 > With KeepAlive enabled, the process auto-restarts if it dies.
 
 ---
@@ -120,18 +120,26 @@ launchctl unload ~/Library/LaunchAgents/com.claude-heartbeat.plist
 ## CLI Reference
 
 ```bash
-heartbeat start           # Start daemon (background)
-heartbeat start -f        # Foreground mode
-heartbeat stop            # Stop daemon
-heartbeat status          # Status + job states + recent logs
-heartbeat jobs            # List configured jobs
-heartbeat once            # Run all jobs once
-heartbeat once -j "name"  # Run specific job once
-heartbeat skills          # List available skills
-heartbeat install <name>  # Install a skill
+heartbeat start            # Start (always foreground since v0.4.0)
+heartbeat stop             # Stop daemon
+heartbeat status           # Status + job states + recent logs
+heartbeat jobs             # List configured jobs
+heartbeat once             # Run all jobs once
+heartbeat once -j "name"   # Run specific job once
+heartbeat skills           # List available skills
+heartbeat install <name>   # Install a skill (registers jobs into jobs.d)
+heartbeat init             # Create HEARTBEAT.md + jobs.d
+heartbeat migrate          # Split HEARTBEAT.md jobs into jobs.d files (--dry-run)
+heartbeat install-service  # Register with launchd / Task Scheduler / systemd
+heartbeat uninstall-service # Remove the OS scheduler entry
 ```
 
-### HEARTBEAT.md Format
+### Job File Format
+
+Jobs live in `~/.claude/heartbeat/jobs.d/<slug>.md` (one file per project; the
+filename is the slug, so the `slug` field is optional there). `~/.claude/HEARTBEAT.md`
+still works as a legacy location and holds global settings like `tick`.
+See [config-contract.md](config-contract.md) for the full contract.
 
 ```markdown
 ## job-name
@@ -150,4 +158,6 @@ heartbeat install <name>  # Install a skill
 | interval | Run interval (s/m/h/d) | 1h |
 | timeout | Timeout (s/m/h/d) | 600s |
 | condition | Pre-run shell check (exit 0 = run) | None (always run) |
-| notify | macOS notification level: `all`, `failure`, `none` | all |
+| notify | Desktop notification level: `all`, `failure`, `none` | all |
+| max_per | Sliding-window quota, e.g. `5/24h` (at most 5 runs in any 24h) | None (no quota) |
+| model | Model passed to `claude --model` (e.g. `opus`) | None (CLI default) |

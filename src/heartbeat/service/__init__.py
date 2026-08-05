@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-from .base import ServiceAdapter
+from .base import RestartResult, ServiceAdapter
 from .launchd import LaunchdAdapter
 from .systemd import SystemdAdapter
 from .task_scheduler import TaskSchedulerAdapter
@@ -44,12 +44,29 @@ def uninstall_service(print_only: bool = False) -> int:
     return adapter.uninstall(print_only)
 
 
+def restart_service() -> RestartResult:
+    """OS 감지하여 등록된 서비스를 재기동. `heartbeat update`의 service 단계."""
+    adapter = _get_adapter()
+    if adapter is None:
+        return RestartResult("failed", "unsupported-platform")
+    return adapter.restart()
+
+
+def detect_service() -> str | None:
+    """이 머신에 등록된 heartbeat 서비스 이름. 미등록이면 None."""
+    adapter = _get_adapter()
+    return adapter.detect() if adapter is not None else None
+
+
 __all__ = [
     "ADAPTERS",
     "LaunchdAdapter",
+    "RestartResult",
     "ServiceAdapter",
     "SystemdAdapter",
     "TaskSchedulerAdapter",
+    "detect_service",
     "install_service",
+    "restart_service",
     "uninstall_service",
 ]

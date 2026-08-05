@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 
-from .base import ServiceAdapter
+from .base import RestartResult, ServiceAdapter
 
 TASK_NAME = "claude-heartbeat"
 
@@ -24,6 +24,38 @@ class TaskSchedulerAdapter(ServiceAdapter):
 
     def _uninstall_cmd(self) -> list[str]:
         return ["schtasks.exe", "/delete", "/tn", TASK_NAME, "/f"]
+
+    def detect(self) -> str | None:
+        try:
+            result = subprocess.run(
+                ["schtasks.exe", "/query", "/tn", TASK_NAME], capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            return None
+        return TASK_NAME if result.returncode == 0 else None
+
+    def restart(self) -> RestartResult:
+        """/end 후 /run.
+
+        launchd·systemd와 달리 `not-loaded`를 구분하지 않는다. schtasks의 실행 상태
+        문자열이 로케일 의존이라 파싱을 계약에 넣을 수 없다. 안 돌고 있으면 /end가
+        실패하는데 그건 무시하고 /run으로 띄운다 — 등록돼 있으면 결과는 항상 "뜬 상태".
+        """
+        task = self.detect()
+        if task is None:
+            return RestartResult("skipped", "not-registered")
+
+        try:
+            subprocess.run(["schtasks.exe", "/end", "/tn", task], capture_output=True, text=True)
+            result = subprocess.run(
+                ["schtasks.exe", "/run", "/tn", task], capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            return RestartResult("failed", "schtasks-missing", task)
+
+        if result.returncode == 0:
+            return RestartResult("ok", "restarted", task)
+        return RestartResult("failed", "restart-failed", task)
 
     def render(self) -> str | None:
         """등록 명령을 한 줄 문자열로 반환. (Task Scheduler는 파일 정의가 아니라 명령)."""
