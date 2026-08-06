@@ -164,6 +164,7 @@ into jobs.d files. On name collisions jobs.d wins. Full contract:
 | notify    | Desktop notification level: `all`, `failure`, `none`                   | all               |
 | max_per   | Sliding-window quota (e.g. `5/24h` = at most 5 runs in any 24h window) | None (no quota)   |
 | model     | Model passed to `claude --model` (e.g. `opus`, `sonnet`)               | None (CLI default) |
+| group     | Dispatch group. Jobs in the same group run sequentially; different groups run in parallel. Namespaced per slug, so the whole project serializes by default. Opting out means the project's own locking must prevent file conflicts | None (group = slug) |
 
 Global settings go before any `##` job header:
 

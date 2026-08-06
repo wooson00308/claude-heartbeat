@@ -271,6 +271,7 @@ def _parse_jobs_text(content: str) -> tuple[dict, list[dict]]:
                 "notify": "all",
                 "max_per": None,  # (count, window_sec) 튜플 또는 None
                 "model": "",  # claude --model 값. 비어 있으면 CLI 기본 모델
+                "group": "",  # 디스패치 그룹. 비어 있으면 slug 전체가 한 그룹(직렬)
             }
         elif current_job and line.startswith("- "):
             kv = line[2:]
@@ -292,6 +293,8 @@ def _parse_jobs_text(content: str) -> tuple[dict, list[dict]]:
                     current_job["notify"] = val
                 elif key == "model":
                     current_job["model"] = val
+                elif key == "group":
+                    current_job["group"] = val
                 elif key == "max_per":
                     parsed = _parse_max_per(val)
                     if parsed is not None:
@@ -629,13 +632,21 @@ _inflight_lock = threading.Lock()
 def _dispatch_due_groups(
     jobs: list[dict], state: dict, executor: ThreadPoolExecutor
 ) -> dict:
-    """due 판정과 slug 그룹 제출만 하고 완료를 기다리지 않는다.
+    """due 판정과 그룹 제출만 하고 완료를 기다리지 않는다.
 
-    실행 중인 그룹은 due여도 건너뛴다. 반환값은 이번에 제출한 slug → Future 맵이다.
+    실행 중인 그룹은 due여도 건너뛴다. 반환값은 이번에 제출한 그룹 키 → Future 맵이다.
+
+    그룹 키는 기본이 slug(프로젝트 전체 직렬)이고, 잡이 `group`을 선언하면
+    `slug/group`으로 갈라져 같은 프로젝트 안에서도 그룹끼리 병렬로 돈다.
+    키를 slug로 네임스페이스하는 것은 다른 프로젝트가 우연히 같은 group 이름을
+    써도 서로 직렬화되지 않게 하려는 것이다. 파일 충돌 방지는 각 프로젝트의
+    조건·선점 규약 몫이 된다 — group을 선언하는 쪽이 그 보장을 가져야 한다.
     """
     slug_groups: dict[str, list[dict]] = defaultdict(list)
     for job in jobs:
-        slug_groups[job["slug"]].append(job)
+        group = job.get("group", "")
+        key = f"{job['slug']}/{group}" if group else job["slug"]
+        slug_groups[key].append(job)
 
     futures: dict[str, object] = {}
     for slug, group in slug_groups.items():
@@ -660,8 +671,9 @@ def _dispatch_due_groups(
 def heartbeat_loop() -> None:
     """Main heartbeat loop. Re-reads HEARTBEAT.md + jobs.d each cycle.
 
-    Jobs with the same slug run sequentially (to avoid file conflicts).
-    Different slugs run independently — v0.8.0에서 사이클 배리어를 제거했다.
+    Jobs in the same dispatch group run sequentially (default group = slug,
+    so a project's jobs avoid file conflicts unless a job opts out via `group`).
+    Different groups run independently — v0.8.0에서 사이클 배리어를 제거했다.
     이전에는 전 그룹 완료를 기다린 뒤 다음 tick을 재서, 한 프로젝트의 장기 세션이
     다른 프로젝트의 스케줄 전체를 세웠다(2026-08-04 실측: 10분짜리 세션이 다른
     프로젝트의 due 잡을 그만큼 미룸).

@@ -29,7 +29,7 @@ def clean_inflight():
         core._inflight.clear()
 
 
-def _job(name, slug):
+def _job(name, slug, group=""):
     return {
         "name": name,
         "slug": slug,
@@ -40,6 +40,7 @@ def _job(name, slug):
         "notify": "none",
         "max_per": None,
         "model": "",
+        "group": group,
     }
 
 
@@ -105,6 +106,57 @@ def test_inflight_guard_is_released_even_when_group_raises(executor, monkeypatch
 
     with core._inflight_lock:
         assert "-proj" not in core._inflight
+
+
+def test_jobs_with_distinct_groups_in_one_slug_dispatch_in_parallel(executor, monkeypatch):
+    """같은 slug라도 group이 다르면 그룹 키가 갈라져 각자 제출된다.
+
+    group이 없는 잡은 지금까지처럼 slug 키에 남는다 — 한 파일 안에서 선언한
+    잡만 병렬로 빠지고 나머지는 서로 직렬을 유지한다.
+    """
+    ran: list[str] = []
+    monkeypatch.setattr(core, "_run_slug_group", lambda slug, group, state: ran.append(slug))
+
+    futures = core._dispatch_due_groups(
+        [
+            _job("planner", "-proj", group="planner"),
+            _job("developer", "-proj", group="developer"),
+            _job("ungrouped", "-proj"),
+        ],
+        {},
+        executor,
+    )
+
+    assert set(futures) == {"-proj/planner", "-proj/developer", "-proj"}
+    for f in futures.values():
+        f.result(timeout=5)
+    assert sorted(ran) == ["-proj", "-proj/developer", "-proj/planner"]
+
+
+def test_same_group_name_in_different_slugs_is_namespaced(executor, monkeypatch):
+    """다른 프로젝트가 우연히 같은 group 이름을 써도 서로 직렬화되지 않는다."""
+    ran: list[str] = []
+    monkeypatch.setattr(core, "_run_slug_group", lambda slug, group, state: ran.append(slug))
+
+    with core._inflight_lock:
+        core._inflight.add("-p1/planner")
+
+    futures = core._dispatch_due_groups(
+        [_job("a", "-p1", group="planner"), _job("b", "-p2", group="planner")], {}, executor
+    )
+
+    assert set(futures) == {"-p2/planner"}
+    futures["-p2/planner"].result(timeout=5)
+    assert ran == ["-p2/planner"]
+
+
+def test_group_field_is_parsed_from_job_text():
+    _, jobs = core._parse_jobs_text(
+        "## with-group\n- prompt: p\n- group: planner\n\n## without-group\n- prompt: p\n"
+    )
+
+    assert jobs[0]["group"] == "planner"
+    assert jobs[1]["group"] == ""
 
 
 def test_interval_due_check_still_applies(executor, monkeypatch):

@@ -151,6 +151,7 @@ heartbeat start
 | condition | 실행 전 셸 체크 (exit 0이면 실행)                                   | 없음 (항상 실행)  |
 | notify    | 데스크탑 알림 수준: `all`, `failure`, `none`                        | all               |
 | max_per   | 슬라이딩 윈도우 quota (예: `5/24h` = 지난 24시간 안 최대 5회 실행) | 없음 (quota 없음) |
+| group     | 디스패치 그룹. 같은 그룹은 직렬, 다른 그룹은 병렬. slug로 네임스페이스되어 기본은 프로젝트 전체 직렬. 선언하는 쪽이 파일 충돌 방지(선점 규약 등)를 보장해야 한다 | 없음 (그룹 = slug) |
 
 ## CLI
 

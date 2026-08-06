@@ -31,6 +31,7 @@
 - notify: <all | failure | none>
 - model: <claude --model 값. 생략 시 CLI 기본>
 - max_per: <N/24h 슬라이딩 윈도우 한도. 생략 시 무제한>
+- group: <디스패치 그룹. 같은 그룹 직렬·다른 그룹 병렬. slug로 네임스페이스. 생략 시 프로젝트 전체가 한 그룹>
 ```
 
 - jobs.d 파일 안의 잡은 파일 이름의 slug 소속으로 강제된다. `- slug:` 줄은
