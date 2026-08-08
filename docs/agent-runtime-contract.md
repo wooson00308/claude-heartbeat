@@ -218,3 +218,26 @@ Windows Task Scheduler는 RestartOnFailure와 중복 실행 방지 정책을 사
 service는 로그아웃 이후에도 실행하려면 `loginctl enable-linger`가 필요하다. 서비스가 재시작돼도
 runtime SQLite와 기존 state 파일이 남으므로 다음 dispatcher는 영속 상태를 먼저 복구하고 같은
 작업을 중복 시작하지 않아야 한다.
+
+## 릴리스 검증 계약
+
+런타임 CI와 릴리스는 `tests/test_agent_end_to_end.py`를 macOS, Linux, Windows에서 같은 fixture로
+실행한다. fixture는 로컬 Python 프로세스를 Claude와 Codex CLI 대신 사용하므로 provider SDK, 실제
+계정, API 키와 유료 요청이 없다. 검사는 다음 경계를 한 묶음으로 고정한다.
+
+- 계약의 provider 목록은 Claude와 Codex만 포함하고 Dream을 포함하지 않는다.
+- 두 프로젝트의 설정, 반복 의도, 실행 상태가 SQLite 재접속 뒤에도 서로 섞이지 않는다.
+- 역할, 프로젝트, 기기 상한과 예약 가능한 대상 수 중 가장 작은 값만 실제 실행으로 이어진다.
+- 대상 없음과 migration lock에서는 provider 생성 함수를 호출하지 않는다.
+- 여러 dispatcher가 같은 대상을 요청해도 하나의 reservation과 provider 프로세스만 생긴다.
+- 역할 prompt는 provider 표준 입력으로만 전달되고 SQLite에는 남지 않는다.
+
+target별 one-folder 배포물은 게시 전에 manifest를 자체 검증하고 실제 `agent contract` 응답을 낸다.
+앱 릴리스는 그 배포물을 다시 검증하므로, runtime version, API 주 버전, target, 파일 해시 또는 실제
+계약 응답 중 하나라도 다르면 앱 bundle 전에 실패한다. release publish는 모든 target build가 성공한
+뒤에만 실행한다.
+
+플랫폼 서비스 smoke test는 실제 서비스 등록, 시작, 강제 종료, 자동 재시작, 해제를 한 순서로 수행한다.
+새 PID와 이전부터 보존된 run ID를 비교해 프로세스 복구와 작업 중복 방지를 구분한다. 플랫폼의 서비스
+관리 기능을 사용할 수 없으면 검사를 성공으로 건너뛰지 않고 환경 오류로 실패시킨다. 해제와 임시 파일
+정리는 검사 성공 여부와 관계없이 실행한다.

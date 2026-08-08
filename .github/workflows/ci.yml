@@ -32,6 +32,9 @@ jobs:
       - name: Syntax check
         run: python -m compileall -q skills/ src/ tests/
 
+      - name: Run provider-free agent end-to-end contract
+        run: pytest tests/test_agent_end_to_end.py -v
+
       - name: Run pytest
         run: pytest tests/ -v
 
@@ -94,7 +97,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install standalone build dependencies
-        run: pip install -e ".[build]"
+        run: pip install -e ".[build,dev]"
 
       - name: Build one-folder runtime
         env:
@@ -108,6 +111,11 @@ jobs:
           python -c "from heartbeat.legacy_migration import write_runtime_manifest; from pathlib import Path; import os; print(write_runtime_manifest(Path('dist/heartbeat'), target=os.environ['RUNTIME_TARGET']))"
           python -c "from pathlib import Path; import subprocess, sys; binary=Path('dist/heartbeat') / ('heartbeat.exe' if sys.platform == 'win32' else 'heartbeat'); subprocess.run([str(binary), 'runtime', 'verify-manifest', '--root', 'dist/heartbeat'], check=True); subprocess.run([str(binary), 'runtime', 'inspect'], check=True); subprocess.run([str(binary), 'agent', 'contract'], check=True)"
           python -c "from pathlib import Path; import os, zipfile; root=Path('dist/heartbeat'); target=os.environ['RUNTIME_TARGET']; archive=Path('dist') / f'heartbeat-{target}.zip'; z=zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED); [z.write(path, path.relative_to(root.parent)) for path in root.rglob('*') if path.is_file()]; z.close()"
+
+      - name: Register, restart, and remove the platform service
+        env:
+          HEARTBEAT_SERVICE_SMOKE_BINARY: ${{ github.workspace }}/dist/heartbeat/heartbeat${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: pytest tests/test_agent_end_to_end.py::test_platform_service_registration_restart_and_cleanup -v
 
       - name: Upload standalone runtime
         uses: actions/upload-artifact@v4
