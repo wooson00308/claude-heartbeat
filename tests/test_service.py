@@ -84,6 +84,16 @@ def test_install_service_missing_bin(monkeypatch):
     assert "PATH" in out or "찾을 수 없음" in out
 
 
+def test_windows_service_definition_restarts_after_crashes_and_rejects_duplicates():
+    """Task Scheduler XML carries the same recovery semantics as the Unix adapters."""
+    definition = TaskSchedulerAdapter()._task_xml(r"C:\Runtime\bin\heartbeat.exe")
+
+    assert "<RestartOnFailure>" in definition
+    assert "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" in definition
+    assert "<LogonTrigger>" in definition
+    assert r"C:\Runtime\bin\heartbeat.exe" in definition
+
+
 # --- HIGH: systemctl 부재 (컨테이너/WSL1) ---
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="systemd 어댑터 회귀 (Linux 한정 모듈)")

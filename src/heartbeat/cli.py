@@ -1,5 +1,6 @@
 """Heartbeat CLI — install skills, manage daemon, run jobs."""
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -337,6 +338,29 @@ def main() -> None:
         help="Update this editable install (git pull --ff-only) and restart the daemon",
     )
 
+    # agent (버전화된 앱-런타임 JSON 계약)
+    p_agent = sub.add_parser("agent", help="Manage the project agent runtime through JSON")
+    agent_sub = p_agent.add_subparsers(dest="agent_command")
+    agent_sub.add_parser("contract", help="Print the supported agent contract as JSON")
+    p_agent_config = agent_sub.add_parser("config", help="Validate, write, or read agent configuration")
+    p_agent_config.add_argument("operation", choices=["validate", "write", "read"])
+    agent_sub.add_parser("state", help="Read project-scoped agent state")
+
+    # runtime (독립 실행형 배포물의 manifest·stable launcher·읽기 전용 마이그레이션)
+    p_runtime = sub.add_parser("runtime", help="Inspect or verify a standalone Heartbeat runtime")
+    runtime_sub = p_runtime.add_subparsers(dest="runtime_command")
+    runtime_sub.add_parser("inspect", help="Print the runtime identity as JSON")
+    p_manifest = runtime_sub.add_parser("write-manifest", help="Write hashes for an unpacked one-folder runtime")
+    p_manifest.add_argument("--root", required=True, help="unpacked runtime directory")
+    p_manifest.add_argument("--target", help="published target name")
+    p_verify_manifest = runtime_sub.add_parser("verify-manifest", help="Verify an unpacked runtime before activation")
+    p_verify_manifest.add_argument("--root", required=True, help="unpacked runtime directory")
+    p_activate = runtime_sub.add_parser("activate", help="Atomically switch the stable runtime launcher")
+    p_activate.add_argument("--install-root", required=True)
+    p_activate.add_argument("--version-dir", required=True)
+    p_preview = runtime_sub.add_parser("migration-preview", help="Read legacy jobs and history without writing")
+    p_preview.add_argument("--home", help="home directory to inspect; defaults to the current user")
+
     # install
     p_install = sub.add_parser("install", help="Install a skill")
     p_install.add_argument("skill", help="Skill name to install")
@@ -474,5 +498,65 @@ def main() -> None:
     elif args.command == "uninstall-service":
         sys.exit(uninstall_service(print_only=args.print_only))
 
+    elif args.command == "agent":
+        from heartbeat.agent_cli import run_agent_command
+
+        command_map = {
+            "contract": "contract.read",
+            "state": "state.read",
+            "validate": "config.validate",
+            "write": "config.write",
+            "read": "config.read",
+        }
+        selected = getattr(args, "agent_command", None)
+        if selected == "config":
+            selected = args.operation
+        if selected not in command_map:
+            p_agent.print_help()
+            sys.exit(2)
+        sys.exit(run_agent_command(command_map[selected]))
+
+    elif args.command == "runtime":
+        from heartbeat.agent_contract import API_VERSION
+        from heartbeat.legacy_migration import (
+            RuntimeIntegrityError,
+            activate_stable_launcher,
+            preview_legacy_migration,
+            runtime_target,
+            verify_runtime_manifest,
+            write_runtime_manifest,
+        )
+
+        try:
+            if args.runtime_command == "inspect":
+                print(json.dumps({
+                    "runtimeVersion": __version__,
+                    "apiMajor": int(API_VERSION),
+                    "target": runtime_target(),
+                    "executable": str(Path(sys.argv[0]).resolve()),
+                }, ensure_ascii=False, separators=(",", ":")))
+            elif args.runtime_command == "write-manifest":
+                manifest = write_runtime_manifest(Path(args.root), target=args.target)
+                print(json.dumps({"outcome": "success", "manifest": str(manifest)}, ensure_ascii=False, separators=(",", ":")))
+            elif args.runtime_command == "verify-manifest":
+                manifest = verify_runtime_manifest(Path(args.root))
+                print(json.dumps({"outcome": "success", "manifest": manifest}, ensure_ascii=False, separators=(",", ":")))
+            elif args.runtime_command == "activate":
+                launcher = activate_stable_launcher(Path(args.install_root), Path(args.version_dir))
+                print(json.dumps({"outcome": "success", "launcher": str(launcher)}, ensure_ascii=False, separators=(",", ":")))
+            elif args.runtime_command == "migration-preview":
+                home = Path(args.home) if args.home else None
+                print(json.dumps(preview_legacy_migration(home), ensure_ascii=False, separators=(",", ":")))
+            else:
+                p_runtime.print_help()
+                sys.exit(2)
+        except RuntimeIntegrityError as error:
+            print(json.dumps({"outcome": "failure", "error": str(error)}, ensure_ascii=False, separators=(",", ":")))
+            sys.exit(2)
+
     else:
         parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

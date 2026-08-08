@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
+from pathlib import Path
+from xml.sax.saxutils import escape
 
 from .base import RestartResult, ServiceAdapter
 
@@ -12,15 +15,34 @@ TASK_NAME = "claude-heartbeat"
 class TaskSchedulerAdapter(ServiceAdapter):
     name = "task_scheduler"
 
-    def _install_cmd(self, bin_path: str) -> list[str]:
+    def _install_cmd(self, xml_path: str) -> list[str]:
         return [
             "schtasks.exe", "/create",
             "/tn", TASK_NAME,
-            "/tr", f'"{bin_path}" start',
-            "/sc", "onlogon",
-            "/rl", "limited",
+            "/xml", xml_path,
             "/f",  # overwrite if exists
         ]
+
+    def _task_xml(self, bin_path: str) -> str:
+        """Build the Task Scheduler definition with crash recovery enabled.
+
+        ``schtasks /sc onlogon`` alone only starts once at sign-in.  The XML
+        form exposes RestartOnFailure, which is the Task Scheduler equivalent
+        of launchd KeepAlive and systemd Restart=always.
+        """
+        command = escape(bin_path)
+        return f'''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>start</Arguments></Exec></Actions>
+</Task>
+'''
 
     def _uninstall_cmd(self) -> list[str]:
         return ["schtasks.exe", "/delete", "/tn", TASK_NAME, "/f"]
@@ -58,12 +80,12 @@ class TaskSchedulerAdapter(ServiceAdapter):
         return RestartResult("failed", "restart-failed", task)
 
     def render(self) -> str | None:
-        """등록 명령을 한 줄 문자열로 반환. (Task Scheduler는 파일 정의가 아니라 명령)."""
+        """등록할 XML 정의를 반환한다."""
         bin_path = self._heartbeat_bin()
         if not bin_path:
             print("⚠ heartbeat CLI를 PATH에서 찾을 수 없음. pip install 후 다시 시도.")
             return None
-        return " ".join(self._install_cmd(bin_path))
+        return self._task_xml(bin_path)
 
     def install(self, print_only: bool = False) -> int:
         bin_path = self._heartbeat_bin()
@@ -71,22 +93,30 @@ class TaskSchedulerAdapter(ServiceAdapter):
             print("⚠ heartbeat CLI를 PATH에서 찾을 수 없음. pip install 후 다시 시도.")
             return 1
 
-        cmd = self._install_cmd(bin_path)
+        definition = self._task_xml(bin_path)
 
         if print_only:
-            print("# Windows Task Scheduler 등록 명령:")
-            print(" ".join(cmd))
+            print("# Windows Task Scheduler XML 정의 (RestartOnFailure 포함):")
+            print(definition)
+            print(f"# 등록: schtasks.exe /create /tn {TASK_NAME} /xml <definition.xml> /f")
             return 0
 
+        descriptor, xml_name = tempfile.mkstemp(prefix="claude-heartbeat-", suffix=".xml")
+        xml_path = Path(xml_name)
         try:
+            with open(descriptor, "w", encoding="utf-16") as definition_file:
+                definition_file.write(definition)
+            cmd = self._install_cmd(str(xml_path))
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             print(f"✓ Task Scheduler 등록 완료: {TASK_NAME}")
             return 0
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             stderr = getattr(exc, "stderr", "") or str(exc)
             print(f"⚠ schtasks 등록 실패: {stderr.strip()}")
-            print(f"  수동 등록: {' '.join(cmd)}")
+            print(f"  수동 등록: schtasks.exe /create /tn {TASK_NAME} /xml <definition.xml> /f")
             return 1
+        finally:
+            xml_path.unlink(missing_ok=True)
 
     def uninstall(self, print_only: bool = False) -> int:
         cmd = self._uninstall_cmd()

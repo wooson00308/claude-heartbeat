@@ -12,6 +12,7 @@ dependencies = [
 dream = []
 notify = ["plyer>=2.1"]  # cross-platform desktop notifications (optional)
 dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+build = ["pyinstaller>=6.0"]
 
 [build-system]
 requires = ["hatchling"]

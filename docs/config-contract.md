@@ -263,3 +263,17 @@ result=failed version=0.8.0 exit=11
 `heartbeat migrate`가 `HEARTBEAT.md`의 잡을 slug별 `jobs.d/<slug>.md`로
 분리한다. slug 없는 블록·전역 설정·HTML 주석(외부 도구의 마커)은 원본에
 남고, 원본은 실행 전 백업된다. `--dry-run`으로 미리 볼 수 있다.
+
+## 독립 실행형 런타임과 기존 설정
+
+앱이 설치하는 독립 실행형 런타임은 Python, 저장소 checkout, PATH의 `heartbeat`
+스크립트에 의존하지 않는다. 배포 디렉터리에는 `runtime-manifest.json`이 있고 target,
+runtime version, API major, 각 파일의 SHA-256과 크기를 기록한다. 설치기는 압축을 푼
+후 `heartbeat runtime verify-manifest --root <directory>`를 통과시킨 다음에만 stable
+launcher를 전환한다. 검증에 실패하면 기존 launcher와 OS 서비스는 바꾸지 않는다.
+
+새 런타임의 역할 정책은 기존 `HEARTBEAT.md`, `jobs.d`, `state.json`을 원천으로 삼지
+않는다. 앱은 먼저 `heartbeat runtime migration-preview`의 JSON을 읽어 옮길 수 있는
+역할별 interval, timeout, max_per, model과 실행 이력을 보여 준다. Dream 잡은 제외되고,
+역할이나 provider를 알 수 없는 잡은 `unmigratable` 목록에 남는다. 이 명령은 어떤 파일도
+쓰지 않으므로 사용자 확인 전 기존 서비스, 실행 파일, 일반 잡과 Dream 동작은 그대로다.

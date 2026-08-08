@@ -68,3 +68,50 @@ jobs:
 
       - name: dream-prep CLI must work
         run: /tmp/smoke-env/bin/dream-prep --help
+
+  runtime-package:
+    name: standalone runtime (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: macos-universal
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: windows-latest
+            target: windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install standalone build dependencies
+        run: pip install -e ".[build]"
+
+      - name: Build one-folder runtime
+        env:
+          HEARTBEAT_MACOS_TARGET_ARCH: universal2
+        run: pyinstaller packaging/heartbeat.spec --noconfirm --clean
+
+      - name: Write and verify artifact manifest
+        env:
+          RUNTIME_TARGET: ${{ matrix.target }}
+        run: |
+          python -c "from heartbeat.legacy_migration import write_runtime_manifest; from pathlib import Path; import os; print(write_runtime_manifest(Path('dist/heartbeat'), target=os.environ['RUNTIME_TARGET']))"
+          python -c "from pathlib import Path; import subprocess, sys; binary=Path('dist/heartbeat') / ('heartbeat.exe' if sys.platform == 'win32' else 'heartbeat'); subprocess.run([str(binary), 'runtime', 'verify-manifest', '--root', 'dist/heartbeat'], check=True); subprocess.run([str(binary), 'runtime', 'inspect'], check=True); subprocess.run([str(binary), 'agent', 'contract'], check=True)"
+          python -c "from pathlib import Path; import os, zipfile; root=Path('dist/heartbeat'); target=os.environ['RUNTIME_TARGET']; archive=Path('dist') / f'heartbeat-{target}.zip'; z=zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED); [z.write(path, path.relative_to(root.parent)) for path in root.rglob('*') if path.is_file()]; z.close()"
+
+      - name: Upload standalone runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: heartbeat-${{ matrix.target }}
+          path: dist/heartbeat-${{ matrix.target }}.zip
+          if-no-files-found: error

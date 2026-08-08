@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 
@@ -30,7 +31,18 @@ class ServiceAdapter:
     name: str = ""
 
     def _heartbeat_bin(self) -> str | None:
-        """heartbeat CLI 경로. PATH에서 찾을 수 없으면 None."""
+        """Stable launcher 우선의 heartbeat CLI 경로.
+
+        앱이 검증한 독립 실행형 런타임을 활성화하면 이 환경 변수에 stable
+        launcher를 넣는다. 서비스 정의가 version 디렉터리를 직접 물지 않아 업데이트
+        실패 때 현재 실행본을 보존하고, 정상 전환 뒤에는 같은 고정 경로가 새 버전을
+        실행한다. 기존 pip 설치는 PATH 탐색으로 그대로 동작한다.
+        """
+        stable_launcher = os.environ.get("HEARTBEAT_RUNTIME_LAUNCHER")
+        if stable_launcher:
+            candidate = os.path.abspath(stable_launcher)
+            if os.path.isfile(candidate):
+                return candidate
         return shutil.which("heartbeat")
 
     def render(self) -> str | None:
