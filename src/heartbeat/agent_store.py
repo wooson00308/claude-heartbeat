@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,10 @@ from heartbeat.agent_contract import AgentConfiguration
 
 AGENT_SCHEMA_VERSION = 1
 DEFAULT_AGENT_DB = Path.home() / ".claude" / "heartbeat" / "agent-runtime.sqlite3"
+
+
+def _dump(value: dict) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def default_agent_database_path() -> Path:
@@ -132,6 +137,171 @@ class AgentStore:
                 "SELECT configuration_json FROM agent_configurations WHERE project_id = ?", (project_id,)
             ).fetchone()
         return json.loads(row[0]) if row else None
+
+    def list_project_ids(self) -> list[str]:
+        """List every configured project so one tick can serve all of them."""
+        with self._connection() as connection:
+            rows = connection.execute("SELECT project_id FROM agent_configurations ORDER BY project_id").fetchall()
+        return [row[0] for row in rows]
+
+    def set_paused(self, project_id: str, paused: bool) -> dict | None:
+        """Flip only the pause flag, leaving the rest of the configuration alone."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT configuration_json FROM agent_configurations WHERE project_id = ?", (project_id,)
+                ).fetchone()
+                if row is None:
+                    connection.execute("ROLLBACK")
+                    return None
+                configuration = json.loads(row[0])
+                configuration["paused"] = paused
+                connection.execute(
+                    "UPDATE agent_configurations SET configuration_json = ?, updated_at = ? WHERE project_id = ?",
+                    (_dump(configuration), utc_now(), project_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return configuration
+
+    def save_plan(self, project_id: str, plan: dict) -> None:
+        """Store one execution plan so a later start can prove it is the same one."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "INSERT OR REPLACE INTO agent_queue(run_id, project_id, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (plan["planId"], project_id, _dump(plan), utc_now()),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def take_plan(self, project_id: str, plan_id: str) -> dict | None:
+        """Consume one stored plan. A plan is usable once, so this deletes it."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT payload_json FROM agent_queue WHERE run_id = ? AND project_id = ?",
+                    (plan_id, project_id),
+                ).fetchone()
+                if row is not None:
+                    connection.execute("DELETE FROM agent_queue WHERE run_id = ?", (plan_id,))
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return json.loads(row[0]) if row else None
+
+    def save_intent(self, project_id: str, intent: dict) -> None:
+        """Store what a role should keep doing when a slot frees up."""
+        self.save_plan(project_id, {**intent, "planId": intent["intentId"]})
+
+    def list_intents(self, project_id: str) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM agent_queue WHERE project_id = ? ORDER BY created_at", (project_id,)
+            ).fetchall()
+        payloads = [json.loads(row[0]) for row in rows]
+        return [payload for payload in payloads if "intentId" in payload]
+
+    def drop_intent(self, intent_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("DELETE FROM agent_queue WHERE run_id = ?", (intent_id,))
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def save_run(self, run: dict) -> None:
+        """Write one run row. The caller owns the state name and the details."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO agent_runs(run_id, project_id, state, details_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id) DO UPDATE SET
+                        state=excluded.state,
+                        details_json=excluded.details_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (run["runId"], run["projectId"], run["state"], _dump(run), utc_now()),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def get_run(self, run_id: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT details_json FROM agent_runs WHERE run_id = ?", (run_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def list_runs(self, project_id: str | None = None, *, states: frozenset[str] | None = None) -> list[dict]:
+        """List runs for one project, or for the whole device when none is given."""
+        query = "SELECT details_json FROM agent_runs"
+        parameters: tuple[str, ...] = ()
+        if project_id is not None:
+            query += " WHERE project_id = ?"
+            parameters = (project_id,)
+        with self._connection() as connection:
+            rows = connection.execute(query + " ORDER BY updated_at DESC", parameters).fetchall()
+        runs = [json.loads(row[0]) for row in rows]
+        return [run for run in runs if states is None or run["state"] in states]
+
+    def append_events(self, project_id: str, run_id: str, events: list[dict]) -> None:
+        """Append normalized provider events. The caller filters them first."""
+        if not events:
+            return
+        created_at = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.executemany(
+                    "INSERT INTO agent_events(event_id, project_id, run_id, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    [(uuid.uuid4().hex, project_id, run_id, _dump(event), created_at) for event in events],
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def read_events(self, project_id: str, run_id: str, *, cursor: int = 0, limit: int = 200) -> tuple[list[dict], int]:
+        """Read events after a cursor and return the cursor to continue from."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT rowid, event_json FROM agent_events
+                WHERE project_id = ? AND run_id = ? AND rowid > ?
+                ORDER BY rowid LIMIT ?
+                """,
+                (project_id, run_id, cursor, limit),
+            ).fetchall()
+        events = [json.loads(row[1]) for row in rows]
+        return events, rows[-1][0] if rows else cursor
+
+    def record_error(self, project_id: str, run_id: str | None, error: dict) -> None:
+        """Record one failure so a later reader can see what stage refused."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "INSERT INTO agent_errors(error_id, project_id, run_id, error_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (uuid.uuid4().hex, project_id, run_id, _dump(error), utc_now()),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
 
     def get_state(self, project_id: str) -> dict:
         """Expose an empty, project-scoped runtime state until dispatch is implemented."""

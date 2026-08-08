@@ -345,6 +345,14 @@ def main() -> None:
     p_agent_config = agent_sub.add_parser("config", help="Validate, write, or read agent configuration")
     p_agent_config.add_argument("operation", choices=["validate", "write", "read"])
     agent_sub.add_parser("state", help="Read project-scoped agent state")
+    agent_sub.add_parser("plan", help="Read an execution plan without starting anything")
+    agent_sub.add_parser("logs", help="Read redacted run events from a cursor")
+    p_agent_run = agent_sub.add_parser("run", help="Start, cancel, or retry runs")
+    p_agent_run.add_argument("operation", choices=["start", "cancel", "retry"])
+    p_agent_project = agent_sub.add_parser("project", help="Pause or resume new assignment for one project")
+    p_agent_project.add_argument("operation", choices=["pause", "resume"])
+    p_agent_provider = agent_sub.add_parser("provider", help="Report provider readiness")
+    p_agent_provider.add_argument("operation", choices=["diagnose"])
 
     # runtime (독립 실행형 배포물의 manifest·stable launcher·읽기 전용 마이그레이션)
     p_runtime = sub.add_parser("runtime", help="Inspect or verify a standalone Heartbeat runtime")
@@ -507,10 +515,20 @@ def main() -> None:
             "validate": "config.validate",
             "write": "config.write",
             "read": "config.read",
+            "plan": "plan.read",
+            "logs": "logs.read",
+            "run start": "run.start",
+            "run cancel": "run.cancel",
+            "run retry": "run.retry",
+            "project pause": "project.pause",
+            "project resume": "project.resume",
+            "provider diagnose": "provider.diagnose",
         }
         selected = getattr(args, "agent_command", None)
         if selected == "config":
             selected = args.operation
+        elif selected in {"run", "project", "provider"}:
+            selected = f"{selected} {args.operation}"
         if selected not in command_map:
             p_agent.print_help()
             sys.exit(2)

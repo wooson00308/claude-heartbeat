@@ -668,6 +668,22 @@ def _dispatch_due_groups(
     return futures
 
 
+def _tick_agent_projects() -> None:
+    """Serve configured agent projects once, without ever failing the loop.
+
+    The agent runtime is optional state: a device with no configured project
+    does nothing here, and a failure inside one project is recorded by the
+    dispatcher itself. Heartbeat 잡 스케줄은 어느 경우에도 그대로 돈다.
+    """
+    try:
+        from heartbeat.agent_dispatch import tick_all_projects
+        from heartbeat.agent_store import AgentStore
+
+        tick_all_projects(AgentStore())
+    except Exception as e:
+        log.debug(f"에이전트 디스패치 tick 건너뜀: {e}")
+
+
 def heartbeat_loop() -> None:
     """Main heartbeat loop. Re-reads HEARTBEAT.md + jobs.d each cycle.
 
@@ -692,10 +708,12 @@ def heartbeat_loop() -> None:
 
         if not jobs:
             log.warning(f"설정에 잡이 없음, {tick}초 후 재확인")
+            _tick_agent_projects()
             time.sleep(tick)
             continue
 
         _dispatch_due_groups(jobs, state, executor)
+        _tick_agent_projects()
         time.sleep(tick)
 
 

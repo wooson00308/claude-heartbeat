@@ -73,7 +73,7 @@ def test_state_returns_only_the_requested_projects_empty_runtime_data(tmp_path):
         ("config.write", "not-json", "invalid_json"),
         ("config.write", json.dumps({"apiVersion": "2", "requestId": "r", "configuration": {}}), "unsupported_api_version"),
         ("config.read", json.dumps({"apiVersion": "1", "requestId": "r"}), "invalid_request"),
-        ("run.start", json.dumps({"apiVersion": "1", "requestId": "r"}), "unsupported_command"),
+        ("plan.write", json.dumps({"apiVersion": "1", "requestId": "r"}), "unsupported_command"),
     ],
 )
 def test_bad_requests_return_failure_envelopes_without_tracebacks(tmp_path, command, payload, code):
@@ -110,3 +110,139 @@ def test_rejected_secret_is_absent_from_response_and_database(tmp_path):
     assert store.get_configuration("project-one") is None
     database = tmp_path / "agent.sqlite3"
     assert not database.exists() or secret.encode() not in database.read_bytes()
+
+
+class _ExecutionProject:
+    """One configured project with fake workflow helpers and a fake provider."""
+
+    def __init__(self, tmp_path, monkeypatch):
+        from heartbeat import agent_dispatch
+        from tests.test_agent_dispatch import FixtureProvider, FIXTURE_CLI, configure, make_project
+
+        self.root = make_project(tmp_path)
+        self.store = AgentStore(tmp_path / "agent.sqlite3")
+        script = tmp_path / "provider_cli.py"
+        script.write_text(FIXTURE_CLI, encoding="utf-8")
+        monkeypatch.setenv("HEARTBEAT_AGENT_HOME", str(tmp_path / "runtime-home"))
+        monkeypatch.setattr(agent_dispatch, "build_provider", lambda name: FixtureProvider(script))
+        self.configuration = configure(self.store, self.root, "project-one")
+
+    def call(self, command, **request):
+        payload = json.dumps({"apiVersion": "1", "requestId": "request-x", "projectId": "project-one", **request})
+        return _invoke(command, payload, self.store)
+
+
+@pytest.fixture
+def execution_project(tmp_path, monkeypatch):
+    if __import__("os").name == "nt":
+        pytest.skip("the fake helpers are POSIX shell scripts")
+    return _ExecutionProject(tmp_path, monkeypatch)
+
+
+def test_contract_reports_the_execution_commands_as_implemented():
+    _, response = _invoke("contract.read")
+
+    implemented = response["data"]["implementedCommands"]
+    assert set(implemented) >= {
+        "plan.read", "run.start", "project.pause", "project.resume", "run.cancel", "run.retry",
+        "logs.read", "provider.diagnose",
+    }
+    assert response["data"]["reservedCommands"] == []
+
+
+def test_plan_reads_limits_and_diagnostics_without_starting_anything(execution_project):
+    from tests.test_agent_dispatch import reserve_calls
+
+    exit_code, response = execution_project.call("plan.read", roles={"developer": {"slots": 2}})
+
+    plan = response["data"]["plan"]
+    assert exit_code == 0
+    assert plan["roles"][0]["granted"] == 1
+    assert plan["roles"][0]["excluded"] == ["limit_reached"]
+    assert plan["roles"][0]["diagnostic"]["status"] == "ready"
+    assert plan["limits"]["projectMaxParallel"] == 3
+    assert reserve_calls(execution_project.root) == 0
+    assert execution_project.store.list_runs("project-one") == []
+
+
+def test_start_needs_the_same_plan_and_an_explicit_confirmation(execution_project):
+    _, planned = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
+    plan_id = planned["data"]["plan"]["planId"]
+
+    unconfirmed = execution_project.call("run.start", planId=plan_id)
+    unknown = execution_project.call("run.start", planId="not-a-plan", confirmed=True)
+    started = execution_project.call("run.start", planId=plan_id, confirmed=True)
+    replayed = execution_project.call("run.start", planId=plan_id, confirmed=True)
+
+    assert unconfirmed[1]["error"]["code"] == "confirmation_required"
+    assert unknown[1]["error"]["code"] == "plan_not_found"
+    assert started[0] == 0
+    assert len(started[1]["data"]["started"]) == 1
+    assert replayed[1]["error"]["code"] == "plan_not_found"
+    assert execution_project.store.list_intents("project-one") == []
+
+
+def test_start_refuses_a_plan_whose_runtime_moved(execution_project):
+    _, planned = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
+    execution_project.store.save_run({
+        "runId": "other", "projectId": "project-one", "role": "planner", "provider": "claude",
+        "state": "running", "targetId": "TASK-Z", "leaseId": "lease-z",
+    })
+
+    exit_code, response = execution_project.call(
+        "run.start", planId=planned["data"]["plan"]["planId"], confirmed=True
+    )
+
+    assert exit_code == 1
+    assert response["outcome"] == "failure"
+    assert response["error"]["code"] == "runtime_changed"
+    assert [run["runId"] for run in execution_project.store.list_runs("project-one")] == ["other"]
+
+
+def test_pause_and_resume_only_flip_the_stored_flag(execution_project):
+    paused = execution_project.call("project.pause")
+    resumed = execution_project.call("project.resume")
+
+    assert paused[1]["data"]["configuration"]["paused"] is True
+    assert resumed[1]["data"]["configuration"]["paused"] is False
+    assert resumed[1]["data"]["configuration"]["roles"] == execution_project.configuration.to_dict()["roles"]
+
+
+def test_logs_read_returns_redacted_events_and_a_next_cursor(execution_project):
+    from heartbeat import agent_dispatch
+
+    _, planned = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
+    execution_project.call("run.start", planId=planned["data"]["plan"]["planId"], confirmed=True)
+    run_id = execution_project.store.list_runs("project-one")[0]["runId"]
+    agent_dispatch.tick_project(
+        execution_project.store,
+        "project-one",
+        provider_factory=agent_dispatch.build_provider,
+    )
+
+    exit_code, response = execution_project.call("logs.read", runId=run_id, cursor=0)
+
+    assert exit_code == 0
+    assert [event["kind"] for event in response["data"]["events"]][0] == "started"
+    assert response["data"]["nextCursor"] > 0
+    assert "prompt" not in json.dumps(response["data"]["events"])
+
+
+def test_provider_diagnose_reports_each_configured_provider(execution_project):
+    exit_code, response = execution_project.call("provider.diagnose")
+
+    assert exit_code == 0
+    assert [item["status"] for item in response["data"]["providers"]] == ["ready"]
+
+
+def test_cancel_previews_before_it_applies(execution_project):
+    _, planned = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
+    execution_project.call("run.start", planId=planned["data"]["plan"]["planId"], confirmed=True)
+    run_id = execution_project.store.list_runs("project-one")[0]["runId"]
+
+    preview = execution_project.call("run.cancel", runId=run_id)
+    applied = execution_project.call("run.cancel", runId=run_id, confirmed=True)
+
+    assert preview[1]["data"]["preview"]["cleanup"] == ["process_termination", "event_close", "lease_release"]
+    assert execution_project.store.get_run(run_id)["state"] in {"cancelled", "recovery_required"}
+    assert applied[1]["outcome"] in {"success", "partial_success"}
