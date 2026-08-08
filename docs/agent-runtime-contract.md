@@ -163,7 +163,7 @@ lease 갱신과 반납은 `wf-claim.sh`를 직접 호출한다. 실행 중 갱�
 
 런타임 릴리스는 macOS universal, Linux x86_64, Windows x86_64용 one-folder 배포물이다.
 각 배포물은 `runtime-manifest.json`으로 target, runtime version, API major, 모든 파일 해시를
-검증한다. `heartbeat runtime inspect`는 설치한 실행 파일의 JSON 신원을 내고,
+검증한다. `heartbeat runtime inspect`는 아래 기기 상태를 JSON으로 내고,
 `heartbeat runtime verify-manifest --root <directory>`는 해시와 API major가 맞을 때만
 성공한다.
 
@@ -171,6 +171,47 @@ lease 갱신과 반납은 `wf-claim.sh`를 직접 호출한다. 실행 중 갱�
 바꾼다. `heartbeat runtime activate --install-root <root> --version-dir <version-dir>`는
 검증을 먼저 하므로 실패한 새 설치가 실행 중인 버전을 훼손하지 않는다. 서비스 정의는 stable
 launcher를 실행해야 하며, `HEARTBEAT_RUNTIME_LAUNCHER`가 있으면 이를 우선 사용한다.
+
+### 기기 상태 조회
+
+`heartbeat runtime inspect [--install-root <root>]`는 설치 상태와 서비스 상태를 한 JSON 응답으로
+돌려준다. 같은 사실을 돌려주는 두 번째 명령은 만들지 않는다.
+
+```json
+{
+  "schemaVersion": 1, "result": "ok", "checkedAt": "2026-08-08T08:41:23Z",
+  "runtimeVersion": "0.8.0", "installedVersion": "0.8.0", "runningVersion": "0.8.0",
+  "apiMajor": 1, "target": "macos-universal", "executable": "/…/heartbeat",
+  "installRoot": "/…/install", "launcher": "/…/install/bin/heartbeat",
+  "installResult": "installed", "recoverable": true,
+  "service": {
+    "platform": "launchd", "result": "registered", "registered": true, "running": true,
+    "label": "com.claude-heartbeat", "executable": "/…/install/bin/heartbeat",
+    "recoverable": true, "checkedAt": "2026-08-08T08:41:23Z",
+    "evidence": ["launch_agents_directory", "program_arguments", "launchctl_list"],
+    "detail": {}
+  },
+  "evidence": ["stable_launcher", "version_manifest", "launch_agents_directory"]
+}
+```
+
+- `runtimeVersion`은 이 호출에 답한 실행 파일의 버전, `installedVersion`은 stable launcher가 가리키는
+  버전 디렉터리의 manifest 값이다. `runningVersion`은 서비스가 실행 중임이 확인됐고 그 등록물의 실행
+  경로에서 버전을 읽어낼 수 있을 때만 채워진다. 셋은 서로 다른 사실이며 하나로 나머지를 추측하지 않는다.
+- `installResult`는 `installed`, `launcher_missing`, `version_missing`, `manifest_unreadable`,
+  `unsupported_version` 중 하나다. 최상위 `result`는 `ok`, `unsupported_platform`,
+  `unsupported_version` 중 하나다.
+- `service.result`는 `registered`, `not_registered`, `executable_missing`, `ambiguous_registration`,
+  `permission_denied`, `tool_missing`, `unsupported_platform` 중 하나이며 세 운영체제가 같은 값을 같은
+  뜻으로 쓴다. `registered`와 `running`은 참·거짓·null 세 값이고 null은 확인하지 못했다는 뜻이다.
+  확인하지 못한 값과 권한 때문에 확인할 수 없는 값은 어떤 경우에도 실행 중으로 올라가지 않는다.
+- `recoverable`은 등록이 확인됐고 그 실행 파일이 있을 때만 참이다. 등록물이 여러 개라 무엇을 재기동할지
+  정할 수 없으면 거짓이고, 확인 자체를 못 했으면 null이다.
+- `evidence`는 판정이 무엇을 읽어서 나왔는지 남긴다. `detail`은 플랫폼 고유 이름과 명령 출력만 담는 선택
+  항목이며 계약 필드가 아니다. Windows는 Task Scheduler의 상태 출력이 로케일에 따라 달라져 `running`을
+  null로 두고 그 사유를 `detail`에 적는다.
+- 조회는 읽기 전용이다. 호출 전후로 런타임 파일, launcher, 서비스 정의, SQLite와 프로젝트 설정이 바뀌지
+  않는다.
 
 macOS LaunchAgent는 KeepAlive와 RunAtLoad를, Linux systemd user unit은 Restart=always를,
 Windows Task Scheduler는 RestartOnFailure와 중복 실행 방지 정책을 사용한다. Linux user

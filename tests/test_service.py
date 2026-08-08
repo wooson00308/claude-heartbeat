@@ -218,3 +218,177 @@ def test_systemd_install_unit_file_permission_error(monkeypatch, tmp_path):
     assert rc == 1
     assert "쓰기 실패" in out
     assert "권한" in out
+
+
+# --- 구조화된 inspect: 세 어댑터가 같은 필드를 같은 뜻으로 채운다 ---
+
+CONTRACT_FIELDS = {
+    "platform", "result", "registered", "running", "label", "executable",
+    "recoverable", "checkedAt", "evidence", "detail",
+}
+
+
+def _completed(returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _plist(path, label, program):
+    import plistlib
+
+    with path.open("wb") as stream:
+        plistlib.dump({"Label": label, "ProgramArguments": [str(program), "start"]}, stream)
+    return path
+
+
+def _unit(path, program):
+    path.write_text(f"[Service]\nExecStart={program} start\nRestart=always\n", encoding="utf-8")
+    return path
+
+
+def _launchd(monkeypatch, plists, run=None):
+    adapter = LaunchdAdapter()
+    monkeypatch.setattr(LaunchdAdapter, "_heartbeat_plists", lambda self: list(plists))
+    if run is not None:
+        monkeypatch.setattr(subprocess, "run", run)
+    return adapter
+
+
+def _systemd(monkeypatch, unit_path, run=None):
+    adapter = SystemdAdapter()
+    monkeypatch.setattr(SystemdAdapter, "_unit_path", lambda self: unit_path)
+    if run is not None:
+        monkeypatch.setattr(subprocess, "run", run)
+    return adapter
+
+
+def test_every_adapter_returns_the_same_inspect_fields(monkeypatch, tmp_path):
+    program = tmp_path / "heartbeat"
+    program.write_text("#!/bin/sh\n", encoding="utf-8")
+    def answer(command, *args, **kwargs):
+        # 세 어댑터가 한 테스트 안에서 같은 subprocess를 쓰므로 명령으로 갈라 답한다.
+        if command[0] == "launchctl":
+            return _completed(0, '\t"PID" = 4242;\n')
+        return _completed(0, "active\n")
+
+    launchd = _launchd(
+        monkeypatch,
+        [_plist(tmp_path / "com.claude-heartbeat.plist", "com.claude-heartbeat", program)],
+        run=answer,
+    )
+    systemd = _systemd(monkeypatch, _unit(tmp_path / "unit.service", program), run=answer)
+    windows = TaskSchedulerAdapter()
+    monkeypatch.setattr(TaskSchedulerAdapter, "_registered_command", lambda self: str(program))
+
+    statuses = [launchd.inspect(), systemd.inspect(), windows.inspect()]
+
+    assert [set(status.to_dict()) for status in statuses] == [CONTRACT_FIELDS] * 3
+    assert [status.result for status in statuses] == ["registered"] * 3
+    assert [status.registered for status in statuses] == [True] * 3
+    assert [status.recoverable for status in statuses] == [True] * 3
+    assert [status.executable for status in statuses] == [str(program)] * 3
+    # Windows는 실행 여부를 로케일 의존 출력에서 읽지 않으므로 모른다고 답한다.
+    assert [status.running for status in statuses] == [True, True, None]
+
+
+def test_a_registration_without_its_executable_is_not_recoverable(monkeypatch, tmp_path):
+    missing = tmp_path / "gone" / "heartbeat"
+    launchd = _launchd(monkeypatch, [_plist(tmp_path / "a.plist", "com.claude-heartbeat", missing)])
+    systemd = _systemd(monkeypatch, _unit(tmp_path / "unit.service", missing))
+
+    for status in (launchd.inspect(), systemd.inspect()):
+        assert status.result == "executable_missing"
+        assert status.registered is True
+        assert status.running is None
+        assert status.recoverable is False
+
+
+def test_two_registrations_are_ambiguous_instead_of_one_guess(monkeypatch, tmp_path):
+    program = tmp_path / "heartbeat"
+    program.write_text("#!/bin/sh\n", encoding="utf-8")
+    first = _plist(tmp_path / "com.claude-heartbeat.plist", "com.claude-heartbeat", program)
+    second = _plist(tmp_path / "com.other-heartbeat.plist", "com.other-heartbeat", program)
+
+    status = _launchd(monkeypatch, [first, second]).inspect()
+
+    assert status.result == "ambiguous_registration"
+    assert status.running is None
+    assert status.recoverable is False
+    assert "com.other-heartbeat" in status.detail["registrations"]
+
+
+def test_missing_registration_is_its_own_result(monkeypatch, tmp_path):
+    launchd = _launchd(monkeypatch, [])
+    systemd = SystemdAdapter()
+    monkeypatch.setattr(SystemdAdapter, "_unit_path", lambda self: tmp_path / "absent.service")
+
+    for status in (launchd.inspect(), systemd.inspect()):
+        assert status.result == "not_registered"
+        assert (status.registered, status.running, status.recoverable) == (False, False, False)
+
+
+def test_unreadable_state_never_becomes_running(monkeypatch, tmp_path):
+    program = tmp_path / "heartbeat"
+    program.write_text("#!/bin/sh\n", encoding="utf-8")
+    denied = _launchd(
+        monkeypatch,
+        [_plist(tmp_path / "a.plist", "com.claude-heartbeat", program)],
+        run=lambda *a, **k: _completed(1, "", "Operation not permitted"),
+    )
+    denied_status = denied.inspect()
+
+    def missing_tool(*args, **kwargs):
+        raise FileNotFoundError
+
+    absent = _systemd(monkeypatch, _unit(tmp_path / "unit.service", program), run=missing_tool)
+    absent_status = absent.inspect()
+
+    assert (denied_status.result, denied_status.running, denied_status.recoverable) == (
+        "permission_denied", None, None,
+    )
+    assert (absent_status.result, absent_status.running, absent_status.recoverable) == (
+        "tool_missing", None, None,
+    )
+
+
+def test_systemd_reports_a_stopped_unit_as_not_running(monkeypatch, tmp_path):
+    program = tmp_path / "heartbeat"
+    program.write_text("#!/bin/sh\n", encoding="utf-8")
+    adapter = _systemd(monkeypatch, _unit(tmp_path / "unit.service", program),
+                       run=lambda *a, **k: _completed(3, "inactive\n"))
+
+    status = adapter.inspect()
+
+    assert (status.result, status.registered, status.running) == ("registered", True, False)
+    assert status.detail["activeState"] == "inactive"
+
+
+def test_a_platform_without_an_adapter_answers_in_the_same_shape(monkeypatch):
+    monkeypatch.setattr(service, "_get_adapter", lambda: None)
+
+    status = service.inspect_service()
+
+    assert set(status.to_dict()) == CONTRACT_FIELDS
+    assert status.result == "unsupported_platform"
+    assert (status.registered, status.running, status.recoverable) == (None, None, None)
+
+
+def test_inspect_writes_nothing_the_adapters_could_have_changed(monkeypatch, tmp_path):
+    import hashlib
+
+    program = tmp_path / "heartbeat"
+    program.write_text("#!/bin/sh\n", encoding="utf-8")
+    plist = _plist(tmp_path / "com.claude-heartbeat.plist", "com.claude-heartbeat", program)
+    unit = _unit(tmp_path / "unit.service", program)
+
+    def digests():
+        return {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(tmp_path.iterdir()) if path.is_file()
+        }
+
+    before = digests()
+    _launchd(monkeypatch, [plist], run=lambda *a, **k: _completed(0, '\t"PID" = 1;\n')).inspect()
+    _systemd(monkeypatch, unit, run=lambda *a, **k: _completed(0, "active\n")).inspect()
+    TaskSchedulerAdapter().inspect()
+
+    assert digests() == before

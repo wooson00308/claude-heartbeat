@@ -282,6 +282,52 @@ def cmd_skills(_args) -> None:
         print(f"  [{marker}] {name} — {desc}")
 
 
+def runtime_status(install_root: "Path | None" = None) -> dict:
+    """Report installed version, running version and service state as one value.
+
+    Everything here is read: the launcher, the version manifests and the OS
+    registration are only inspected, so an app can poll this without changing
+    what it is asking about.  A fact that could not be read stays null instead
+    of being filled in with a plausible one.
+    """
+    from heartbeat.agent_contract import API_VERSION
+    from heartbeat.legacy_migration import installed_runtime, runtime_target, runtime_version_of
+    from heartbeat.service import inspect_service
+    from heartbeat.service.base import checked_at
+
+    installed = installed_runtime(install_root)
+    service_status = inspect_service()
+    running_version = (
+        runtime_version_of(Path(service_status.executable))
+        if service_status.running and service_status.executable
+        else None
+    )
+    target = runtime_target()
+    if target.startswith("unsupported-") or service_status.result == "unsupported_platform":
+        result = "unsupported_platform"
+    elif installed["result"] == "unsupported_version":
+        result = "unsupported_version"
+    else:
+        result = "ok"
+    return {
+        "schemaVersion": 1,
+        "result": result,
+        "checkedAt": checked_at(),
+        "runtimeVersion": __version__,
+        "installedVersion": installed["installedVersion"],
+        "runningVersion": running_version,
+        "apiMajor": int(API_VERSION),
+        "target": target,
+        "executable": str(Path(sys.argv[0]).resolve()),
+        "installRoot": installed["installRoot"],
+        "launcher": installed["launcher"],
+        "installResult": installed["result"],
+        "recoverable": service_status.recoverable,
+        "service": service_status.to_dict(),
+        "evidence": [*installed["evidence"], *service_status.evidence],
+    }
+
+
 def main() -> None:
     import argparse
     import os
@@ -357,7 +403,8 @@ def main() -> None:
     # runtime (독립 실행형 배포물의 manifest·stable launcher·읽기 전용 마이그레이션)
     p_runtime = sub.add_parser("runtime", help="Inspect or verify a standalone Heartbeat runtime")
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command")
-    runtime_sub.add_parser("inspect", help="Print the runtime identity as JSON")
+    p_inspect = runtime_sub.add_parser("inspect", help="Print runtime and service status as JSON")
+    p_inspect.add_argument("--install-root", help="installed runtime root; defaults to the active stable launcher")
     p_manifest = runtime_sub.add_parser("write-manifest", help="Write hashes for an unpacked one-folder runtime")
     p_manifest.add_argument("--root", required=True, help="unpacked runtime directory")
     p_manifest.add_argument("--target", help="published target name")
@@ -547,12 +594,10 @@ def main() -> None:
 
         try:
             if args.runtime_command == "inspect":
-                print(json.dumps({
-                    "runtimeVersion": __version__,
-                    "apiMajor": int(API_VERSION),
-                    "target": runtime_target(),
-                    "executable": str(Path(sys.argv[0]).resolve()),
-                }, ensure_ascii=False, separators=(",", ":")))
+                print(json.dumps(
+                    runtime_status(Path(args.install_root) if args.install_root else None),
+                    ensure_ascii=False, separators=(",", ":"),
+                ))
             elif args.runtime_command == "write-manifest":
                 manifest = write_runtime_manifest(Path(args.root), target=args.target)
                 print(json.dumps({"outcome": "success", "manifest": str(manifest)}, ensure_ascii=False, separators=(",", ":")))

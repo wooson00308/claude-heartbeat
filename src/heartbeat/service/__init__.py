@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-from .base import RestartResult, ServiceAdapter
+from .base import RestartResult, ServiceAdapter, ServiceStatus
 from .launchd import LaunchdAdapter
 from .systemd import SystemdAdapter
 from .task_scheduler import TaskSchedulerAdapter
@@ -52,6 +52,18 @@ def restart_service() -> RestartResult:
     return adapter.restart()
 
 
+def inspect_service() -> ServiceStatus:
+    """등록·실행 상태를 구조화해 반환한다. 아무것도 쓰지 않는다.
+
+    어댑터가 없는 플랫폼도 같은 모양으로 답한다. 앱이 플랫폼마다 다른 응답을
+    구분할 필요가 없어야 한다.
+    """
+    adapter = _get_adapter()
+    if adapter is None:
+        return ServiceStatus(sys.platform, "unsupported_platform", evidence=("platform_dispatch",))
+    return adapter.inspect()
+
+
 def detect_service() -> str | None:
     """이 머신에 등록된 heartbeat 서비스 이름. 미등록이면 None."""
     adapter = _get_adapter()
@@ -63,9 +75,11 @@ __all__ = [
     "LaunchdAdapter",
     "RestartResult",
     "ServiceAdapter",
+    "ServiceStatus",
     "SystemdAdapter",
     "TaskSchedulerAdapter",
     "detect_service",
+    "inspect_service",
     "install_service",
     "restart_service",
     "uninstall_service",

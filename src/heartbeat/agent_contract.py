@@ -24,6 +24,40 @@ FAILURE_STAGES = frozenset({
     "request_validation", "reservation", "provider_start", "role_session", "cleanup", "recovery",
 })
 
+# 계약이 알리는 명령 목록의 유일한 정의다. 응답을 만드는 층은 이 목록을 읽기만 하고
+# 덧붙이거나 지우지 않는다. 두 곳에서 정하면 계약이 알리는 것과 실제로 되는 일이
+# 갈라지고, 앱은 둘 중 무엇을 믿을지 정할 수 없게 된다.
+AGENT_COMMANDS: tuple[str, ...] = (
+    "config.read",
+    "config.validate",
+    "config.write",
+    "contract.read",
+    "logs.read",
+    "plan.read",
+    "project.pause",
+    "project.resume",
+    "provider.diagnose",
+    "run.cancel",
+    "run.retry",
+    "run.start",
+    "state.read",
+    "update.apply",
+    "update.plan",
+)
+
+# 기기 조회는 독립 실행형 런타임의 `heartbeat runtime` 명령군이 제공한다. 같은 사실을
+# 돌려주는 두 번째 명령을 만들지 않기 위해 agent 명령으로 옮기지 않고, 대신 어떤 표면이
+# 그 사실을 책임지는지를 여기 한 곳에 적는다.
+RUNTIME_COMMANDS: tuple[str, ...] = (
+    "runtime.activate",
+    "runtime.inspect",
+    "runtime.migration-preview",
+    "runtime.verify-manifest",
+    "runtime.write-manifest",
+)
+
+RESERVED_COMMANDS: tuple[str, ...] = ()
+
 
 class AgentContractError(ValueError):
     """A client request that must be rejected before persistent state changes."""
@@ -259,11 +293,9 @@ def contract_description() -> dict[str, Any]:
     return {
         "supportedApiVersions": [API_VERSION],
         "runtimeVersion": __version__,
-        "implementedCommands": ["contract.read", "config.validate", "config.write", "config.read", "state.read"],
-        "reservedCommands": [
-            "plan.read", "run.start", "project.pause", "project.resume", "run.cancel", "run.retry",
-            "logs.read", "provider.diagnose",
-        ],
+        "implementedCommands": list(AGENT_COMMANDS),
+        "runtimeCommands": list(RUNTIME_COMMANDS),
+        "reservedCommands": list(RESERVED_COMMANDS),
         "roles": sorted(ROLES),
         "providers": sorted(SUPPORTED_PROVIDERS),
         "executionModes": sorted(EXECUTION_MODES),

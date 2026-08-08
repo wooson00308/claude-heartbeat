@@ -172,6 +172,87 @@ def activate_stable_launcher(install_root: Path, version_dir: Path) -> Path:
     return launcher
 
 
+LAUNCHER_NAMES = ("heartbeat", "heartbeat.cmd")
+_VERSION_DIRECTORY = re.compile(r"versions[/\\]([^/\\\"']+)[/\\]")
+
+
+def stable_launcher_path(install_root: Path | None = None) -> Path | None:
+    """Locate the stable launcher this device would run, without touching it."""
+    if install_root is not None:
+        return next((candidate for candidate in (install_root / "bin" / name for name in LAUNCHER_NAMES) if candidate.is_file()), None)
+    override = os.environ.get("HEARTBEAT_RUNTIME_LAUNCHER")
+    if not override:
+        return None
+    candidate = Path(override)
+    return candidate if candidate.is_file() else None
+
+
+def _manifest_of(version_dir: Path) -> dict[str, Any] | None:
+    try:
+        manifest = json.loads((version_dir / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def installed_runtime(install_root: Path | None = None, *, launcher: Path | None = None) -> dict[str, Any]:
+    """Describe what the stable launcher currently points at.
+
+    Only files are read.  The launcher, the version directories and the
+    manifests stay exactly as they were, because a status query must never be
+    able to change the runtime it is reporting on.
+    """
+    empty: dict[str, Any] = {
+        "installRoot": str(install_root) if install_root else None,
+        "launcher": None, "versionDir": None, "installedVersion": None,
+        "target": None, "apiMajor": None, "evidence": ["stable_launcher"],
+    }
+    path = launcher or stable_launcher_path(install_root)
+    if path is None:
+        return {**empty, "result": "launcher_missing"}
+    root = install_root or path.resolve().parent.parent
+    try:
+        body = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {**empty, "launcher": str(path), "result": "launcher_missing"}
+    found = _VERSION_DIRECTORY.search(body)
+    known = {**empty, "installRoot": str(root), "launcher": str(path)}
+    if not found:
+        return {**known, "result": "version_missing"}
+    version_dir = root / "versions" / found.group(1)
+    manifest = _manifest_of(version_dir)
+    if manifest is None:
+        return {**known, "versionDir": str(version_dir), "result": "manifest_unreadable"}
+    known.update({
+        "versionDir": str(version_dir),
+        "installedVersion": manifest.get("runtimeVersion"),
+        "target": manifest.get("target"),
+        "apiMajor": manifest.get("apiMajor"),
+        "evidence": ["stable_launcher", "version_manifest"],
+    })
+    supported = manifest.get("apiMajor") == int(API_VERSION)
+    return {**known, "result": "installed" if supported else "unsupported_version"}
+
+
+def runtime_version_of(executable: Path) -> str | None:
+    """The installed version an executable or launcher belongs to, or None.
+
+    A service registration names a path, and this turns that path into a
+    version only when a manifest actually says so.  Nothing is inferred from
+    the file name.
+    """
+    candidate = Path(executable)
+    for parent in [candidate, *candidate.parents]:
+        if parent.parent.name == "versions":
+            manifest = _manifest_of(parent)
+            return manifest.get("runtimeVersion") if manifest else None
+    if candidate.is_file():
+        described = installed_runtime(launcher=candidate)
+        if described["result"] in {"installed", "unsupported_version"}:
+            return described["installedVersion"]
+    return None
+
+
 def _parse_legacy_jobs(path: Path) -> list[dict[str, str]]:
     if not path.is_file():
         return []

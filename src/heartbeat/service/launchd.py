@@ -7,9 +7,22 @@ import plistlib
 import subprocess
 from pathlib import Path
 
-from .base import RestartResult, ServiceAdapter
+from .base import RestartResult, ServiceAdapter, ServiceStatus
 
 PLIST_LABEL = "com.claude-heartbeat"
+
+
+def _has_pid(listed: str) -> bool:
+    """`launchctl list <label>` 출력에 살아 있는 PID가 있는지.
+
+    로드만 되고 프로세스가 없으면 PID 항목이 빠지거나 0이 온다. 등록 사실만으로
+    실행 중이라고 답하지 않기 위해 이 값만 본다.
+    """
+    for line in listed.splitlines():
+        if '"PID"' in line:
+            digits = "".join(character for character in line.split("=")[-1] if character.isdigit())
+            return bool(digits) and int(digits) > 0
+    return False
 
 PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -76,6 +89,48 @@ class LaunchdAdapter(ServiceAdapter):
     def detect(self) -> str | None:
         plists = self._heartbeat_plists()
         return self._label_of(plists[0]) if plists else None
+
+    def _program_of(self, plist_path: Path) -> str:
+        """등록물이 실제로 실행하는 경로. 못 읽으면 빈 문자열."""
+        try:
+            with plist_path.open("rb") as fh:
+                arguments = plistlib.load(fh).get("ProgramArguments") or []
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            return ""
+        return arguments[0] if arguments and isinstance(arguments[0], str) else ""
+
+    def inspect(self) -> ServiceStatus:
+        plists = self._heartbeat_plists()
+        if not plists:
+            return ServiceStatus(self.name, "not_registered", registered=False, running=False,
+                                 evidence=("launch_agents_directory",))
+        label = self._label_of(plists[0])
+        program = self._program_of(plists[0])
+        if len(plists) > 1:
+            # 어느 등록물이 도는지 정할 수 없으면 재기동 대상도 정할 수 없다.
+            return ServiceStatus(
+                self.name, "ambiguous_registration", registered=True, running=None,
+                label=label, executable=program, evidence=("launch_agents_directory",),
+                detail={"registrations": ", ".join(self._label_of(path) for path in plists)},
+            )
+        if not program or not Path(program).is_file():
+            return ServiceStatus(self.name, "executable_missing", registered=True, running=None,
+                                 label=label, executable=program,
+                                 evidence=("launch_agents_directory", "program_arguments"))
+
+        try:
+            listed = subprocess.run(["launchctl", "list", label], capture_output=True, text=True)
+        except FileNotFoundError:
+            return ServiceStatus(self.name, "tool_missing", registered=True, running=None,
+                                 label=label, executable=program,
+                                 evidence=("launch_agents_directory", "program_arguments"))
+        evidence = ("launch_agents_directory", "program_arguments", "launchctl_list")
+        if "not permitted" in (listed.stderr or "").casefold():
+            return ServiceStatus(self.name, "permission_denied", registered=True, running=None,
+                                 label=label, executable=program, evidence=evidence)
+        running = listed.returncode == 0 and _has_pid(listed.stdout)
+        return ServiceStatus(self.name, "registered", registered=True, running=running,
+                             label=label, executable=program, evidence=evidence)
 
     def restart(self) -> RestartResult:
         label = self.detect()

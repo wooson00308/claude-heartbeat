@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from heartbeat.agent_contract import (
+    AGENT_COMMANDS,
     ROLES,
     AgentContractError,
     contract_description,
@@ -25,6 +26,7 @@ EXECUTION_COMMANDS = (
     "plan.read", "run.start", "project.pause", "project.resume", "run.cancel", "run.retry",
     "logs.read", "provider.diagnose",
 )
+UPDATE_COMMANDS = ("update.plan", "update.apply")
 
 
 def _read_json(stream: TextIO) -> dict[str, Any]:
@@ -92,6 +94,46 @@ def _run_or_reject(store: AgentStore, request: dict[str, Any], request_id: str, 
     if row is None or row["projectId"] != project_id:
         raise AgentContractError("run_not_found", "runId is not a run of this project", request_id=request_id)
     return row
+
+
+def _update_command(
+    command: str,
+    request: dict[str, Any],
+    request_id: str,
+    store: AgentStore,
+) -> tuple[str, dict[str, Any]]:
+    """Plan or apply one runtime update. These are device-wide, not per project."""
+    from heartbeat.runtime_management import apply_update, plan_update
+
+    install_root = _required_path(request, "installRoot", request_id)
+    version_dir = _required_path(request, "versionDir", request_id)
+    if command == "update.plan":
+        plan = plan_update(install_root, version_dir, store=store)
+        outcome = "success" if plan.result == "ready" else "failure"
+        data = plan.to_dict()
+        return outcome, {**data, "stage": None if outcome == "success" else "request_validation",
+                         "reason": None if outcome == "success" else plan.result}
+
+    plan_id = request.get("planId")
+    if not isinstance(plan_id, str) or not plan_id.strip():
+        raise AgentContractError("invalid_request", "planId must be a non-empty string", request_id=request_id)
+    applied = apply_update(
+        install_root, version_dir, store=store, plan_id=plan_id, confirmed=request.get("confirmed") is True,
+    )
+    data = applied.to_dict()
+    if applied.result == "success":
+        return "success", data
+    if applied.result == "partial_success":
+        return "partial_success", data
+    return "failure", {**data, "stage": "request_validation" if applied.result != "failure" else "cleanup",
+                       "reason": applied.result}
+
+
+def _required_path(request: dict[str, Any], name: str, request_id: str) -> Path:
+    value = request.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise AgentContractError("invalid_request", f"{name} must be a non-empty string", request_id=request_id)
+    return Path(value)
 
 
 def _execution_command(
@@ -229,13 +271,12 @@ def run_agent_command(
     output_stream = output_stream or sys.stdout
     request_id = str(uuid.uuid4())
     try:
+        # 계약이 알리는 목록이 곧 라우팅 기준이다. 목록과 실제로 처리되는 명령이
+        # 갈라질 자리를 남기지 않기 위해 여기서 한 번만 판단한다.
+        if command not in AGENT_COMMANDS:
+            raise AgentContractError("unsupported_command", "agent command is not implemented", request_id=request_id)
         if command == "contract.read":
-            description = contract_description()
-            description["implementedCommands"] = sorted(
-                [*description["implementedCommands"], *EXECUTION_COMMANDS]
-            )
-            description["reservedCommands"] = []
-            _write_json(envelope(command, request_id, outcome="success", data=description), output_stream)
+            _write_json(envelope(command, request_id, outcome="success", data=contract_description()), output_stream)
             return 0
 
         request = _read_json(input_stream)
@@ -258,8 +299,9 @@ def run_agent_command(
             state = runtime_store.get_state(_project_id(request, request_id))
             _write_json(envelope(command, request_id, outcome="success", data=state), output_stream)
             return 0
-        if command in EXECUTION_COMMANDS:
-            outcome, data = _execution_command(command, request, request_id, runtime_store)
+        if command in EXECUTION_COMMANDS or command in UPDATE_COMMANDS:
+            handler = _update_command if command in UPDATE_COMMANDS else _execution_command
+            outcome, data = handler(command, request, request_id, runtime_store)
             if outcome == "failure":
                 _write_json(
                     envelope(

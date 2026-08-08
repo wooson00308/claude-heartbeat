@@ -116,7 +116,8 @@ def test_contract_advertises_versions_commands_and_defaults():
     assert description["supportedApiVersions"] == [API_VERSION]
     assert description["runtimeVersion"] == __version__
     assert "config.write" in description["implementedCommands"]
-    assert "run.start" in description["reservedCommands"]
+    assert "run.start" in description["implementedCommands"]
+    assert "run.start" not in description["reservedCommands"]
     assert description["defaults"] == {
         "roleMaxParallel": 1,
         "projectMaxParallel": 3,

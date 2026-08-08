@@ -10,7 +10,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from .base import RestartResult, ServiceAdapter
+from .base import RestartResult, ServiceAdapter, ServiceStatus
 
 UNIT_NAME = "claude-heartbeat.service"
 
@@ -41,6 +41,49 @@ class SystemdAdapter(ServiceAdapter):
 
     def detect(self) -> str | None:
         return UNIT_NAME if self._unit_path().exists() else None
+
+    def _exec_start(self) -> str:
+        """unit이 실제로 실행하는 경로. 못 읽으면 빈 문자열."""
+        try:
+            text = self._unit_path().read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        for line in text.splitlines():
+            if line.startswith("ExecStart="):
+                command = line.split("=", 1)[1].strip()
+                return command.split()[0] if command else ""
+        return ""
+
+    def inspect(self) -> ServiceStatus:
+        unit = self.detect()
+        if unit is None:
+            return ServiceStatus(self.name, "not_registered", registered=False, running=False,
+                                 evidence=("user_unit_directory",))
+        program = self._exec_start()
+        if not program or not Path(program).is_file():
+            return ServiceStatus(self.name, "executable_missing", registered=True, running=None,
+                                 label=unit, executable=program,
+                                 evidence=("user_unit_directory", "exec_start"))
+
+        try:
+            active = subprocess.run(
+                ["systemctl", "--user", "is-active", unit], capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            return ServiceStatus(self.name, "tool_missing", registered=True, running=None,
+                                 label=unit, executable=program,
+                                 evidence=("user_unit_directory", "exec_start"))
+        evidence = ("user_unit_directory", "exec_start", "systemctl_is_active")
+        combined = f"{active.stdout}{active.stderr}".casefold()
+        if "permission denied" in combined or "failed to connect to bus" in combined:
+            # 사용자 버스에 붙지 못하면 실행 여부 자체를 읽을 수 없다.
+            return ServiceStatus(self.name, "permission_denied", registered=True, running=None,
+                                 label=unit, executable=program, evidence=evidence)
+        state = active.stdout.strip()
+        running = True if state == "active" else (False if state in {"inactive", "failed", "deactivating"} else None)
+        return ServiceStatus(self.name, "registered", registered=True, running=running,
+                             label=unit, executable=program, evidence=evidence,
+                             detail={"activeState": state} if state else {})
 
     def restart(self) -> RestartResult:
         unit = self.detect()

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 from pathlib import Path
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape, unescape
 
-from .base import RestartResult, ServiceAdapter
+from .base import RestartResult, ServiceAdapter, ServiceStatus
 
 TASK_NAME = "claude-heartbeat"
 
@@ -55,6 +56,49 @@ class TaskSchedulerAdapter(ServiceAdapter):
         except FileNotFoundError:
             return None
         return TASK_NAME if result.returncode == 0 else None
+
+    def _registered_command(self) -> str:
+        """등록물이 실행하는 경로. XML 태그 이름은 로케일에 흔들리지 않는다."""
+        try:
+            queried = subprocess.run(
+                ["schtasks.exe", "/query", "/tn", TASK_NAME, "/xml", "ONELINE"],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            return ""
+        if queried.returncode != 0:
+            return ""
+        match = re.search(r"<Command>(.*?)</Command>", queried.stdout, re.DOTALL)
+        return unescape(match.group(1).strip()) if match else ""
+
+    def inspect(self) -> ServiceStatus:
+        try:
+            queried = subprocess.run(
+                ["schtasks.exe", "/query", "/tn", TASK_NAME], capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            return ServiceStatus(self.name, "tool_missing", registered=None, running=None,
+                                 evidence=("schtasks_query",))
+        if queried.returncode != 0:
+            if "denied" in (queried.stderr or "").casefold():
+                return ServiceStatus(self.name, "permission_denied", registered=None, running=None,
+                                     evidence=("schtasks_query",))
+            return ServiceStatus(self.name, "not_registered", registered=False, running=False,
+                                 evidence=("schtasks_query",))
+
+        command = self._registered_command()
+        if not command or not Path(command).is_file():
+            return ServiceStatus(self.name, "executable_missing", registered=True, running=None,
+                                 label=TASK_NAME, executable=command,
+                                 evidence=("schtasks_query", "schtasks_query_xml"))
+        # 실행 여부는 돌려주지 않는다. schtasks의 상태 문자열이 로케일에 따라 달라져
+        # 계약 값으로 파싱할 수 없고, 모르는 값을 실행 중으로 올리지 않는다.
+        return ServiceStatus(
+            self.name, "registered", registered=True, running=None,
+            label=TASK_NAME, executable=command,
+            evidence=("schtasks_query", "schtasks_query_xml"),
+            detail={"runningUnknown": "schtasks status output is locale dependent"},
+        )
 
     def restart(self) -> RestartResult:
         """/end 후 /run.

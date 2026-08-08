@@ -258,6 +258,16 @@ class AgentStore:
         runs = [json.loads(row[0]) for row in rows]
         return [run for run in runs if states is None or run["state"] in states]
 
+    def active_run_summary(self) -> dict:
+        """Count active runs and name their projects, and nothing else.
+
+        An update plan needs to say what it would disturb. It never needs the
+        prompts, events or tool output behind those runs, so they do not leave
+        the store through this path.
+        """
+        runs = self.list_runs(states=frozenset({"reserved", "running"}))
+        return {"activeRuns": len(runs), "projects": sorted({run["projectId"] for run in runs})}
+
     def append_events(self, project_id: str, run_id: str, events: list[dict]) -> None:
         """Append normalized provider events. The caller filters them first."""
         if not events:
