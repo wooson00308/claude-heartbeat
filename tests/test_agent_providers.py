@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import psutil
@@ -18,7 +20,10 @@ from heartbeat.providers.process import (
     CliProvider,
     NormalizedLine,
     ProviderDiagnostic,
+    ProviderEventBatch,
     ProviderExecutionRequest,
+    ProviderRunHandle,
+    ProviderStartFailure,
     execute_process,
 )
 
@@ -98,7 +103,12 @@ else:
     return script
 
 
-def request(tmp_path: Path, *, prompt: str = "write the private plan") -> ProviderExecutionRequest:
+def request(
+    tmp_path: Path,
+    *,
+    prompt: str = "write the private plan",
+    timeout_seconds: float | None = 5,
+) -> ProviderExecutionRequest:
     return ProviderExecutionRequest(
         project_id="project-1",
         role="developer",
@@ -106,12 +116,38 @@ def request(tmp_path: Path, *, prompt: str = "write the private plan") -> Provid
         project_root=tmp_path,
         prompt=prompt,
         model=None,
-        timeout_seconds=5,
+        timeout_seconds=timeout_seconds,
+        event_root=tmp_path / "runs",
     )
 
 
 def complete(command: list[str], returncode: int = 0, stdout: str = "cli 1.2.3", stderr: str = "") -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+def slow_environment(tmp_path: Path) -> dict[str, str]:
+    return {"PROVIDER_TEST_MODE": "slow", "PROVIDER_TEST_CHILD_PID": str(tmp_path / "child.pid")}
+
+
+def wait_for_file(path: Path) -> None:
+    for _ in range(100):
+        if path.exists():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{path} never appeared")
+
+
+def is_gone(pid: int) -> bool:
+    for _ in range(20):
+        if not psutil.pid_exists(pid):
+            return True
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                return True
+        except psutil.NoSuchProcess:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def test_claude_command_is_stream_json_and_keeps_prompt_off_command_line(tmp_path: Path) -> None:
@@ -170,7 +206,7 @@ def test_claude_api_billing_route_requires_acknowledgement_before_start(monkeypa
     monkeypatch.setattr(provider, "_executable_exists", lambda: True)
     probes = iter([complete(["claude", "--version"])])
     monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(probes))
-    monkeypatch.setattr(process_module, "execute_process", lambda *args, **kwargs: pytest.fail("must not start"))
+    monkeypatch.setattr(process_module, "spawn_process", lambda *args, **kwargs: pytest.fail("must not start"))
 
     result = provider.run(request(tmp_path), environment={"ANTHROPIC_API_KEY": "very-secret-value"})
 
@@ -261,6 +297,141 @@ def test_cancellation_and_timeout_stop_the_full_child_process_tree(
             break
         time.sleep(0.05)
     assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+
+
+def test_start_returns_a_running_handle_with_pid_start_time_and_event_file(
+    fixture_script: Path, tmp_path: Path
+) -> None:
+    provider = FixtureProvider(fixture_script)
+
+    handle = provider.start(
+        request(tmp_path, timeout_seconds=None), environment=slow_environment(tmp_path)
+    )
+
+    assert isinstance(handle, ProviderRunHandle)
+    try:
+        assert psutil.pid_exists(handle.pid)
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", handle.started_at)
+        assert handle.process_identity is not None
+        assert handle.event_path.parent == tmp_path / "runs"
+        assert provider.watch(handle).events[0].kind == "started"
+    finally:
+        provider.cancel(handle)
+        provider.wait(handle)
+
+
+def test_start_failures_separate_the_diagnostic_stage_from_the_spawn_stage(
+    monkeypatch, fixture_script: Path, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    claude = ClaudeProvider(executable="fake-claude")
+    monkeypatch.setattr(claude, "_executable_exists", lambda: True)
+    probes = iter([complete(["claude", "--version"])])
+    monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(probes))
+
+    class MissingExecutableProvider(FixtureProvider):
+        def command(self, value: ProviderExecutionRequest) -> list[str]:
+            return ["definitely-not-an-agent-cli"]
+
+    diagnostic_failure = claude.start(
+        request(tmp_path), environment={"ANTHROPIC_API_KEY": "very-secret-value"}
+    )
+    spawn_failure = MissingExecutableProvider(fixture_script).start(request(tmp_path))
+
+    assert isinstance(diagnostic_failure, ProviderStartFailure)
+    assert (diagnostic_failure.stage, diagnostic_failure.detail) == (
+        "diagnostic",
+        "billing_route_acknowledgement_required",
+    )
+    assert isinstance(spawn_failure, ProviderStartFailure)
+    assert (spawn_failure.stage, spawn_failure.detail) == ("spawn", "executable_missing")
+
+
+def test_watch_resumes_from_the_last_offset_and_withholds_a_partial_line(
+    fixture_script: Path, tmp_path: Path
+) -> None:
+    provider = FixtureProvider(fixture_script)
+    handle = provider.start(request(tmp_path), environment={"TEST_API_KEY": "not-used"})
+    assert isinstance(handle, ProviderRunHandle)
+    result = provider.wait(handle)
+
+    first = provider.watch(handle)
+    assert [event.kind for event in first.events] == [event.kind for event in result.events]
+    assert first.next_offset == handle.event_path.stat().st_size
+    assert provider.watch(handle) == first
+    assert provider.watch(handle, offset=first.next_offset) == ProviderEventBatch((), first.next_offset)
+
+    payload = json.dumps(asdict(result.events[-1]))
+    middle = len(payload) // 2
+    with handle.event_path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(payload[:middle])
+    assert provider.watch(handle, offset=first.next_offset) == ProviderEventBatch((), first.next_offset)
+    with handle.event_path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(payload[middle:] + "\n")
+
+    resumed = provider.watch(handle, offset=first.next_offset)
+    assert [event.kind for event in resumed.events] == [result.events[-1].kind]
+
+
+def test_cancel_through_the_handle_stops_the_child_process_tree(
+    fixture_script: Path, tmp_path: Path
+) -> None:
+    provider = FixtureProvider(fixture_script)
+    child_pid_path = tmp_path / "child.pid"
+    handle = provider.start(
+        request(tmp_path, timeout_seconds=None), environment=slow_environment(tmp_path)
+    )
+    assert isinstance(handle, ProviderRunHandle)
+    wait_for_file(child_pid_path)
+
+    cancellation = provider.cancel(handle)
+    result = provider.wait(handle)
+
+    assert (cancellation.cancelled, cancellation.process_stopped, cancellation.events_closed) == (
+        True,
+        True,
+        True,
+    )
+    assert result.status == "cancelled"
+    assert result.run_id == handle.run_id
+    assert is_gone(int(child_pid_path.read_text(encoding="utf-8")))
+    assert not psutil.pid_exists(handle.pid) or psutil.Process(handle.pid).status() == psutil.STATUS_ZOMBIE
+
+
+def test_event_file_never_contains_the_prompt_or_environment_secret(
+    fixture_script: Path, tmp_path: Path
+) -> None:
+    provider = FixtureProvider(fixture_script)
+    prompt = "prompt-secret-123"
+
+    handle = provider.start(
+        request(tmp_path, prompt=prompt), environment={"TEST_API_KEY": "api-secret-456"}
+    )
+    assert isinstance(handle, ProviderRunHandle)
+    result = provider.wait(handle)
+
+    recorded = handle.event_path.read_text(encoding="utf-8")
+    assert result.status == "success"
+    assert prompt not in recorded
+    assert "api-secret-456" not in recorded
+    assert prompt not in repr(handle)
+
+
+def test_cancelling_a_run_this_provider_does_not_own_is_not_reported_as_success(tmp_path: Path) -> None:
+    handle = ProviderRunHandle(
+        run_id="not-started-here",
+        provider="claude",
+        project_id="project-1",
+        role="developer",
+        target_id="TASK-1",
+        pid=1,
+        started_at="2026-01-01T00:00:00Z",
+        event_path=tmp_path / "missing.jsonl",
+    )
+
+    cancellation = ClaudeProvider().cancel(handle)
+
+    assert (cancellation.cancelled, cancellation.detail) == (False, "unknown_run")
+    assert ClaudeProvider().watch(handle) == ProviderEventBatch((), 0)
 
 
 def test_provider_jsonl_normalizers_cover_tool_and_failure_events() -> None:
