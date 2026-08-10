@@ -64,6 +64,8 @@ PLAN_TTL_SECONDS = 120
 ACTIVE_STATES = frozenset({"reserved", "queued", "running", "paused"})
 WORKER_POLL_SECONDS = 2.0
 WORKER_START_TIMEOUT_SECONDS = 10.0
+DISPATCHER_POLL_CAP_SECONDS = 5.0
+DISPATCHER_START_TIMEOUT_SECONDS = 10.0
 TARGET_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 TERMINAL_BY_EVENT = {
     "completed": "succeeded",
@@ -302,6 +304,8 @@ def build_plan(
             diagnostic={"status": diagnostic.status, "provider": diagnostic.provider, "version": diagnostic.version},
         )
         granted = min(request.slots, _role_remaining(store, configuration, request.role), budget)
+        if policy.execution_limit is not None:
+            granted = min(granted, policy.execution_limit)
         if configuration.paused:
             granted = 0
             plan.excluded.append("project_paused")
@@ -317,7 +321,10 @@ def build_plan(
             plan.excluded.extend(reasons)
             granted = min(granted, len(accepted))
         if granted < request.slots and not plan.excluded:
-            plan.excluded.append("limit_reached")
+            plan.excluded.append(
+                "execution_limit" if policy.execution_limit is not None and granted == policy.execution_limit
+                else "limit_reached"
+            )
         plan.granted = granted
         budget -= granted
         plans.append(plan)
@@ -341,7 +348,13 @@ def build_plan(
     }
 
 
-def _new_run_row(configuration: AgentConfiguration, role: str, provider: str, previous_run_id: str | None) -> dict[str, Any]:
+def _new_run_row(
+    configuration: AgentConfiguration,
+    role: str,
+    provider: str,
+    previous_run_id: str | None,
+    intent_id: str | None = None,
+) -> dict[str, Any]:
     return {
         "runId": uuid.uuid4().hex,
         "projectId": configuration.project_id,
@@ -359,6 +372,7 @@ def _new_run_row(configuration: AgentConfiguration, role: str, provider: str, pr
         "eventPath": None,
         "lastOffset": 0,
         "previousRunId": previous_run_id,
+        "intentId": intent_id,
         "failureStage": None,
         "reason": None,
         "remaining": [],
@@ -383,10 +397,11 @@ def start_one_run(
     provider_factory: Callable[[str], AgentProvider] = build_provider,
     manual_targets: Sequence[str] = (),
     previous_run_id: str | None = None,
+    intent_id: str | None = None,
 ) -> dict[str, Any]:
     """Start inside a persistent daemon or test process that owns supervision."""
     policy = configuration.roles[role]
-    row = _new_run_row(configuration, role, policy.provider, previous_run_id)
+    row = _new_run_row(configuration, role, policy.provider, previous_run_id, intent_id)
     row["manualTargets"] = list(manual_targets)
     return _start_run_row(
         store,
@@ -404,10 +419,11 @@ def queue_one_run(
     *,
     manual_targets: Sequence[str] = (),
     previous_run_id: str | None = None,
+    intent_id: str | None = None,
 ) -> dict[str, Any]:
     """Persist work before a detached supervisor is launched for it."""
     policy = configuration.roles[role]
-    row = _new_run_row(configuration, role, policy.provider, previous_run_id)
+    row = _new_run_row(configuration, role, policy.provider, previous_run_id, intent_id)
     row.update({"state": "queued", "manualTargets": list(manual_targets)})
     store.save_run(row)
     return row
@@ -519,6 +535,7 @@ def queue_and_launch_run(
     *,
     manual_targets: Sequence[str] = (),
     previous_run_id: str | None = None,
+    intent_id: str | None = None,
 ) -> dict[str, Any]:
     """Queue one run and report whether its detached supervisor was created."""
     row = queue_one_run(
@@ -527,6 +544,7 @@ def queue_and_launch_run(
         role,
         manual_targets=manual_targets,
         previous_run_id=previous_run_id,
+        intent_id=intent_id,
     )
     if launch_run_worker(store, row["runId"]):
         deadline = time.monotonic() + WORKER_START_TIMEOUT_SECONDS
@@ -587,6 +605,122 @@ def serve_queued_run(
             provider_factory=provider_factory,
             supervisor_pid=os.getpid(),
         )
+
+
+def _dispatcher_command() -> list[str]:
+    """Start the same runtime in private repeat-dispatcher mode."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "agent-dispatcher"]
+    return [sys.executable, str(Path(__file__).with_name("cli.py")), "agent-dispatcher"]
+
+
+def _dispatcher_is_live(row: dict[str, Any]) -> bool:
+    observation = observe_process(row["pid"])
+    return (
+        observation.liveness == "running"
+        and bool(row.get("processIdentity"))
+        and observation.identity == row["processIdentity"]
+    )
+
+
+def launch_continuous_dispatcher(store: AgentStore) -> bool:
+    """Detach one device-wide scheduler from the short control command."""
+    environment = dict(os.environ)
+    environment["HEARTBEAT_AGENT_DATABASE"] = str(store.database_path)
+    options: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": environment,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    else:
+        options["start_new_session"] = True
+    try:
+        subprocess.Popen(_dispatcher_command(), **options)
+    except OSError:
+        return False
+    return True
+
+
+def ensure_continuous_dispatcher(store: AgentStore) -> bool:
+    """Keep one scheduler alive whenever at least one repeat intent exists."""
+    if not store.list_all_intents():
+        return False
+    current = store.get_dispatcher()
+    if current is not None:
+        observation = observe_process(current["pid"])
+        if _dispatcher_is_live(current):
+            return True
+        if observation.liveness == "unknown":
+            return False
+        store.release_dispatcher(current["pid"], current.get("processIdentity"))
+    if not launch_continuous_dispatcher(store):
+        return False
+    deadline = time.monotonic() + DISPATCHER_START_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        current = store.get_dispatcher()
+        if current is not None and _dispatcher_is_live(current):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _parse_utc(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _next_poll_at(now: datetime, seconds: int) -> str:
+    return (now + timedelta(seconds=seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _dispatcher_sleep_seconds(store: AgentStore, *, now: datetime) -> float:
+    waits: list[float] = []
+    for intent in store.list_all_intents():
+        configuration = configuration_of(store, intent["projectId"])
+        if configuration is None or not configuration.paused:
+            due = _parse_utc(intent.get("nextPollAt"))
+            waits.append(0.05 if due is None else max(0.05, (due - now).total_seconds()))
+    if not waits:
+        return DISPATCHER_POLL_CAP_SECONDS
+    return min(DISPATCHER_POLL_CAP_SECONDS, min(waits))
+
+
+def serve_continuous_intents(
+    store: AgentStore,
+    *,
+    helpers_factory: Callable[[Path], WorkflowHelpers] = WorkflowHelpers,
+    provider_factory: Callable[[str], AgentProvider] = build_provider,
+) -> int:
+    """Own all repeat policies until none remain, independent of the GUI."""
+    pid = os.getpid()
+    identity = process_identity(pid)
+    if not identity or not store.claim_dispatcher(pid, identity):
+        return 0
+    try:
+        while store.list_all_intents():
+            now = datetime.now(UTC)
+            tick_all_projects(
+                store,
+                helpers_factory=helpers_factory,
+                provider_factory=provider_factory,
+                detached_workers=True,
+                now=now,
+            )
+            if not store.list_all_intents():
+                break
+            time.sleep(_dispatcher_sleep_seconds(store, now=datetime.now(UTC)))
+        return 0
+    finally:
+        store.release_dispatcher(pid, identity)
 
 
 def handle_of(row: dict[str, Any]) -> ProviderRunHandle:
@@ -858,9 +992,12 @@ def tick_project(
     *,
     helpers_factory: Callable[[Path], WorkflowHelpers] = WorkflowHelpers,
     provider_factory: Callable[[str], AgentProvider] = build_provider,
+    detached_workers: bool = False,
+    now: datetime | None = None,
 ) -> TickReport:
-    """Recover what is running, then refill the slots a repeat run may take."""
+    """Recover what is running, then refill repeat slots that are due."""
     report = TickReport(project_id=project_id)
+    now = now or datetime.now(UTC)
     configuration = configuration_of(store, project_id)
     if configuration is None:
         return report
@@ -877,28 +1014,64 @@ def tick_project(
 
     for intent in store.list_intents(project_id):
         role = intent["role"]
+        policy = configuration.roles.get(role)
+        if policy is None or policy.execution_mode != "continuous":
+            store.drop_intent(intent["intentId"])
+            continue
+        manual = tuple(intent.get("manualTargets", ()))
+        if intent["mode"] == "manual" and not manual:
+            store.drop_intent(intent["intentId"])
+            continue
+        started_count = int(intent.get("startedCount", 0))
+        if policy.execution_limit is not None and started_count >= policy.execution_limit:
+            store.drop_intent(intent["intentId"])
+            continue
+        due = _parse_utc(intent.get("nextPollAt"))
+        if due is not None and due > now:
+            continue
+        intent["nextPollAt"] = _next_poll_at(now, policy.poll_interval_seconds)
+        store.save_intent(project_id, intent)
         while _role_remaining(store, configuration, role) > 0 and min(
             _project_remaining(store, configuration), _device_remaining(store, configuration)
         ) > 0:
-            manual = tuple(intent.get("manualTargets", ()))
-            if intent["mode"] == "manual" and not manual:
+            if policy.execution_limit is not None and started_count >= policy.execution_limit:
                 store.drop_intent(intent["intentId"])
                 break
-            row = start_one_run(
-                store,
-                configuration,
-                role,
-                helpers=helpers,
-                provider_factory=provider_factory,
-                manual_targets=manual,
-            )
-            if row["state"] != "running":
+            if detached_workers:
+                row = queue_and_launch_run(
+                    store,
+                    configuration,
+                    role,
+                    manual_targets=manual,
+                    intent_id=intent["intentId"],
+                )
+            else:
+                row = start_one_run(
+                    store,
+                    configuration,
+                    role,
+                    helpers=helpers,
+                    provider_factory=provider_factory,
+                    manual_targets=manual,
+                    intent_id=intent["intentId"],
+                )
+            if row["state"] not in {"queued", "reserved", "running"}:
                 report.failures.append(row.get("reason") or "start_failed")
+                if row.get("failureStage") == "request_validation":
+                    store.drop_intent(intent["intentId"])
                 break
             report.started += 1
+            started_count += 1
+            intent["startedCount"] = started_count
             if manual:
                 intent["manualTargets"] = [target for target in manual if target != row["targetId"]]
-                store.save_intent(project_id, intent)
+                manual = tuple(intent["manualTargets"])
+            if (intent["mode"] == "manual" and not manual) or (
+                policy.execution_limit is not None and started_count >= policy.execution_limit
+            ):
+                store.drop_intent(intent["intentId"])
+                break
+            store.save_intent(project_id, intent)
     return report
 
 
@@ -907,6 +1080,8 @@ def tick_all_projects(
     *,
     helpers_factory: Callable[[Path], WorkflowHelpers] = WorkflowHelpers,
     provider_factory: Callable[[str], AgentProvider] = build_provider,
+    detached_workers: bool = False,
+    now: datetime | None = None,
 ) -> list[TickReport]:
     """Serve every configured project, least recently started first.
 
@@ -917,7 +1092,14 @@ def tick_all_projects(
     for project_id in _fair_order(store):
         try:
             reports.append(
-                tick_project(store, project_id, helpers_factory=helpers_factory, provider_factory=provider_factory)
+                tick_project(
+                    store,
+                    project_id,
+                    helpers_factory=helpers_factory,
+                    provider_factory=provider_factory,
+                    detached_workers=detached_workers,
+                    now=now,
+                )
             )
         except Exception as error:  # noqa: BLE001 - one project must not stop the sweep
             report = TickReport(project_id=project_id)

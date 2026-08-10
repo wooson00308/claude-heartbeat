@@ -14,7 +14,7 @@ from typing import Iterator
 
 from heartbeat.agent_contract import AgentConfiguration
 
-AGENT_SCHEMA_VERSION = 2
+AGENT_SCHEMA_VERSION = 3
 DEFAULT_AGENT_DB = Path.home() / ".claude" / "heartbeat" / "agent-runtime.sqlite3"
 ACTIVE_RUN_STATES = frozenset({"reserved", "queued", "running", "paused"})
 ESTIMATED_MEMORY_PER_AGENT_BYTES = 1536 * 1024 * 1024
@@ -155,6 +155,12 @@ class AgentStore:
                 run_id TEXT,
                 error_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_dispatcher (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                pid INTEGER NOT NULL,
+                process_identity TEXT,
+                updated_at TEXT NOT NULL
             );
             """
         )
@@ -352,6 +358,34 @@ class AgentStore:
         """Store what a role should keep doing when a slot frees up."""
         self.save_plan(project_id, {**intent, "planId": intent["intentId"]})
 
+    def activate_intent(self, project_id: str, intent: dict) -> None:
+        """Replace the one repeat instruction for a role with a new activation."""
+        payload = {**intent, "planId": intent["intentId"]}
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    "SELECT run_id, payload_json FROM agent_queue WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+                replaced = []
+                for run_id, payload_json in rows:
+                    current = json.loads(payload_json)
+                    if current.get("intentId") and current.get("role") == intent.get("role"):
+                        replaced.append((run_id, project_id))
+                connection.executemany(
+                    "DELETE FROM agent_queue WHERE run_id = ? AND project_id = ?",
+                    replaced,
+                )
+                connection.execute(
+                    "INSERT INTO agent_queue(run_id, project_id, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (intent["intentId"], project_id, _dump(payload), utc_now()),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
     def list_intents(self, project_id: str) -> list[dict]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -359,6 +393,30 @@ class AgentStore:
             ).fetchall()
         payloads = [json.loads(row[0]) for row in rows]
         return [payload for payload in payloads if "intentId" in payload]
+
+    def list_all_intents(self) -> list[dict]:
+        """Return every persistent repeat instruction, keeping project identity."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT project_id, payload_json FROM agent_queue ORDER BY created_at"
+            ).fetchall()
+        intents = []
+        for project_id, payload_json in rows:
+            payload = json.loads(payload_json)
+            if "intentId" in payload:
+                intents.append({**payload, "projectId": project_id})
+        return intents
+
+    def get_intent(self, intent_id: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT project_id, payload_json FROM agent_queue WHERE run_id = ?",
+                (intent_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row[1])
+        return {**payload, "projectId": row[0]} if "intentId" in payload else None
 
     def drop_intent(self, intent_id: str) -> None:
         with self._connection() as connection:
@@ -369,6 +427,81 @@ class AgentStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+
+    def drop_role_intents(self, project_id: str, roles: set[str]) -> int:
+        """Stop repeat instructions whose saved role policy is no longer continuous."""
+        if not roles:
+            return 0
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    "SELECT run_id, payload_json FROM agent_queue WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+                dropped = []
+                for run_id, payload_json in rows:
+                    payload = json.loads(payload_json)
+                    if payload.get("intentId") and payload.get("role") in roles:
+                        dropped.append((run_id, project_id))
+                connection.executemany(
+                    "DELETE FROM agent_queue WHERE run_id = ? AND project_id = ?",
+                    dropped,
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return len(dropped)
+
+    def get_dispatcher(self) -> dict | None:
+        """Read the one device-wide repeat dispatcher process identity."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT pid, process_identity, updated_at FROM agent_dispatcher WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return {"pid": row[0], "processIdentity": row[1], "updatedAt": row[2]}
+
+    def claim_dispatcher(self, pid: int, identity: str | None) -> bool:
+        """Let exactly one detached process own repeat scheduling on this device."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO agent_dispatcher(singleton, pid, process_identity, updated_at)
+                    VALUES (1, ?, ?, ?)
+                    """,
+                    (pid, identity, utc_now()),
+                )
+                row = connection.execute(
+                    "SELECT pid, process_identity FROM agent_dispatcher WHERE singleton = 1"
+                ).fetchone()
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return row == (pid, identity)
+
+    def release_dispatcher(self, pid: int, identity: str | None) -> bool:
+        """Release only the dispatcher identity the caller actually observed or owns."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM agent_dispatcher
+                    WHERE singleton = 1 AND pid = ? AND process_identity IS ?
+                    """,
+                    (pid, identity),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return cursor.rowcount == 1
 
     def save_run(self, run: dict) -> None:
         """Write one run row. The caller owns the state name and the details."""

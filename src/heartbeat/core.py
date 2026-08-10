@@ -676,10 +676,13 @@ def _tick_agent_projects() -> None:
     dispatcher itself. Heartbeat 잡 스케줄은 어느 경우에도 그대로 돈다.
     """
     try:
-        from heartbeat.agent_dispatch import tick_all_projects
+        from heartbeat.agent_dispatch import ensure_continuous_dispatcher, reconcile_project_runs
         from heartbeat.agent_store import AgentStore
 
-        tick_all_projects(AgentStore())
+        store = AgentStore()
+        for project_id in store.list_project_ids():
+            reconcile_project_runs(store, project_id)
+        ensure_continuous_dispatcher(store)
     except Exception as e:
         log.debug(f"에이전트 디스패치 tick 건너뜀: {e}")
 
@@ -715,5 +718,4 @@ def heartbeat_loop() -> None:
         _dispatch_due_groups(jobs, state, executor)
         _tick_agent_projects()
         time.sleep(tick)
-
 

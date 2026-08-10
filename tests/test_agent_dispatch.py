@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,17 @@ def configure(store: AgentStore, root: Path, project_id: str, **overrides) -> ob
     return configuration
 
 
+def continuous_roles(root: Path, project_id: str, **developer_overrides: object) -> dict:  # type: ignore[no-untyped-def]
+    """Build role policies with only developer repeat execution enabled."""
+    roles = default_configuration(project_id, str(root)).to_dict()["roles"]
+    roles["developer"].update({
+        "executionMode": "continuous",
+        "pollIntervalSeconds": 1,
+        **developer_overrides,
+    })
+    return roles
+
+
 def store_at(tmp_path: Path) -> AgentStore:
     return AgentStore(tmp_path / "agent.sqlite3")
 
@@ -274,8 +286,8 @@ def test_paused_project_blocks_new_assignment_only(tmp_path: Path, provider_fact
     root = make_project(tmp_path, "paused")
     other = make_project(tmp_path, "other")
     store = store_at(tmp_path)
-    configure(store, root, "project-one")
-    configure(store, other, "project-two")
+    configure(store, root, "project-one", roles=continuous_roles(root, "project-one"))
+    configure(store, other, "project-two", roles=continuous_roles(other, "project-two"))
     running = start_slots(store, agent_dispatch.configuration_of(store, "project-one"), root, provider_factory)[0]
     store.set_paused("project-one", True)
     store.save_intent("project-one", {"intentId": "intent-1", "role": "developer", "mode": "auto", "manualTargets": []})
@@ -297,6 +309,7 @@ def test_once_does_not_refill_and_continuous_does(tmp_path: Path, provider_facto
     control(root, "reserve-limit", "5")
 
     once_reports = tick_project(store, "project-one", helpers_factory=WorkflowHelpers, provider_factory=provider_factory)
+    configure(store, root, "project-one", roles=continuous_roles(root, "project-one"))
     store.save_intent("project-one", {"intentId": "intent-1", "role": "developer", "mode": "auto", "manualTargets": []})
     continuous = tick_project(store, "project-one", helpers_factory=WorkflowHelpers, provider_factory=provider_factory)
 
@@ -307,7 +320,7 @@ def test_once_does_not_refill_and_continuous_does(tmp_path: Path, provider_facto
 def test_repeating_manual_work_stops_when_the_list_is_done(tmp_path: Path, provider_factory) -> None:  # type: ignore[no-untyped-def]
     root = make_project(tmp_path)
     store = store_at(tmp_path)
-    configure(store, root, "project-one")
+    configure(store, root, "project-one", roles=continuous_roles(root, "project-one"))
     control(root, "reserve-targets", "TASK-A\nTASK-B\n")
     store.save_intent("project-one", {
         "intentId": "intent-1", "role": "developer", "mode": "manual", "manualTargets": ["TASK-A"],
@@ -322,6 +335,65 @@ def test_repeating_manual_work_stops_when_the_list_is_done(tmp_path: Path, provi
     assert first.started == 1
     assert second.started == 0
     assert store.list_intents("project-one") == []
+
+
+def test_repeat_waits_for_its_role_interval_before_refilling(tmp_path: Path, provider_factory) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    roles = continuous_roles(root, "project-one", pollIntervalSeconds=60)
+    configure(store, root, "project-one", roles=roles)
+    now = datetime(2026, 8, 11, 1, 0, tzinfo=UTC)
+    store.save_intent("project-one", {
+        "intentId": "intent-1",
+        "role": "developer",
+        "mode": "auto",
+        "manualTargets": [],
+        "startedCount": 0,
+        "nextPollAt": (now + timedelta(seconds=60)).isoformat().replace("+00:00", "Z"),
+    })
+
+    early = tick_project(
+        store,
+        "project-one",
+        helpers_factory=WorkflowHelpers,
+        provider_factory=provider_factory,
+        now=now,
+    )
+    due = tick_project(
+        store,
+        "project-one",
+        helpers_factory=WorkflowHelpers,
+        provider_factory=provider_factory,
+        now=now + timedelta(seconds=60),
+    )
+
+    assert early.started == 0
+    assert due.started == 1
+    assert store.list_intents("project-one")[0]["nextPollAt"] == "2026-08-11T01:02:00Z"
+
+
+def test_repeat_execution_limit_stops_the_instruction_after_that_many_starts(
+    tmp_path: Path, provider_factory
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    roles = continuous_roles(root, "project-one", maxParallel=3, executionLimit=2)
+    configure(store, root, "project-one", projectMaxParallel=3, deviceMaxParallel=3, roles=roles)
+    control(root, "reserve-targets", "TASK-A\nTASK-B\n")
+    store.save_intent("project-one", {
+        "intentId": "intent-1", "role": "developer", "mode": "auto", "manualTargets": [],
+    })
+
+    report = tick_project(
+        store,
+        "project-one",
+        helpers_factory=WorkflowHelpers,
+        provider_factory=provider_factory,
+    )
+
+    assert report.started == 2
+    assert store.list_intents("project-one") == []
+    assert {run["intentId"] for run in store.list_runs("project-one")} == {"intent-1"}
 
 
 def test_only_one_dispatcher_wins_the_same_target(tmp_path: Path, provider_factory) -> None:  # type: ignore[no-untyped-def]
@@ -354,8 +426,22 @@ def test_two_projects_take_turns_on_the_device_slots(tmp_path: Path, provider_fa
     first_root = make_project(tmp_path, "first")
     second_root = make_project(tmp_path, "second")
     store = store_at(tmp_path)
-    configure(store, first_root, "project-one", deviceMaxParallel=2, projectMaxParallel=2)
-    configure(store, second_root, "project-two", deviceMaxParallel=2, projectMaxParallel=2)
+    configure(
+        store,
+        first_root,
+        "project-one",
+        deviceMaxParallel=2,
+        projectMaxParallel=2,
+        roles=continuous_roles(first_root, "project-one"),
+    )
+    configure(
+        store,
+        second_root,
+        "project-two",
+        deviceMaxParallel=2,
+        projectMaxParallel=2,
+        roles=continuous_roles(second_root, "project-two"),
+    )
     for project in ("project-one", "project-two"):
         store.save_intent(project, {"intentId": f"intent-{project}", "role": "developer", "mode": "auto", "manualTargets": []})
 
@@ -377,8 +463,8 @@ def test_one_broken_project_does_not_stop_the_other(tmp_path: Path, provider_fac
     broken_root = make_project(tmp_path, "broken")
     healthy_root = make_project(tmp_path, "healthy")
     store = store_at(tmp_path)
-    configure(store, broken_root, "project-broken")
-    configure(store, healthy_root, "project-healthy")
+    configure(store, broken_root, "project-broken", roles=continuous_roles(broken_root, "project-broken"))
+    configure(store, healthy_root, "project-healthy", roles=continuous_roles(healthy_root, "project-healthy"))
     control(broken_root, "reserve-mode", "unavailable")
     for project in ("project-broken", "project-healthy"):
         store.save_intent(project, {"intentId": f"intent-{project}", "role": "developer", "mode": "auto", "manualTargets": []})

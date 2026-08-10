@@ -15,6 +15,7 @@ from heartbeat.agent_store import AgentStore
 from heartbeat.agent_dispatch import (
     WorkflowHelpers,
     apply_cancel,
+    ensure_continuous_dispatcher,
     queue_and_launch_run,
     queue_one_run,
     preview_cancel,
@@ -196,6 +197,71 @@ def test_the_real_detached_worker_outlives_the_control_call(
         "started", "progress", "completed",
     ]
     assert f"release {current['targetId']} {current['leaseId']}" in claim_log(root)
+
+
+def test_the_real_repeat_dispatcher_outlives_the_control_call_and_starts_the_next_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from tests.test_agent_dispatch import continuous_roles
+
+    root = make_project(tmp_path)
+    store = AgentStore(tmp_path / "runtime-home" / "agent-runtime.sqlite3")
+    roles = continuous_roles(
+        root,
+        "project-one",
+        pollIntervalSeconds=1,
+        executionLimit=2,
+    )
+    configure(store, root, "project-one", roles=roles)
+    control(root, "reserve-targets", "TASK-A\nTASK-B\n")
+    executable = tmp_path / "bin" / "claude"
+    executable.parent.mkdir()
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys, time\n"
+        "if '--version' in sys.argv:\n"
+        "    print('claude 1.0.0')\n"
+        "elif 'auth' in sys.argv:\n"
+        "    print(json.dumps({'loggedIn': True}))\n"
+        "else:\n"
+        "    sys.stdin.read()\n"
+        "    print(json.dumps({'type': 'assistant'}), flush=True)\n"
+        "    time.sleep(0.1)\n"
+        "    print(json.dumps({'type': 'result', 'subtype': 'success'}), flush=True)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{executable.parent}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("HEARTBEAT_AGENT_HOME", str(tmp_path / "runtime-home"))
+    store.activate_intent("project-one", {
+        "intentId": "intent-1",
+        "role": "developer",
+        "mode": "auto",
+        "manualTargets": [],
+        "startedCount": 0,
+        "nextPollAt": "2000-01-01T00:00:00Z",
+    })
+
+    assert ensure_continuous_dispatcher(store) is True
+    dispatcher = store.get_dispatcher()
+    assert dispatcher is not None and dispatcher["pid"] != os.getpid()
+
+    deadline = time.monotonic() + 15
+    runs = store.list_runs("project-one")
+    while (
+        len(runs) < 2
+        or any(run["state"] in {"queued", "reserved", "running"} for run in runs)
+        or store.list_intents("project-one")
+    ) and time.monotonic() < deadline:
+        time.sleep(0.05)
+        runs = store.list_runs("project-one")
+
+    assert len(runs) == 2
+    assert {run["state"] for run in runs} == {"succeeded"}
+    assert {run["targetId"] for run in runs} == {"TASK-A", "TASK-B"}
+    assert {run["intentId"] for run in runs} == {"intent-1"}
+    assert store.list_intents("project-one") == []
+    assert reserve_calls(root) == 2
 
 
 def test_state_refresh_leaves_a_live_detached_supervisor_as_the_single_event_owner(

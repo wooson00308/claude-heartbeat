@@ -126,6 +126,19 @@ recovery_required다. 앱은 SQLite 행이 아니라 `state` 응답의 이 이�
 provider 시작, 이벤트 기록, lease 갱신과 종료 정리를 소유하므로 제어 명령이나 앱이 먼저 끝나도
 provider의 표준 출력 파이프와 감시 수명이 끊기지 않는다.
 
+`continuous` 역할을 확인해 시작하면 런타임은 역할당 반복 지시 하나를 저장하고 기기당 반복 dispatcher
+하나를 별도 프로세스로 띄운다. dispatcher는 앱과 짧은 제어 명령의 자식 수명에 묶이지 않으며, 빈 슬롯이
+생겨도 역할의 `pollIntervalSeconds`가 지난 뒤에만 자격을 다시 판단한다. `executionLimit`은 사용자가
+확인한 반복 시작 한 번에서 새로 시작할 수 있는 총 실행 수다. 최초 실행도 그 수에 포함하고, 한도에
+도달하거나 수동 대상 목록을 모두 처리하면 해당 반복 지시를 제거한다. 같은 역할을 다시 시작하면 이전
+지시를 중복 적재하지 않고 새 확인 내용으로 교체한다. 역할 설정을 `once`로 저장하면 남은 반복 지시를
+제거한다.
+
+반복 dispatcher는 모든 프로젝트를 한 프로세스에서 공정 순서로 훑는다. 각 실제 역할 실행은 다시 자기
+전용 감독 프로세스로 분리되므로 dispatcher가 종료돼도 이미 시작된 CLI와 lease 정리는 계속된다. 프로젝트
+일시 정지는 반복 지시를 지우지 않고 새 배정만 멈추며, 재개·상태 조회·Heartbeat 사용자 서비스의 다음
+tick은 저장된 반복 지시가 있는데 dispatcher가 사라졌을 때 하나만 다시 띄운다.
+
 ### 예약 도구와 lease
 
 시작은 프로젝트의 `.workflow/rules/wf-reserve.sh`(Windows는 `.ps1`)를 슬롯마다 한 번 호출하고
@@ -173,6 +186,13 @@ PID와 생성 신원을 대조해 회수한다. PID가 같아도 생성 신원�
 직접 열거나 마이그레이션하지 않는다. 기존 `jobs.d`, Heartbeat 잡, Dream 설정과 기존 `state.json`은
 새 에이전트 상태의 원천이 아니며 변경하지 않는다.
 
+기본 경로는 `~/.claude/heartbeat/agent-runtime.sqlite3`이다. 이 로컬 파일에는 프로젝트별 정책,
+일회용 시작 계획, 반복 지시, 실행 상태, 정규화된 진행 이벤트와 오류 단계, 현재 반복 dispatcher의
+PID·프로세스 신원만 저장한다. 프로젝트 문서의 내용, 역할 prompt 원문, provider 인증 토큰, API 키와
+전체 환경 변수는 저장하지 않는다. SQLite가 필요한 이유는 앱이나 제어 명령이 종료된 뒤에도 반복 지시와
+실행 사실을 잃지 않고, 재시작 뒤 살아 있는 프로세스를 같은 PID의 다른 프로세스와 구분하며, 여러 시작
+요청이 같은 기기 슬롯과 dispatcher 소유권을 짧은 트랜잭션으로 정리하게 하기 위해서다.
+
 ## 독립 실행형 배포와 서비스 복구
 
 런타임 릴리스는 macOS universal, Linux x86_64, Windows x86_64용 one-folder 배포물이다.
@@ -194,7 +214,7 @@ launcher를 실행해야 하며, `HEARTBEAT_RUNTIME_LAUNCHER`가 있으면 이�
 ```json
 {
   "schemaVersion": 1, "result": "ok", "checkedAt": "2026-08-08T08:41:23Z",
-  "runtimeVersion": "0.8.0", "installedVersion": "0.8.0", "runningVersion": "0.8.0",
+  "runtimeVersion": "0.8.2", "installedVersion": "0.8.2", "runningVersion": "0.8.2",
   "apiMajor": 1, "target": "macos-universal", "executable": "/…/heartbeat",
   "installRoot": "/…/install", "launcher": "/…/install/bin/heartbeat",
   "installResult": "installed", "recoverable": true,

@@ -207,6 +207,61 @@ def test_start_needs_the_same_plan_and_an_explicit_confirmation(execution_projec
     assert execution_project.store.list_intents("project-one") == []
 
 
+def test_continuous_start_persists_one_role_instruction_and_starts_the_dispatcher(
+    execution_project, monkeypatch
+):
+    from tests.test_agent_dispatch import continuous_roles
+
+    configuration = default_configuration("project-one", str(execution_project.root)).to_dict()
+    configuration["roles"] = continuous_roles(
+        execution_project.root,
+        "project-one",
+        pollIntervalSeconds=30,
+        executionLimit=3,
+    )
+    _invoke("config.write", _request(configuration), execution_project.store)
+    started_dispatcher = []
+    monkeypatch.setattr(
+        "heartbeat.agent_dispatch.ensure_continuous_dispatcher",
+        lambda store: started_dispatcher.append(store.database_path) or True,
+    )
+    _, planned = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
+
+    exit_code, response = execution_project.call(
+        "run.start",
+        planId=planned["data"]["plan"]["planId"],
+        confirmed=True,
+    )
+    intents = execution_project.store.list_intents("project-one")
+
+    assert exit_code == 0
+    assert response["outcome"] == "success"
+    assert len(intents) == 1
+    assert intents[0]["role"] == "developer"
+    assert intents[0]["startedCount"] == 1
+    assert intents[0]["nextPollAt"].endswith("Z")
+    assert started_dispatcher == [execution_project.store.database_path]
+
+
+def test_saving_once_mode_stops_an_existing_repeat_instruction(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    store = AgentStore(tmp_path / "agent.sqlite3")
+    continuous = default_configuration("project-one", str(root)).to_dict()
+    continuous["roles"]["developer"]["executionMode"] = "continuous"
+    monkeypatch.setattr("heartbeat.agent_dispatch.ensure_continuous_dispatcher", lambda store: True)
+    _invoke("config.write", _request(continuous), store)
+    store.save_intent("project-one", {
+        "intentId": "intent-1", "role": "developer", "mode": "auto", "manualTargets": [],
+    })
+    once = default_configuration("project-one", str(root)).to_dict()
+
+    exit_code, _ = _invoke("config.write", _request(once), store)
+
+    assert exit_code == 0
+    assert store.list_intents("project-one") == []
+
+
 def test_state_read_reconciles_a_finished_process_before_reporting_capacity(execution_project):
     from tests.test_agent_recovery import wait_for_events
 
