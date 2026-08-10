@@ -56,6 +56,7 @@ def test_parse_heartbeat_md_max_per_field(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr(core, "HEARTBEAT_FILE", f)
+    monkeypatch.setattr(core, "JOBS_DIR", tmp_path / "jobs.d")
 
     _, jobs = core.parse_heartbeat_md()
     job = jobs[0]
@@ -67,6 +68,7 @@ def test_parse_heartbeat_md_no_max_per_defaults_to_none(tmp_path, monkeypatch):
     f = tmp_path / "HEARTBEAT.md"
     f.write_text("## j\n- slug: -x\n- prompt: y\n", encoding="utf-8")
     monkeypatch.setattr(core, "HEARTBEAT_FILE", f)
+    monkeypatch.setattr(core, "JOBS_DIR", tmp_path / "jobs.d")
 
     _, jobs = core.parse_heartbeat_md()
     assert jobs[0]["max_per"] is None
