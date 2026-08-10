@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
 from heartbeat.agent_contract import default_configuration, validate_configuration
-from heartbeat.agent_store import AGENT_SCHEMA_VERSION, AgentStore
+from heartbeat.agent_store import AGENT_SCHEMA_VERSION, AgentStore, recommend_device_parallelism
 
 
 def _configuration(project_id, directory):
@@ -39,6 +39,55 @@ def test_project_records_do_not_mix(tmp_path):
 
     assert store.get_configuration("project-one") == first.to_dict()
     assert store.get_configuration("project-two") == second.to_dict()
+
+
+def test_device_limit_is_one_global_value_and_has_no_fixed_ceiling(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+    first_directory = tmp_path / "first"
+    second_directory = tmp_path / "second"
+    first_directory.mkdir()
+    second_directory.mkdir()
+    first_data = default_configuration("project-one", str(first_directory)).to_dict()
+    first_data["deviceMaxParallel"] = 48
+    second = _configuration("project-two", second_directory)
+
+    store.save_configuration(validate_configuration(first_data))
+    assert store.get_configuration("project-one")["deviceMaxParallel"] == 48
+
+    store.save_configuration(second)
+    assert store.get_configuration("project-one")["deviceMaxParallel"] == 16
+    assert store.get_configuration("project-two")["deviceMaxParallel"] == 16
+
+
+def test_device_recommendation_uses_cpu_and_memory_without_becoming_a_cap():
+    eight_gib = 8 * 1024 * 1024 * 1024
+    recommendation = recommend_device_parallelism(12, eight_gib)
+
+    assert recommendation["recommendedMaxParallel"] == 4
+    assert recommendation["cpuAllowance"] == 11
+    assert recommendation["memoryAllowance"] == 4
+
+
+def test_device_capacity_lists_project_ceiling_and_live_use(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+    project = _configuration("project-one", tmp_path)
+    store.save_configuration(project)
+    store.save_run({
+        "runId": "run-1", "projectId": "project-one", "role": "developer",
+        "provider": "claude", "state": "running",
+    })
+
+    capacity = store.device_capacity()
+
+    assert capacity["effectiveMaxParallel"] == 16
+    assert capacity["configuredMaxParallel"] == 16
+    assert capacity["activeRuns"] == 1
+    assert capacity["projects"] == [{
+        "projectId": "project-one",
+        "projectName": tmp_path.name,
+        "projectMaxParallel": 3,
+        "activeRuns": 1,
+    }]
 
 
 def test_state_is_project_scoped_and_empty_before_dispatch(tmp_path):

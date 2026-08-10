@@ -286,14 +286,21 @@ def run_agent_command(
             configuration = validate_configuration(request.get("configuration"), request_id=request_id)
             if command == "config.write":
                 runtime_store.save_configuration(configuration)
+                configuration = validate_configuration(runtime_store.get_configuration(configuration.project_id))
             _write_json(
-                envelope(command, request_id, outcome="success", data={"configuration": configuration.to_dict()}),
+                envelope(command, request_id, outcome="success", data={
+                    "configuration": configuration.to_dict(),
+                    "deviceCapacity": runtime_store.device_capacity(),
+                }),
                 output_stream,
             )
             return 0
         if command == "config.read":
             configuration = runtime_store.get_configuration(_project_id(request, request_id))
-            _write_json(envelope(command, request_id, outcome="success", data={"configuration": configuration}), output_stream)
+            _write_json(envelope(command, request_id, outcome="success", data={
+                "configuration": configuration,
+                "deviceCapacity": runtime_store.device_capacity(),
+            }), output_stream)
             return 0
         if command == "state.read":
             state = runtime_store.get_state(_project_id(request, request_id))

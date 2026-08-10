@@ -14,8 +14,11 @@ from typing import Iterator
 
 from heartbeat.agent_contract import AgentConfiguration
 
-AGENT_SCHEMA_VERSION = 1
+AGENT_SCHEMA_VERSION = 2
 DEFAULT_AGENT_DB = Path.home() / ".claude" / "heartbeat" / "agent-runtime.sqlite3"
+ACTIVE_RUN_STATES = frozenset({"reserved", "queued", "running", "paused"})
+ESTIMATED_MEMORY_PER_AGENT_BYTES = 1536 * 1024 * 1024
+MINIMUM_RESERVED_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _dump(value: dict) -> str:
@@ -34,6 +37,45 @@ def default_agent_database_path() -> Path:
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def recommend_device_parallelism(logical_cpu_count: int, total_memory_bytes: int | None) -> dict:
+    """Return a transparent first-run suggestion, never a hard limit.
+
+    One logical CPU is left for the desktop and OS. Memory keeps the larger of
+    2 GiB or 25% aside and budgets 1.5 GiB for each CLI process tree. The
+    smaller allowance becomes the recommendation; users may override it.
+    """
+    logical_cpu_count = max(1, logical_cpu_count)
+    cpu_allowance = max(1, logical_cpu_count - 1)
+    reserved_memory_bytes: int | None = None
+    memory_allowance: int | None = None
+    if total_memory_bytes is not None and total_memory_bytes > 0:
+        reserved_memory_bytes = max(MINIMUM_RESERVED_MEMORY_BYTES, total_memory_bytes // 4)
+        usable = max(ESTIMATED_MEMORY_PER_AGENT_BYTES, total_memory_bytes - reserved_memory_bytes)
+        memory_allowance = max(1, usable // ESTIMATED_MEMORY_PER_AGENT_BYTES)
+    recommended = min(cpu_allowance, memory_allowance) if memory_allowance is not None else cpu_allowance
+    return {
+        "recommendedMaxParallel": max(1, recommended),
+        "logicalCpuCount": logical_cpu_count,
+        "totalMemoryBytes": total_memory_bytes,
+        "reservedMemoryBytes": reserved_memory_bytes,
+        "estimatedMemoryPerAgentBytes": ESTIMATED_MEMORY_PER_AGENT_BYTES,
+        "cpuAllowance": cpu_allowance,
+        "memoryAllowance": memory_allowance,
+    }
+
+
+def detected_device_recommendation() -> dict:
+    """Read cross-platform hardware facts without making them an execution gate."""
+    total_memory_bytes: int | None = None
+    try:
+        import psutil
+
+        total_memory_bytes = int(psutil.virtual_memory().total)
+    except (ImportError, AttributeError, OSError, ValueError):
+        pass
+    return recommend_device_parallelism(os.cpu_count() or 1, total_memory_bytes)
 
 
 class AgentStore:
@@ -78,6 +120,11 @@ class AgentStore:
                 configuration_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_device_settings (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                max_parallel INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS agent_queue (
                 run_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -110,7 +157,7 @@ class AgentStore:
         connection.execute(f"PRAGMA user_version={AGENT_SCHEMA_VERSION}")
 
     def save_configuration(self, configuration: AgentConfiguration) -> None:
-        """Atomically replace one project's complete configuration."""
+        """Atomically replace one project and the one device-wide limit."""
         payload = json.dumps(configuration.to_dict(), ensure_ascii=False, separators=(",", ":"))
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -126,6 +173,16 @@ class AgentStore:
                     """,
                     (configuration.project_id, configuration.working_directory, payload, utc_now()),
                 )
+                connection.execute(
+                    """
+                    INSERT INTO agent_device_settings(singleton, max_parallel, updated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET
+                        max_parallel=excluded.max_parallel,
+                        updated_at=excluded.updated_at
+                    """,
+                    (configuration.device_max_parallel, utc_now()),
+                )
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")
@@ -136,7 +193,69 @@ class AgentStore:
             row = connection.execute(
                 "SELECT configuration_json FROM agent_configurations WHERE project_id = ?", (project_id,)
             ).fetchone()
-        return json.loads(row[0]) if row else None
+            device_limit = self._device_limit(connection)
+        if row is None:
+            return None
+        configuration = json.loads(row[0])
+        configuration["deviceMaxParallel"] = device_limit
+        return configuration
+
+    @staticmethod
+    def _device_limit(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT max_parallel FROM agent_device_settings WHERE singleton = 1"
+        ).fetchone()
+        if row is not None:
+            return max(1, int(row[0]))
+        # Upgrade compatibility: preserve the most recently edited legacy value
+        # until the user saves the new global setting for the first time.
+        legacy = connection.execute(
+            "SELECT configuration_json FROM agent_configurations ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        if legacy is not None:
+            value = json.loads(legacy[0]).get("deviceMaxParallel")
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return detected_device_recommendation()["recommendedMaxParallel"]
+
+    def device_limit(self) -> int:
+        with self._connection() as connection:
+            return self._device_limit(connection)
+
+    def device_capacity(self) -> dict:
+        """Expose recommendation, global choice, project ceilings, and live use."""
+        recommendation = detected_device_recommendation()
+        with self._connection() as connection:
+            configured = connection.execute(
+                "SELECT max_parallel FROM agent_device_settings WHERE singleton = 1"
+            ).fetchone()
+            configuration_rows = connection.execute(
+                "SELECT project_id, working_directory, configuration_json FROM agent_configurations ORDER BY project_id"
+            ).fetchall()
+            run_rows = connection.execute(
+                "SELECT project_id, state FROM agent_runs"
+            ).fetchall()
+            effective = self._device_limit(connection)
+        active_by_project: dict[str, int] = {}
+        for project_id, state in run_rows:
+            if state in ACTIVE_RUN_STATES:
+                active_by_project[project_id] = active_by_project.get(project_id, 0) + 1
+        projects = []
+        for project_id, working_directory, payload in configuration_rows:
+            configuration = json.loads(payload)
+            projects.append({
+                "projectId": project_id,
+                "projectName": Path(working_directory).name or project_id,
+                "projectMaxParallel": int(configuration.get("projectMaxParallel", 1)),
+                "activeRuns": active_by_project.get(project_id, 0),
+            })
+        return {
+            **recommendation,
+            "configuredMaxParallel": int(configured[0]) if configured is not None else None,
+            "effectiveMaxParallel": effective,
+            "activeRuns": sum(active_by_project.values()),
+            "projects": projects,
+        }
 
     def list_project_ids(self) -> list[str]:
         """List every configured project so one tick can serve all of them."""
@@ -328,8 +447,11 @@ class AgentStore:
             errors = connection.execute(
                 "SELECT error_json FROM agent_errors WHERE project_id = ? ORDER BY created_at DESC", (project_id,)
             ).fetchall()
+        stored_configuration = json.loads(configuration[0]) if configuration else None
+        if stored_configuration is not None:
+            stored_configuration["deviceMaxParallel"] = self.device_limit()
         return {
-            "configuration": json.loads(configuration[0]) if configuration else None,
+            "configuration": stored_configuration,
             "queue": [json.loads(row[0]) for row in queue],
             "runs": [json.loads(row[0]) for row in runs],
             "errors": [json.loads(row[0]) for row in errors],

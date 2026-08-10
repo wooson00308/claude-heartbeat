@@ -191,19 +191,6 @@ def validate_configuration(value: Any, *, request_id: str | None = None) -> Agen
         "deviceMaxParallel",
         request_id,
     )
-    if device_max_parallel > DEFAULT_DEVICE_MAX_PARALLEL:
-        raise AgentContractError(
-            "device_limit_exceeded",
-            f"deviceMaxParallel must not exceed {DEFAULT_DEVICE_MAX_PARALLEL}",
-            request_id=request_id,
-        )
-    if project_max_parallel > device_max_parallel:
-        raise AgentContractError(
-            "project_limit_exceeded",
-            "projectMaxParallel must not exceed deviceMaxParallel",
-            request_id=request_id,
-        )
-
     paused = config.get("paused", False)
     if not isinstance(paused, bool):
         raise AgentContractError("invalid_request", "paused must be a boolean", request_id=request_id)
@@ -305,6 +292,7 @@ def contract_description() -> dict[str, Any]:
             "roleMaxParallel": DEFAULT_ROLE_MAX_PARALLEL,
             "projectMaxParallel": DEFAULT_PROJECT_MAX_PARALLEL,
             "deviceMaxParallel": DEFAULT_DEVICE_MAX_PARALLEL,
+            "deviceMaxParallelIsRecommendationFallback": True,
             "eventRetentionDays": DEFAULT_EVENT_RETENTION_DAYS,
         },
     }

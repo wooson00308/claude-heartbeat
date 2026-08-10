@@ -29,7 +29,6 @@ from typing import Any
 import psutil
 
 from heartbeat.agent_contract import (
-    DEFAULT_DEVICE_MAX_PARALLEL,
     AgentConfiguration,
     validate_configuration,
 )
@@ -223,7 +222,7 @@ def runtime_revision(store: AgentStore, configuration: AgentConfiguration) -> st
     """Fingerprint everything a plan assumed, so a changed world is visible."""
     active = sorted(run["runId"] for run in store.list_runs(states=ACTIVE_STATES))
     payload = json.dumps(
-        {"configuration": configuration.to_dict(), "active": active},
+        {"configuration": configuration.to_dict(), "deviceMaxParallel": store.device_limit(), "active": active},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -232,7 +231,7 @@ def runtime_revision(store: AgentStore, configuration: AgentConfiguration) -> st
 
 
 def _device_remaining(store: AgentStore, configuration: AgentConfiguration) -> int:
-    limit = min(configuration.device_max_parallel, DEFAULT_DEVICE_MAX_PARALLEL)
+    limit = store.device_limit()
     return max(0, limit - len(store.list_runs(states=ACTIVE_STATES)))
 
 
@@ -330,7 +329,7 @@ def build_plan(
         "projectRemaining": project_remaining,
         "limits": {
             "projectMaxParallel": configuration.project_max_parallel,
-            "deviceMaxParallel": min(configuration.device_max_parallel, DEFAULT_DEVICE_MAX_PARALLEL),
+            "deviceMaxParallel": store.device_limit(),
             "roleMaxParallel": {role: policy.max_parallel for role, policy in sorted(configuration.roles.items())},
         },
         "billingRouteRisk": any(

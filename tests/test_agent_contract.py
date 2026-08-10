@@ -53,20 +53,15 @@ def test_missing_working_directory_is_rejected(configuration, tmp_path):
     assert error.value.code == "working_directory_not_found"
 
 
-def test_device_cap_cannot_exceed_first_release_limit(configuration):
-    configuration["deviceMaxParallel"] = 17
+def test_device_cap_accepts_an_explicit_user_override(configuration):
+    configuration["deviceMaxParallel"] = 64
 
-    with pytest.raises(AgentContractError) as error:
-        validate_configuration(configuration)
-
-    assert error.value.code == "device_limit_exceeded"
+    assert validate_configuration(configuration).device_max_parallel == 64
 
 
-def test_project_and_role_limits_cannot_exceed_their_parent_limits(configuration):
+def test_project_limit_may_exceed_the_shared_device_limit_but_role_may_not_exceed_project(configuration):
     configuration["projectMaxParallel"] = 17
-    with pytest.raises(AgentContractError) as project_error:
-        validate_configuration(configuration)
-    assert project_error.value.code == "project_limit_exceeded"
+    assert validate_configuration(configuration).project_max_parallel == 17
 
     configuration["projectMaxParallel"] = 3
     configuration["roles"]["developer"]["maxParallel"] = 4
@@ -122,6 +117,7 @@ def test_contract_advertises_versions_commands_and_defaults():
         "roleMaxParallel": 1,
         "projectMaxParallel": 3,
         "deviceMaxParallel": 16,
+        "deviceMaxParallelIsRecommendationFallback": True,
         "eventRetentionDays": 30,
     }
     assert "recovery_required" in description["runStates"]

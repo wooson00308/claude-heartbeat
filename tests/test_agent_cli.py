@@ -88,13 +88,25 @@ def test_bad_requests_return_failure_envelopes_without_tracebacks(tmp_path, comm
 def test_bad_write_does_not_store_a_configuration(tmp_path):
     store = AgentStore(tmp_path / "agent.sqlite3")
     configuration = default_configuration("project-one", str(tmp_path)).to_dict()
-    configuration["deviceMaxParallel"] = 17
+    configuration["deviceMaxParallel"] = 0
 
     exit_code, response = _invoke("config.write", _request(configuration), store)
 
     assert exit_code == 2
-    assert response["error"]["code"] == "device_limit_exceeded"
+    assert response["error"]["code"] == "invalid_request"
     assert store.get_configuration("project-one") is None
+
+
+def test_device_override_above_the_old_fixed_ceiling_round_trips(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+    configuration = default_configuration("project-one", str(tmp_path)).to_dict()
+    configuration["deviceMaxParallel"] = 48
+
+    write_code, written = _invoke("config.write", _request(configuration), store)
+
+    assert write_code == 0
+    assert written["data"]["configuration"]["deviceMaxParallel"] == 48
+    assert written["data"]["deviceCapacity"]["effectiveMaxParallel"] == 48
 
 
 def test_rejected_secret_is_absent_from_response_and_database(tmp_path):
