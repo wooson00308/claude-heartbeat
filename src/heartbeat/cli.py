@@ -355,6 +355,11 @@ def main() -> None:
         help="(deprecated since v0.4.0) start는 항상 foreground 동작. 인자만 유지.",
     )
 
+    # Internal detached supervisor. The app never calls this command directly;
+    # run.start launches it with a runtime-owned run id and database path.
+    p_agent_worker = sub.add_parser("agent-worker", help=argparse.SUPPRESS)
+    p_agent_worker.add_argument("run_id")
+
     # stop
     sub.add_parser("stop", help="Stop heartbeat daemon")
 
@@ -552,6 +557,12 @@ def main() -> None:
 
     elif args.command == "uninstall-service":
         sys.exit(uninstall_service(print_only=args.print_only))
+
+    elif args.command == "agent-worker":
+        from heartbeat.agent_dispatch import serve_queued_run
+        from heartbeat.agent_store import AgentStore
+
+        sys.exit(serve_queued_run(AgentStore(), args.run_id))
 
     elif args.command == "agent":
         from heartbeat.agent_cli import run_agent_command

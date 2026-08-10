@@ -103,6 +103,21 @@ def test_state_is_project_scoped_and_empty_before_dispatch(tmp_path):
     assert store.get_state("unknown-project")["configuration"] is None
 
 
+def test_expired_plans_are_pruned_without_removing_live_plans_or_repeat_intents(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+    store.save_plan("project-one", {"planId": "expired", "expiresAt": "2090-08-10T10:00:00Z"})
+    store.save_plan("project-one", {"planId": "live", "expiresAt": "2092-08-10T12:00:00Z"})
+    store.save_intent("project-one", {
+        "intentId": "repeat", "role": "developer", "mode": "auto", "manualTargets": [],
+    })
+
+    removed = store.prune_expired_plans("project-one", now="2091-08-10T11:00:00Z")
+    queue = store.get_state("project-one")["queue"]
+
+    assert removed == 1
+    assert [item.get("planId") or item.get("intentId") for item in queue] == ["live", "repeat"]
+
+
 def test_invalid_candidate_does_not_partially_replace_saved_configuration(tmp_path):
     store = AgentStore(tmp_path / "agent.sqlite3")
     saved = _configuration("project-one", tmp_path)

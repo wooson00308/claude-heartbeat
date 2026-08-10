@@ -4,21 +4,28 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
 import psutil
 import pytest
 
+from heartbeat.agent_store import AgentStore
 from heartbeat.agent_dispatch import (
     WorkflowHelpers,
     apply_cancel,
+    queue_and_launch_run,
+    queue_one_run,
     preview_cancel,
+    reconcile_project_runs,
     reconcile_run,
     retry_run,
+    serve_queued_run,
     start_one_run,
     tick_project,
 )
+from heartbeat.providers.process import process_identity
 from tests.test_agent_dispatch import (
     FIXTURE_CLI,
     FixtureProvider,
@@ -123,6 +130,98 @@ def test_a_dead_process_is_concluded_and_its_lease_released(tmp_path: Path, prov
     assert current["state"] == "succeeded"
     assert current["remaining"] == []
     assert f"release {row['targetId']} {row['leaseId']}" in claim_log(root)
+
+
+def test_a_detached_worker_owns_supervision_until_the_run_and_lease_are_closed(
+    tmp_path: Path, provider_factory
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configuration = configure(store, root, "project-one")
+    queued = queue_one_run(store, configuration, "developer")
+
+    exit_code = serve_queued_run(
+        store,
+        queued["runId"],
+        helpers_factory=WorkflowHelpers,
+        provider_factory=provider_factory,
+        poll_seconds=0.01,
+    )
+    current = store.get_run(queued["runId"])
+
+    assert exit_code == 0
+    assert current["state"] == "succeeded"
+    assert current["remaining"] == []
+    assert current["supervisorPid"] == os.getpid()
+    assert f"release {current['targetId']} {current['leaseId']}" in claim_log(root)
+
+
+def test_the_real_detached_worker_outlives_the_control_call(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = make_project(tmp_path)
+    store = AgentStore(tmp_path / "runtime-home" / "agent-runtime.sqlite3")
+    configuration = configure(store, root, "project-one")
+    executable = tmp_path / "bin" / "claude"
+    executable.parent.mkdir()
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys, time\n"
+        "if '--version' in sys.argv:\n"
+        "    print('claude 1.0.0')\n"
+        "elif 'auth' in sys.argv:\n"
+        "    print(json.dumps({'loggedIn': True}))\n"
+        "else:\n"
+        "    sys.stdin.read()\n"
+        "    print(json.dumps({'type': 'assistant'}), flush=True)\n"
+        "    time.sleep(0.2)\n"
+        "    print(json.dumps({'type': 'result', 'subtype': 'success'}), flush=True)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{executable.parent}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    launched = queue_and_launch_run(store, configuration, "developer")
+    assert launched["state"] in {"reserved", "running"}
+    assert launched["supervisorPid"] != os.getpid()
+
+    deadline = time.monotonic() + 10
+    current = store.get_run(launched["runId"])
+    while current["state"] in {"queued", "reserved", "running"} and time.monotonic() < deadline:
+        time.sleep(0.05)
+        current = store.get_run(launched["runId"])
+
+    assert current["state"] == "succeeded"
+    assert [event["kind"] for event in store.read_events("project-one", current["runId"])[0]] == [
+        "started", "progress", "completed",
+    ]
+    assert f"release {current['targetId']} {current['leaseId']}" in claim_log(root)
+
+
+def test_state_refresh_leaves_a_live_detached_supervisor_as_the_single_event_owner(
+    tmp_path: Path, provider_factory, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    store, root, row = start_slow_run(tmp_path, provider_factory, monkeypatch)
+    stored = store.get_run(row["runId"])
+    stored["supervisorPid"] = os.getpid()
+    stored["supervisorIdentity"] = process_identity(os.getpid())
+    store.save_run(stored)
+
+    try:
+        reconciled = reconcile_project_runs(
+            store,
+            "project-one",
+            helpers_factory=WorkflowHelpers,
+            provider_factory=provider_factory,
+        )
+        current = store.get_run(row["runId"])
+
+        assert reconciled == 0
+        assert current["state"] == "running"
+        assert current["lastOffset"] == 0
+        assert not any(line.startswith("renew ") for line in claim_log(root))
+    finally:
+        stop_tree(row["pid"])
 
 
 def test_a_reused_pid_is_never_adopted_as_the_running_job(tmp_path: Path, provider_factory, monkeypatch) -> None:  # type: ignore[no-untyped-def]

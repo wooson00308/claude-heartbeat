@@ -3,13 +3,10 @@
 The runtime never chooses a workflow target by itself.  It asks the project's
 app-managed reservation helper for one target at a time, and starts a provider
 only after that helper reported a lease of its own.  Everything a started run
-needs to be found again lives in SQLite and in the run's event file, never in
-this process's memory: a control CLI starts a run and exits, and a later tick
-in the daemon picks the same run up from its persisted handle.
-
-That is also why no code here calls ``wait``.  A provider object is built for
-one tick and dropped, so its live-run registry never outlives the call, and a
-run is concluded from what its process and event file show.
+needs to be found again lives in SQLite and in the run's event file.  A short
+control CLI queues the run, then a detached worker owns the provider supervisor
+until the terminal event and lease cleanup are persisted.  A daemon tick or a
+state read only recovers legacy runs and workers that actually disappeared.
 """
 
 from __future__ import annotations
@@ -19,6 +16,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -48,6 +47,7 @@ from heartbeat.providers.process import (
     ProviderRunHandle,
     default_event_root,
     observe_process,
+    process_identity,
 )
 
 RESERVATION_HELPER = ".workflow/rules/wf-reserve.sh"
@@ -61,7 +61,9 @@ LEASE_DIRECTORY = ".workflow/.runtime/leases"
 # the runtime only needs a window long enough to hand the work across.
 RESERVATION_MINUTES = 30
 PLAN_TTL_SECONDS = 120
-ACTIVE_STATES = frozenset({"reserved", "running"})
+ACTIVE_STATES = frozenset({"reserved", "queued", "running", "paused"})
+WORKER_POLL_SECONDS = 2.0
+WORKER_START_TIMEOUT_SECONDS = 10.0
 TARGET_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 TERMINAL_BY_EVENT = {
     "completed": "succeeded",
@@ -382,9 +384,49 @@ def start_one_run(
     manual_targets: Sequence[str] = (),
     previous_run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Reserve one target and start one provider, or record why neither happened."""
+    """Start inside a persistent daemon or test process that owns supervision."""
     policy = configuration.roles[role]
     row = _new_run_row(configuration, role, policy.provider, previous_run_id)
+    row["manualTargets"] = list(manual_targets)
+    return _start_run_row(
+        store,
+        configuration,
+        row,
+        helpers=helpers,
+        provider_factory=provider_factory,
+    )
+
+
+def queue_one_run(
+    store: AgentStore,
+    configuration: AgentConfiguration,
+    role: str,
+    *,
+    manual_targets: Sequence[str] = (),
+    previous_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist work before a detached supervisor is launched for it."""
+    policy = configuration.roles[role]
+    row = _new_run_row(configuration, role, policy.provider, previous_run_id)
+    row.update({"state": "queued", "manualTargets": list(manual_targets)})
+    store.save_run(row)
+    return row
+
+
+def _start_run_row(
+    store: AgentStore,
+    configuration: AgentConfiguration,
+    row: dict[str, Any],
+    *,
+    helpers: WorkflowHelpers,
+    provider_factory: Callable[[str], AgentProvider] = build_provider,
+) -> dict[str, Any]:
+    """Reserve and start the already identified run without changing its id."""
+    role = row["role"]
+    policy = configuration.roles[role]
+    manual_targets = tuple(row.get("manualTargets", ()))
+    row["state"] = "reserved"
+    store.save_run(row)
     reservation = helpers.reserve(role, f"heartbeat-runtime-{role}")
     if isinstance(reservation, DispatchFailure):
         return _fail(store, row, stage=reservation.stage, reason=reservation.reason)
@@ -438,6 +480,113 @@ def start_one_run(
     })
     store.save_run(row)
     return row
+
+
+def _worker_command(run_id: str) -> list[str]:
+    """Start the same runtime in its private worker mode in source and bundles."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "agent-worker", run_id]
+    return [sys.executable, str(Path(__file__).with_name("cli.py")), "agent-worker", run_id]
+
+
+def launch_run_worker(store: AgentStore, run_id: str) -> bool:
+    """Launch a worker detached from the short JSON control command."""
+    environment = dict(os.environ)
+    environment["HEARTBEAT_AGENT_DATABASE"] = str(store.database_path)
+    options: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": environment,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    else:
+        options["start_new_session"] = True
+    try:
+        worker = subprocess.Popen(_worker_command(run_id), **options)
+    except OSError:
+        return False
+    store.attach_supervisor(run_id, worker.pid, process_identity(worker.pid))
+    return True
+
+
+def queue_and_launch_run(
+    store: AgentStore,
+    configuration: AgentConfiguration,
+    role: str,
+    *,
+    manual_targets: Sequence[str] = (),
+    previous_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Queue one run and report whether its detached supervisor was created."""
+    row = queue_one_run(
+        store,
+        configuration,
+        role,
+        manual_targets=manual_targets,
+        previous_run_id=previous_run_id,
+    )
+    if launch_run_worker(store, row["runId"]):
+        deadline = time.monotonic() + WORKER_START_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            current = store.get_run(row["runId"]) or row
+            if current["state"] not in {"queued", "reserved"} or current.get("targetId"):
+                return current
+            worker_pid = current.get("supervisorPid")
+            if isinstance(worker_pid, int) and observe_process(worker_pid).liveness == "gone":
+                reconcile_project_runs(store, configuration.project_id)
+                return store.get_run(row["runId"]) or current
+            time.sleep(0.02)
+        reconcile_project_runs(store, configuration.project_id)
+        return store.get_run(row["runId"]) or row
+    return _fail(store, row, stage="provider_start", reason="worker_not_started")
+
+
+def serve_queued_run(
+    store: AgentStore,
+    run_id: str,
+    *,
+    helpers_factory: Callable[[Path], WorkflowHelpers] = WorkflowHelpers,
+    provider_factory: Callable[[str], AgentProvider] = build_provider,
+    poll_seconds: float = WORKER_POLL_SECONDS,
+) -> int:
+    """Own one queued provider until its terminal state and lease are durable."""
+    row = store.get_run(run_id)
+    if row is None or row.get("state") != "queued":
+        return 1
+    store.attach_supervisor(run_id, os.getpid(), process_identity(os.getpid()))
+    row = store.get_run(run_id)
+    if row is None:
+        return 1
+    configuration = configuration_of(store, row["projectId"])
+    if configuration is None or row["role"] not in configuration.roles:
+        _fail(store, row, stage="request_validation", reason="project_not_configured")
+        return 1
+    helpers = helpers_factory(Path(configuration.working_directory))
+    started = _start_run_row(
+        store,
+        configuration,
+        row,
+        helpers=helpers,
+        provider_factory=provider_factory,
+    )
+    if started["state"] != "running":
+        return 1
+
+    while True:
+        time.sleep(max(0.01, poll_seconds))
+        current = store.get_run(run_id)
+        if current is None or current["state"] not in ACTIVE_STATES:
+            return 0 if current is not None and current["state"] == "succeeded" else 1
+        reconcile_run(
+            store,
+            current,
+            helpers=helpers,
+            provider_factory=provider_factory,
+            supervisor_pid=os.getpid(),
+        )
 
 
 def handle_of(row: dict[str, Any]) -> ProviderRunHandle:
@@ -508,14 +657,68 @@ def _drain_events(store: AgentStore, provider: AgentProvider, row: dict[str, Any
     row["lastOffset"] = batch.next_offset
 
 
+def _live_supervisor_owned_elsewhere(row: dict[str, Any], supervisor_pid: int | None) -> bool:
+    pid = row.get("supervisorPid")
+    identity = row.get("supervisorIdentity")
+    if not isinstance(pid, int) or not identity:
+        return False
+    observation = observe_process(pid)
+    return (
+        observation.liveness == "running"
+        and observation.identity == identity
+        and supervisor_pid != pid
+    )
+
+
 def reconcile_run(
     store: AgentStore,
     row: dict[str, Any],
     *,
     helpers: WorkflowHelpers,
     provider_factory: Callable[[str], AgentProvider] = build_provider,
+    supervisor_pid: int | None = None,
 ) -> dict[str, Any]:
     """Bring one persisted run up to what its process and events now show."""
+    if _live_supervisor_owned_elsewhere(row, supervisor_pid):
+        return row
+
+    worker_pid = row.get("supervisorPid")
+    worker_identity = row.get("supervisorIdentity")
+    if isinstance(worker_pid, int) and worker_identity and worker_pid != supervisor_pid:
+        worker = observe_process(worker_pid)
+        if worker.liveness == "unknown" or (
+            worker.liveness == "running" and worker.identity != worker_identity
+        ):
+            row.update({
+                "state": "recovery_required",
+                "failureStage": "recovery",
+                "reason": "supervisor_identity_unverified",
+                "remaining": ["process_termination", "event_close", "lease_release"],
+            })
+            store.save_run(row)
+            store.record_error(
+                row["projectId"], row["runId"],
+                {"stage": "recovery", "reason": "supervisor_identity_unverified"},
+            )
+            return row
+        if worker.liveness == "gone" and row.get("pid"):
+            provider_process = observe_process(row["pid"])
+            if provider_process.liveness != "gone":
+                row.update({
+                    "state": "recovery_required",
+                    "failureStage": "recovery",
+                    "reason": "supervisor_gone",
+                    "remaining": ["process_termination", "event_close", "lease_release"],
+                })
+                store.save_run(row)
+                store.record_error(
+                    row["projectId"], row["runId"],
+                    {"stage": "recovery", "reason": "supervisor_gone"},
+                )
+                return row
+
+    if row["state"] == "queued":
+        return _fail(store, row, stage="provider_start", reason="worker_not_running")
     if row["state"] == "reserved" or not row.get("providerRunId"):
         released = _release_lease(helpers, row)
         row["remaining"] = [] if released else ["lease_release"]
@@ -560,6 +763,27 @@ def reconcile_run(
     })
     store.save_run(row)
     return row
+
+
+def reconcile_project_runs(
+    store: AgentStore,
+    project_id: str,
+    *,
+    helpers_factory: Callable[[Path], WorkflowHelpers] = WorkflowHelpers,
+    provider_factory: Callable[[str], AgentProvider] = build_provider,
+) -> int:
+    """Recover only runs without another live detached supervisor."""
+    configuration = configuration_of(store, project_id)
+    if configuration is None:
+        return 0
+    helpers = helpers_factory(Path(configuration.working_directory))
+    reconciled = 0
+    for row in store.list_runs(project_id, states=ACTIVE_STATES):
+        if _live_supervisor_owned_elsewhere(row, None):
+            continue
+        reconcile_run(store, row, helpers=helpers, provider_factory=provider_factory)
+        reconciled += 1
+    return reconciled
 
 
 def preview_cancel(row: dict[str, Any]) -> dict[str, Any]:
@@ -641,10 +865,12 @@ def tick_project(
     if configuration is None:
         return report
     helpers = helpers_factory(Path(configuration.working_directory))
-
-    for row in store.list_runs(project_id, states=ACTIVE_STATES):
-        reconcile_run(store, row, helpers=helpers, provider_factory=provider_factory)
-        report.reconciled += 1
+    report.reconciled = reconcile_project_runs(
+        store,
+        project_id,
+        helpers_factory=helpers_factory,
+        provider_factory=provider_factory,
+    )
 
     if configuration.paused:
         return report

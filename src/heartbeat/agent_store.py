@@ -29,8 +29,12 @@ def default_agent_database_path() -> Path:
     """Resolve the runtime-owned database path when a process starts.
 
     Tests and packaged runtime launchers can isolate the state by setting
-    ``HEARTBEAT_AGENT_HOME`` without changing legacy Heartbeat paths.
+    ``HEARTBEAT_AGENT_HOME``. Detached workers receive the exact runtime-owned
+    database through ``HEARTBEAT_AGENT_DATABASE`` so they cannot drift homes.
     """
+    database_override = os.environ.get("HEARTBEAT_AGENT_DATABASE")
+    if database_override:
+        return Path(database_override)
     override = os.environ.get("HEARTBEAT_AGENT_HOME")
     return Path(override) / "agent-runtime.sqlite3" if override else DEFAULT_AGENT_DB
 
@@ -288,6 +292,7 @@ class AgentStore:
 
     def save_plan(self, project_id: str, plan: dict) -> None:
         """Store one execution plan so a later start can prove it is the same one."""
+        self.prune_expired_plans(project_id)
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -299,6 +304,32 @@ class AgentStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+
+    def prune_expired_plans(self, project_id: str, *, now: str | None = None) -> int:
+        """Remove spent plan previews while preserving continuous-run intents."""
+        threshold = now or utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    "SELECT run_id, payload_json FROM agent_queue WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+                expired = []
+                for run_id, payload_json in rows:
+                    payload = json.loads(payload_json)
+                    expires_at = payload.get("expiresAt")
+                    if "planId" in payload and isinstance(expires_at, str) and expires_at <= threshold:
+                        expired.append(run_id)
+                connection.executemany(
+                    "DELETE FROM agent_queue WHERE run_id = ? AND project_id = ?",
+                    [(run_id, project_id) for run_id in expired],
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return len(expired)
 
     def take_plan(self, project_id: str, plan_id: str) -> dict | None:
         """Consume one stored plan. A plan is usable once, so this deletes it."""
@@ -365,6 +396,30 @@ class AgentStore:
             row = connection.execute("SELECT details_json FROM agent_runs WHERE run_id = ?", (run_id,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def attach_supervisor(self, run_id: str, pid: int, identity: str | None) -> bool:
+        """Attach the detached worker without overwriting a run it already advanced."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                stored = connection.execute(
+                    "SELECT state, details_json FROM agent_runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if stored is None or stored[0] != "queued":
+                    connection.execute("ROLLBACK")
+                    return False
+                run = json.loads(stored[1])
+                run["supervisorPid"] = pid
+                run["supervisorIdentity"] = identity
+                connection.execute(
+                    "UPDATE agent_runs SET details_json = ?, updated_at = ? WHERE run_id = ?",
+                    (_dump(run), utc_now(), run_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return True
+
     def list_runs(self, project_id: str | None = None, *, states: frozenset[str] | None = None) -> list[dict]:
         """List runs for one project, or for the whole device when none is given."""
         query = "SELECT details_json FROM agent_runs"
@@ -384,7 +439,7 @@ class AgentStore:
         prompts, events or tool output behind those runs, so they do not leave
         the store through this path.
         """
-        runs = self.list_runs(states=frozenset({"reserved", "running"}))
+        runs = self.list_runs(states=ACTIVE_RUN_STATES)
         return {"activeRuns": len(runs), "projects": sorted({run["projectId"] for run in runs})}
 
     def append_events(self, project_id: str, run_id: str, events: list[dict]) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 
 import pytest
 
@@ -137,6 +138,18 @@ class _ExecutionProject:
         script.write_text(FIXTURE_CLI, encoding="utf-8")
         monkeypatch.setenv("HEARTBEAT_AGENT_HOME", str(tmp_path / "runtime-home"))
         monkeypatch.setattr(agent_dispatch, "build_provider", lambda name: FixtureProvider(script))
+        def launch_in_test_process(store, run_id):
+            row = store.get_run(run_id)
+            configuration = agent_dispatch.configuration_of(store, row["projectId"])
+            agent_dispatch._start_run_row(
+                store,
+                configuration,
+                row,
+                helpers=agent_dispatch.WorkflowHelpers(self.root),
+                provider_factory=agent_dispatch.build_provider,
+            )
+            return True
+        monkeypatch.setattr(agent_dispatch, "launch_run_worker", launch_in_test_process)
         self.configuration = configure(self.store, self.root, "project-one")
 
     def call(self, command, **request):
@@ -192,6 +205,22 @@ def test_start_needs_the_same_plan_and_an_explicit_confirmation(execution_projec
     assert len(started[1]["data"]["started"]) == 1
     assert replayed[1]["error"]["code"] == "plan_not_found"
     assert execution_project.store.list_intents("project-one") == []
+
+
+def test_state_read_reconciles_a_finished_process_before_reporting_capacity(execution_project):
+    from tests.test_agent_recovery import wait_for_events
+
+    _, planned = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
+    execution_project.call("run.start", planId=planned["data"]["plan"]["planId"], confirmed=True)
+    row = execution_project.store.list_runs("project-one")[0]
+    wait_for_events(Path(row["eventPath"]), lines=3)
+
+    exit_code, response = execution_project.call("state.read")
+    current = execution_project.store.get_run(row["runId"])
+
+    assert exit_code == 0
+    assert response["data"]["runs"][0]["state"] == "succeeded"
+    assert current["state"] == "succeeded"
 
 
 def test_start_refuses_a_plan_whose_runtime_moved(execution_project):

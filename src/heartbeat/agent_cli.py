@@ -194,10 +194,13 @@ def _execution_command(
 
     if command == "run.retry":
         previous = _run_or_reject(store, request, request_id, project_id)
-        row = agent_dispatch.retry_run(
-            store, configuration, previous, helpers=helpers, provider_factory=agent_dispatch.build_provider
+        row = agent_dispatch.queue_and_launch_run(
+            store,
+            configuration,
+            previous["role"],
+            previous_run_id=previous["runId"],
         )
-        outcome = "success" if row["state"] == "running" else "failure"
+        outcome = "success" if row["state"] in {"queued", "reserved", "running"} else "failure"
         return outcome, {"run": row, "previousRunId": previous["runId"]}
 
     raise AgentContractError("unsupported_command", "agent command is not implemented", request_id=request_id)
@@ -229,15 +232,13 @@ def _start_from_plan(
     for role_plan in plan["roles"]:
         remaining_targets = list(role_plan["manualTargets"])
         for _ in range(role_plan["granted"]):
-            row = agent_dispatch.start_one_run(
+            row = agent_dispatch.queue_and_launch_run(
                 store,
                 configuration,
                 role_plan["role"],
-                helpers=helpers,
-                provider_factory=agent_dispatch.build_provider,
                 manual_targets=tuple(remaining_targets),
             )
-            if row["state"] == "running":
+            if row["state"] in {"queued", "reserved", "running"}:
                 started.append(row)
                 if remaining_targets and row["targetId"] in remaining_targets:
                     remaining_targets.remove(row["targetId"])
@@ -303,7 +304,10 @@ def run_agent_command(
             }), output_stream)
             return 0
         if command == "state.read":
-            state = runtime_store.get_state(_project_id(request, request_id))
+            project_id = _project_id(request, request_id)
+            runtime_store.prune_expired_plans(project_id)
+            agent_dispatch.reconcile_project_runs(runtime_store, project_id)
+            state = runtime_store.get_state(project_id)
             _write_json(envelope(command, request_id, outcome="success", data=state), output_stream)
             return 0
         if command in EXECUTION_COMMANDS or command in UPDATE_COMMANDS:
