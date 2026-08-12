@@ -91,8 +91,13 @@ def test_windows_service_definition_restarts_after_crashes_and_rejects_duplicate
 
     assert "<RestartOnFailure>" in definition
     assert "<Interval>PT1M</Interval><Count>255</Count>" in definition
+    assert "<RegistrationTrigger>" in definition
+    assert definition.count("<Repetition>") == 2
     assert "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" in definition
     assert "<LogonTrigger>" in definition
+    assert "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" in definition
+    assert "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" in definition
+    assert "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in definition
     assert r"C:\Runtime\bin\heartbeat.exe" in definition
     assert "<Arguments>agent-dispatcher</Arguments>" in definition
 

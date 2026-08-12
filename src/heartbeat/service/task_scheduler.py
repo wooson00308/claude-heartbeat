@@ -28,17 +28,31 @@ class TaskSchedulerAdapter(ServiceAdapter):
         """Build the Task Scheduler definition with crash recovery enabled.
 
         ``schtasks /sc onlogon`` alone only starts once at sign-in.  The XML
-        form exposes RestartOnFailure, which is the Task Scheduler equivalent
-        of launchd KeepAlive and systemd Restart=always.
+        form combines RestartOnFailure with one-minute registration/logon
+        repetitions.  Some Windows builds do not classify an externally
+        killed task as a failure, so the repetitions are the recovery safety
+        net; IgnoreNew prevents a second dispatcher while one is healthy.
         """
         command = escape(bin_path)
         return f'''<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Triggers>
+    <RegistrationTrigger>
+      <Enabled>true</Enabled>
+      <Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
+    </RegistrationTrigger>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
+    </LogonTrigger>
+  </Triggers>
   <Principals><Principal id="Author"><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <StartWhenAvailable>true</StartWhenAvailable>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <!-- Count is an unsigned byte in the Task Scheduler schema. -->
     <RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure>
   </Settings>
