@@ -42,7 +42,9 @@ jobs:
           from pathlib import Path
           import subprocess, sysconfig
 
-          library = Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY")
+          framework = sysconfig.get_config_var("PYTHONFRAMEWORK")
+          library = (Path(sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX")) /
+                     f"{framework}.framework/Versions/{sysconfig.get_config_var('VERSION')}/{framework}")
           architectures = subprocess.check_output(["lipo", "-archs", str(library)], text=True).split()
           if set(architectures) != {"arm64", "x86_64"}:
               raise SystemExit(f"Python is not universal2: {library} -> {architectures}")

@@ -96,6 +96,44 @@ def test_windows_service_definition_restarts_after_crashes_and_rejects_duplicate
     assert "<Arguments>agent-dispatcher</Arguments>" in definition
 
 
+def test_windows_service_install_starts_the_registered_dispatcher(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        TaskSchedulerAdapter,
+        "_heartbeat_bin",
+        lambda self: r"C:\Runtime\heartbeat.exe",
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: calls.append(command) or _completed(),
+    )
+
+    assert TaskSchedulerAdapter().install() == 0
+    assert calls[0][:2] == ["schtasks.exe", "/create"]
+    assert calls[1] == ["schtasks.exe", "/run", "/tn", "claude-heartbeat"]
+
+
+def test_windows_service_install_removes_a_task_that_cannot_start(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        TaskSchedulerAdapter,
+        "_heartbeat_bin",
+        lambda self: r"C:\Runtime\heartbeat.exe",
+    )
+
+    def answer(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["schtasks.exe", "/run"]:
+            raise subprocess.CalledProcessError(1, command, stderr="start failed")
+        return _completed()
+
+    monkeypatch.setattr(subprocess, "run", answer)
+
+    assert TaskSchedulerAdapter().install() == 1
+    assert calls[-1] == ["schtasks.exe", "/delete", "/tn", "claude-heartbeat", "/f"]
+
+
 def test_all_service_definitions_launch_the_agent_dispatcher(monkeypatch):
     monkeypatch.setattr(LaunchdAdapter, "_heartbeat_bin", lambda self: "/fake/heartbeat")
     monkeypatch.setattr(SystemdAdapter, "_heartbeat_bin", lambda self: "/fake/heartbeat")

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import io
 import re
 import sys
 import tomllib
@@ -23,6 +24,23 @@ VERSION_LINE = re.compile(r"^heartbeat \d+\.\d+\.\d+\S*$")
 
 
 # --- 버전 출력 ---
+
+def test_console_output_replaces_characters_missing_from_a_legacy_code_page(monkeypatch):
+    raw_out = io.BytesIO()
+    raw_err = io.BytesIO()
+    stdout = io.TextIOWrapper(raw_out, encoding="cp1252", errors="strict")
+    stderr = io.TextIOWrapper(raw_err, encoding="cp1252", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    cli._make_console_output_resilient()
+
+    stdout.write("✓ 등록 완료")
+    stderr.write("⚠ 복구 필요")
+    stdout.flush()
+    stderr.flush()
+    assert stdout.errors == "replace"
+    assert stderr.errors == "replace"
 
 def test_version_flag_prints_contract_line(monkeypatch, capsys):
     """`heartbeat --version`은 `heartbeat <X.Y.Z>` 한 줄 + 종료 코드 0."""

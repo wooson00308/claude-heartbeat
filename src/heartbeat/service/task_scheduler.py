@@ -147,14 +147,27 @@ class TaskSchedulerAdapter(ServiceAdapter):
 
         descriptor, xml_name = tempfile.mkstemp(prefix="claude-heartbeat-", suffix=".xml")
         xml_path = Path(xml_name)
+        registered = False
         try:
             with open(descriptor, "w", encoding="utf-16") as definition_file:
                 definition_file.write(definition)
             cmd = self._install_cmd(str(xml_path))
             subprocess.run(cmd, check=True, capture_output=True, text=True)
+            registered = True
+            subprocess.run(
+                ["schtasks.exe", "/run", "/tn", TASK_NAME],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             print(f"✓ Task Scheduler 등록 완료: {TASK_NAME}")
             return 0
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            if registered:
+                try:
+                    subprocess.run(self._uninstall_cmd(), capture_output=True, text=True)
+                except FileNotFoundError:
+                    pass
             stderr = getattr(exc, "stderr", "") or str(exc)
             print(f"⚠ schtasks 등록 실패: {stderr.strip()}")
             print(f"  수동 등록: schtasks.exe /create /tn {TASK_NAME} /xml <definition.xml> /f")

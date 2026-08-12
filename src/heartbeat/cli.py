@@ -25,6 +25,14 @@ HEARTBEAT_FILE = Path.home() / ".claude" / "HEARTBEAT.md"
 SKILLS_DIR = Path.home() / ".claude" / "skills"
 
 
+def _make_console_output_resilient() -> None:
+    """Do not let a legacy Windows code page terminate a service command."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
+
+
 def _get_package_skills_dir() -> Path:
     """Get the skills/ directory.
 
@@ -329,6 +337,7 @@ def runtime_status(install_root: "Path | None" = None) -> dict:
 
 
 def main() -> None:
+    _make_console_output_resilient()
     import argparse
     import os
     import signal

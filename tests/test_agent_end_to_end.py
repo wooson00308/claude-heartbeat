@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -260,19 +259,19 @@ def test_platform_service_registration_restart_and_cleanup() -> None:
             [str(binary), *arguments], env=environment, text=True, capture_output=True, timeout=30, check=False,
         )
 
+    store = AgentStore()
+
     def wait_for_pid(*, different_from: int | None = None, timeout: float = 90) -> int:
         deadline = time.monotonic() + timeout
-        last = ""
+        last: dict | None = None
         while time.monotonic() < deadline:
-            status = invoke("status")
-            last = f"{status.stdout}\n{status.stderr}"
-            match = re.search(r"PID\s+(\d+)", last)
-            if match:
-                pid = int(match.group(1))
+            last = store.get_dispatcher()
+            if last is not None:
+                pid = int(last["pid"])
                 if pid != different_from and psutil.pid_exists(pid):
                     return pid
             time.sleep(1)
-        raise AssertionError(f"서비스 PID를 확인하지 못했습니다: {last.strip()}")
+        raise AssertionError(f"dispatcher PID를 확인하지 못했습니다: {last}")
 
     try:
         installed = invoke("install-service")
