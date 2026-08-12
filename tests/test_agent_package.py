@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -75,6 +76,17 @@ def test_package_spec_excludes_provider_sdks_and_manifest_is_not_self_hashed():
     assert '"claude_agent_sdk"' in spec and '"codex"' in spec
     assert "pyinstaller" in manifest.lower()
     assert MANIFEST_NAME == "runtime-manifest.json"
+
+
+def test_linux_standalone_runtime_uses_the_app_compatibility_floor():
+    repository = Path(__file__).resolve().parents[1]
+
+    for relative_path in (".github/workflows/ci.yml", ".github/workflows/release.yml"):
+        workflow = (repository / relative_path).read_text(encoding="utf-8")
+        assert re.search(
+            r"- os: ubuntu-22\.04\s+target: linux-x86_64",
+            workflow,
+        ), f"{relative_path} must build the Linux runtime on Ubuntu 22.04"
 
 
 # --- 기기 상태 조회: 설치 버전·실행 중 버전·서비스 상태를 한 응답으로 ---
