@@ -39,7 +39,8 @@ class TaskSchedulerAdapter(ServiceAdapter):
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <StartWhenAvailable>true</StartWhenAvailable>
-    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+    <!-- Count is an unsigned byte in the Task Scheduler schema. -->
+    <RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure>
   </Settings>
   <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>agent-dispatcher</Arguments></Exec></Actions>
 </Task>

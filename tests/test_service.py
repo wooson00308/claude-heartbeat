@@ -90,6 +90,7 @@ def test_windows_service_definition_restarts_after_crashes_and_rejects_duplicate
     definition = TaskSchedulerAdapter()._task_xml(r"C:\Runtime\bin\heartbeat.exe")
 
     assert "<RestartOnFailure>" in definition
+    assert "<Interval>PT1M</Interval><Count>255</Count>" in definition
     assert "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" in definition
     assert "<LogonTrigger>" in definition
     assert r"C:\Runtime\bin\heartbeat.exe" in definition
