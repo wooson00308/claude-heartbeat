@@ -12,6 +12,7 @@ from io import StringIO
 import pytest
 
 from heartbeat import service
+from heartbeat.service import launchd
 from heartbeat.service import (
     LaunchdAdapter,
     ServiceAdapter,
@@ -119,6 +120,12 @@ def test_launchd_reads_both_boolean_and_word_disabled_formats(monkeypatch):
         "com.old-heartbeat",
         "com.bool-heartbeat",
     }
+
+
+def test_launchd_user_domain_is_available_during_cross_platform_contract_tests(monkeypatch):
+    monkeypatch.delattr(launchd.os, "getuid", raising=False)
+
+    assert launchd._user_domain() == "gui/0"
 
 
 # --- HIGH: systemctl 부재 (컨테이너/WSL1) ---

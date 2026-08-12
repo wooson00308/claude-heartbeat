@@ -12,6 +12,13 @@ from .base import RestartResult, ServiceAdapter, ServiceStatus
 PLIST_LABEL = "com.claude-heartbeat"
 
 
+def _user_domain() -> str:
+    """Return the launchd user domain, including in cross-platform contract tests."""
+    getuid = getattr(os, "getuid", None)
+    uid = getuid() if getuid is not None else 0
+    return f"gui/{uid}"
+
+
 def _has_pid(listed: str) -> bool:
     """`launchctl list <label>` 출력에 살아 있는 PID가 있는지.
 
@@ -102,7 +109,7 @@ class LaunchdAdapter(ServiceAdapter):
     def _disabled_labels(self) -> set[str]:
         try:
             result = subprocess.run(
-                ["launchctl", "print-disabled", f"gui/{os.getuid()}"],
+                ["launchctl", "print-disabled", _user_domain()],
                 capture_output=True,
                 text=True,
             )
@@ -173,7 +180,7 @@ class LaunchdAdapter(ServiceAdapter):
             return RestartResult("skipped", "not-loaded", label)
 
         kick = subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+            ["launchctl", "kickstart", "-k", f"{_user_domain()}/{label}"],
             capture_output=True, text=True,
         )
         if kick.returncode == 0:
@@ -284,7 +291,7 @@ class LaunchdAdapter(ServiceAdapter):
             return 1
         previous = foreign[0]
         label = self._label_of(previous)
-        domain = f"gui/{os.getuid()}"
+        domain = _user_domain()
         was_disabled = label in disabled_labels
         try:
             previous_state = subprocess.run(
