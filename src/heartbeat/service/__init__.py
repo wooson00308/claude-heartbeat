@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-from .base import RestartResult, ServiceAdapter
+from .base import RestartResult, ServiceAdapter, ServiceStatus
 from .launchd import LaunchdAdapter
 from .systemd import SystemdAdapter
 from .task_scheduler import TaskSchedulerAdapter
@@ -44,12 +44,50 @@ def uninstall_service(print_only: bool = False) -> int:
     return adapter.uninstall(print_only)
 
 
+def migrate_service(confirmed: bool = False) -> int:
+    """Replace one existing registration with the managed dispatcher, with rollback."""
+    if not confirmed:
+        print("서비스 전환에는 명시적 확인이 필요합니다.")
+        return 2
+    adapter = _get_adapter()
+    if adapter is None:
+        print(f"지원하지 않는 플랫폼: {sys.platform}")
+        return 1
+    from heartbeat.agent_dispatch import (
+        ensure_continuous_dispatcher,
+        stop_continuous_dispatcher_for_service,
+    )
+    from heartbeat.agent_store import AgentStore
+
+    store = AgentStore()
+    handoff = stop_continuous_dispatcher_for_service(store)
+    if handoff == "blocked":
+        print("기존 자동 배정 프로세스의 신원을 안전하게 확인하거나 종료하지 못했습니다.")
+        return 1
+    result = adapter.migrate()
+    if result != 0 and handoff == "stopped":
+        ensure_continuous_dispatcher(store)
+    return result
+
+
 def restart_service() -> RestartResult:
     """OS 감지하여 등록된 서비스를 재기동. `heartbeat update`의 service 단계."""
     adapter = _get_adapter()
     if adapter is None:
         return RestartResult("failed", "unsupported-platform")
     return adapter.restart()
+
+
+def inspect_service() -> ServiceStatus:
+    """등록·실행 상태를 구조화해 반환한다. 아무것도 쓰지 않는다.
+
+    어댑터가 없는 플랫폼도 같은 모양으로 답한다. 앱이 플랫폼마다 다른 응답을
+    구분할 필요가 없어야 한다.
+    """
+    adapter = _get_adapter()
+    if adapter is None:
+        return ServiceStatus(sys.platform, "unsupported_platform", evidence=("platform_dispatch",))
+    return adapter.inspect()
 
 
 def detect_service() -> str | None:
@@ -63,10 +101,13 @@ __all__ = [
     "LaunchdAdapter",
     "RestartResult",
     "ServiceAdapter",
+    "ServiceStatus",
     "SystemdAdapter",
     "TaskSchedulerAdapter",
     "detect_service",
+    "inspect_service",
     "install_service",
+    "migrate_service",
     "restart_service",
     "uninstall_service",
 ]

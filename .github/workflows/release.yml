@@ -1,0 +1,95 @@
+name: Release standalone runtime
+
+on:
+  push:
+    tags: ["runtime-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-runtime:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: macos-universal
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: windows-latest
+            target: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install standalone build dependencies
+        if: runner.os != 'macOS'
+        run: pip install -e ".[build,dev]"
+      - name: Install macOS universal build dependencies
+        if: runner.os == 'macOS'
+        env:
+          ARCHFLAGS: -arch arm64 -arch x86_64
+        run: |
+          python -m pip install --no-binary=psutil,watchdog -e ".[build,dev]"
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess, sysconfig
+
+          framework = sysconfig.get_config_var("PYTHONFRAMEWORK")
+          library = (Path(sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX")) /
+                     f"{framework}.framework/Versions/{sysconfig.get_config_var('VERSION')}/{framework}")
+          architectures = subprocess.check_output(["lipo", "-archs", str(library)], text=True).split()
+          if set(architectures) != {"arm64", "x86_64"}:
+              raise SystemExit(f"Python is not universal2: {library} -> {architectures}")
+          PY
+      - name: Verify the provider-free runtime contract
+        run: pytest tests/test_agent_end_to_end.py -v
+      - name: Build and verify one-folder runtime
+        env:
+          RUNTIME_TARGET: ${{ matrix.target }}
+          HEARTBEAT_MACOS_TARGET_ARCH: universal2
+        run: |
+          pyinstaller packaging/heartbeat.spec --noconfirm --clean
+          python -c "from heartbeat.legacy_migration import write_runtime_manifest; from pathlib import Path; import os; print(write_runtime_manifest(Path('dist/heartbeat'), target=os.environ['RUNTIME_TARGET']))"
+          python -c "from pathlib import Path; import subprocess, sys; binary=Path('dist/heartbeat') / ('heartbeat.exe' if sys.platform == 'win32' else 'heartbeat'); subprocess.run([str(binary), 'runtime', 'verify-manifest', '--root', 'dist/heartbeat'], check=True); subprocess.run([str(binary), 'agent', 'contract'], check=True)"
+          python -c "from pathlib import Path; import os, zipfile; root=Path('dist/heartbeat'); target=os.environ['RUNTIME_TARGET']; archive=Path('dist') / f'heartbeat-{target}.zip'; z=zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED); [z.write(path, path.relative_to(root.parent)) for path in root.rglob('*') if path.is_file()]; z.close()"
+      - name: Verify macOS universal slices and both contract paths
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          test "$(lipo -archs dist/heartbeat/heartbeat)" = "x86_64 arm64" || \
+            test "$(lipo -archs dist/heartbeat/heartbeat)" = "arm64 x86_64"
+          psutil_binary="$(find dist/heartbeat -name '_psutil_osx*.so' -print -quit)"
+          test -n "$psutil_binary"
+          test "$(lipo -archs "$psutil_binary")" = "x86_64 arm64" || \
+            test "$(lipo -archs "$psutil_binary")" = "arm64 x86_64"
+          arch -arm64 dist/heartbeat/heartbeat agent contract >/dev/null
+          arch -x86_64 dist/heartbeat/heartbeat agent contract >/dev/null
+      - name: Register, restart, and remove the platform service
+        env:
+          HEARTBEAT_SERVICE_SMOKE_BINARY: ${{ github.workspace }}/dist/heartbeat/heartbeat${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: pytest tests/test_agent_end_to_end.py::test_platform_service_registration_restart_and_cleanup -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heartbeat-${{ matrix.target }}
+          path: dist/heartbeat-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build-runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Publish verified runtime archives
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/**

@@ -88,6 +88,21 @@ See [skills/heartbeat-register/README.md](skills/heartbeat-register/README.md) f
 - Python 3.11+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 
+The source and PyPI flow above still needs Python. Product integrations can
+instead install a signed standalone runtime for macOS universal, Linux x86_64,
+or Windows x86_64. Each release archive contains a one-folder `heartbeat`
+executable and `runtime-manifest.json`; verify the manifest before changing a
+stable launcher or OS service. The standalone runtime contains Heartbeat,
+`portalocker`, and `psutil`, but never bundles Claude Agent SDK or Codex SDK.
+
+```bash
+# CI/release maintainers: build and verify the exact directory that is archived
+pip install -e ".[build]"
+pyinstaller packaging/heartbeat.spec --noconfirm --clean
+python -m heartbeat.cli runtime write-manifest --root dist/heartbeat --target linux-x86_64
+dist/heartbeat/heartbeat runtime verify-manifest --root dist/heartbeat
+```
+
 ## Quick Start
 
 ```bash
@@ -187,6 +202,8 @@ heartbeat init                 # Create HEARTBEAT.md + jobs.d
 heartbeat migrate              # Split HEARTBEAT.md jobs into jobs.d files (--dry-run supported)
 heartbeat install-service      # Register with launchd (macOS) / Task Scheduler (Windows) / systemd (Linux)
 heartbeat uninstall-service    # Remove the OS scheduler entry
+heartbeat runtime inspect       # JSON identity for a standalone runtime
+heartbeat runtime migration-preview  # Read old jobs and history without writing
 ```
 
 ## Migration from v0.1

@@ -1,5 +1,6 @@
 """Heartbeat CLI — install skills, manage daemon, run jobs."""
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -18,10 +19,18 @@ from heartbeat.core import (
     run_job,
     LOG_DIR,
 )
-from heartbeat.service import install_service, uninstall_service
+from heartbeat.service import install_service, migrate_service, uninstall_service
 
 HEARTBEAT_FILE = Path.home() / ".claude" / "HEARTBEAT.md"
 SKILLS_DIR = Path.home() / ".claude" / "skills"
+
+
+def _make_console_output_resilient() -> None:
+    """Do not let a legacy Windows code page terminate a service command."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
 
 
 def _get_package_skills_dir() -> Path:
@@ -281,7 +290,54 @@ def cmd_skills(_args) -> None:
         print(f"  [{marker}] {name} — {desc}")
 
 
+def runtime_status(install_root: "Path | None" = None) -> dict:
+    """Report installed version, running version and service state as one value.
+
+    Everything here is read: the launcher, the version manifests and the OS
+    registration are only inspected, so an app can poll this without changing
+    what it is asking about.  A fact that could not be read stays null instead
+    of being filled in with a plausible one.
+    """
+    from heartbeat.agent_contract import API_VERSION
+    from heartbeat.legacy_migration import installed_runtime, runtime_target, runtime_version_of
+    from heartbeat.service import inspect_service
+    from heartbeat.service.base import checked_at
+
+    installed = installed_runtime(install_root)
+    service_status = inspect_service()
+    running_version = (
+        runtime_version_of(Path(service_status.executable))
+        if service_status.running and service_status.executable
+        else None
+    )
+    target = runtime_target()
+    if target.startswith("unsupported-") or service_status.result == "unsupported_platform":
+        result = "unsupported_platform"
+    elif installed["result"] == "unsupported_version":
+        result = "unsupported_version"
+    else:
+        result = "ok"
+    return {
+        "schemaVersion": 1,
+        "result": result,
+        "checkedAt": checked_at(),
+        "runtimeVersion": __version__,
+        "installedVersion": installed["installedVersion"],
+        "runningVersion": running_version,
+        "apiMajor": int(API_VERSION),
+        "target": target,
+        "executable": str(Path(sys.argv[0]).resolve()),
+        "installRoot": installed["installRoot"],
+        "launcher": installed["launcher"],
+        "installResult": installed["result"],
+        "recoverable": service_status.recoverable,
+        "service": service_status.to_dict(),
+        "evidence": [*installed["evidence"], *service_status.evidence],
+    }
+
+
 def main() -> None:
+    _make_console_output_resilient()
     import argparse
     import os
     import signal
@@ -307,6 +363,12 @@ def main() -> None:
         action="store_true",
         help="(deprecated since v0.4.0) start는 항상 foreground 동작. 인자만 유지.",
     )
+
+    # Internal detached supervisor. The app never calls this command directly;
+    # run.start launches it with a runtime-owned run id and database path.
+    p_agent_worker = sub.add_parser("agent-worker", help=argparse.SUPPRESS)
+    p_agent_worker.add_argument("run_id")
+    sub.add_parser("agent-dispatcher", help=argparse.SUPPRESS)
 
     # stop
     sub.add_parser("stop", help="Stop heartbeat daemon")
@@ -337,6 +399,38 @@ def main() -> None:
         help="Update this editable install (git pull --ff-only) and restart the daemon",
     )
 
+    # agent (버전화된 앱-런타임 JSON 계약)
+    p_agent = sub.add_parser("agent", help="Manage the project agent runtime through JSON")
+    agent_sub = p_agent.add_subparsers(dest="agent_command")
+    agent_sub.add_parser("contract", help="Print the supported agent contract as JSON")
+    p_agent_config = agent_sub.add_parser("config", help="Validate, write, or read agent configuration")
+    p_agent_config.add_argument("operation", choices=["validate", "write", "read"])
+    agent_sub.add_parser("state", help="Read project-scoped agent state")
+    agent_sub.add_parser("plan", help="Read an execution plan without starting anything")
+    agent_sub.add_parser("logs", help="Read redacted run events from a cursor")
+    p_agent_run = agent_sub.add_parser("run", help="Start, cancel, or retry runs")
+    p_agent_run.add_argument("operation", choices=["start", "cancel", "retry"])
+    p_agent_project = agent_sub.add_parser("project", help="Pause or resume new assignment for one project")
+    p_agent_project.add_argument("operation", choices=["pause", "resume"])
+    p_agent_provider = agent_sub.add_parser("provider", help="Report provider readiness")
+    p_agent_provider.add_argument("operation", choices=["diagnose"])
+
+    # runtime (독립 실행형 배포물의 manifest·stable launcher·읽기 전용 마이그레이션)
+    p_runtime = sub.add_parser("runtime", help="Inspect or verify a standalone Heartbeat runtime")
+    runtime_sub = p_runtime.add_subparsers(dest="runtime_command")
+    p_inspect = runtime_sub.add_parser("inspect", help="Print runtime and service status as JSON")
+    p_inspect.add_argument("--install-root", help="installed runtime root; defaults to the active stable launcher")
+    p_manifest = runtime_sub.add_parser("write-manifest", help="Write hashes for an unpacked one-folder runtime")
+    p_manifest.add_argument("--root", required=True, help="unpacked runtime directory")
+    p_manifest.add_argument("--target", help="published target name")
+    p_verify_manifest = runtime_sub.add_parser("verify-manifest", help="Verify an unpacked runtime before activation")
+    p_verify_manifest.add_argument("--root", required=True, help="unpacked runtime directory")
+    p_activate = runtime_sub.add_parser("activate", help="Atomically switch the stable runtime launcher")
+    p_activate.add_argument("--install-root", required=True)
+    p_activate.add_argument("--version-dir", required=True)
+    p_preview = runtime_sub.add_parser("migration-preview", help="Read legacy jobs and history without writing")
+    p_preview.add_argument("--home", help="home directory to inspect; defaults to the current user")
+
     # install
     p_install = sub.add_parser("install", help="Install a skill")
     p_install.add_argument("skill", help="Skill name to install")
@@ -359,6 +453,11 @@ def main() -> None:
         "--print-only", action="store_true",
         help="실제 해제 없이 해제 명령만 출력",
     )
+    p_migrate_service = sub.add_parser(
+        "migrate-service",
+        help="Safely replace an existing heartbeat service with the managed dispatcher",
+    )
+    p_migrate_service.add_argument("--confirmed", action="store_true")
 
     args = parser.parse_args()
 
@@ -474,5 +573,88 @@ def main() -> None:
     elif args.command == "uninstall-service":
         sys.exit(uninstall_service(print_only=args.print_only))
 
+    elif args.command == "migrate-service":
+        sys.exit(migrate_service(confirmed=args.confirmed))
+
+    elif args.command == "agent-worker":
+        from heartbeat.agent_dispatch import serve_queued_run
+        from heartbeat.agent_store import AgentStore
+
+        sys.exit(serve_queued_run(AgentStore(), args.run_id))
+
+    elif args.command == "agent-dispatcher":
+        from heartbeat.agent_dispatch import serve_continuous_intents
+        from heartbeat.agent_store import AgentStore
+
+        sys.exit(serve_continuous_intents(AgentStore()))
+
+    elif args.command == "agent":
+        from heartbeat.agent_cli import run_agent_command
+
+        command_map = {
+            "contract": "contract.read",
+            "state": "state.read",
+            "validate": "config.validate",
+            "write": "config.write",
+            "read": "config.read",
+            "plan": "plan.read",
+            "logs": "logs.read",
+            "run start": "run.start",
+            "run cancel": "run.cancel",
+            "run retry": "run.retry",
+            "project pause": "project.pause",
+            "project resume": "project.resume",
+            "provider diagnose": "provider.diagnose",
+        }
+        selected = getattr(args, "agent_command", None)
+        if selected == "config":
+            selected = args.operation
+        elif selected in {"run", "project", "provider"}:
+            selected = f"{selected} {args.operation}"
+        if selected not in command_map:
+            p_agent.print_help()
+            sys.exit(2)
+        sys.exit(run_agent_command(command_map[selected]))
+
+    elif args.command == "runtime":
+        from heartbeat.agent_contract import API_VERSION
+        from heartbeat.legacy_migration import (
+            RuntimeIntegrityError,
+            activate_stable_launcher,
+            preview_legacy_migration,
+            runtime_target,
+            verify_runtime_manifest,
+            write_runtime_manifest,
+        )
+
+        try:
+            if args.runtime_command == "inspect":
+                print(json.dumps(
+                    runtime_status(Path(args.install_root) if args.install_root else None),
+                    ensure_ascii=False, separators=(",", ":"),
+                ))
+            elif args.runtime_command == "write-manifest":
+                manifest = write_runtime_manifest(Path(args.root), target=args.target)
+                print(json.dumps({"outcome": "success", "manifest": str(manifest)}, ensure_ascii=False, separators=(",", ":")))
+            elif args.runtime_command == "verify-manifest":
+                manifest = verify_runtime_manifest(Path(args.root))
+                print(json.dumps({"outcome": "success", "manifest": manifest}, ensure_ascii=False, separators=(",", ":")))
+            elif args.runtime_command == "activate":
+                launcher = activate_stable_launcher(Path(args.install_root), Path(args.version_dir))
+                print(json.dumps({"outcome": "success", "launcher": str(launcher)}, ensure_ascii=False, separators=(",", ":")))
+            elif args.runtime_command == "migration-preview":
+                home = Path(args.home) if args.home else None
+                print(json.dumps(preview_legacy_migration(home), ensure_ascii=False, separators=(",", ":")))
+            else:
+                p_runtime.print_help()
+                sys.exit(2)
+        except RuntimeIntegrityError as error:
+            print(json.dumps({"outcome": "failure", "error": str(error)}, ensure_ascii=False, separators=(",", ":")))
+            sys.exit(2)
+
     else:
         parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
