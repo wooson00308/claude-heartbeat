@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -194,7 +195,7 @@ def test_codex_command_is_json_exec_and_keeps_prompt_off_command_line(tmp_path: 
 )
 def test_diagnostics_distinguish_login_permission_and_version(monkeypatch, probes, expected) -> None:  # type: ignore[no-untyped-def]
     provider = ClaudeProvider(executable="fake-claude")
-    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    monkeypatch.setattr(provider, "_executable_exists", lambda *_: True)
     iterator = iter(probes)
     monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(iterator))
 
@@ -209,9 +210,25 @@ def test_missing_executable_is_not_confused_with_other_diagnostics() -> None:
     assert result.status == "executable_missing"
 
 
+def test_diagnostics_search_well_known_install_dirs_beyond_the_service_path(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    home = tmp_path / "home"
+    tool_dir = home / ".local" / "bin"
+    tool_dir.mkdir(parents=True)
+    tool = tool_dir / ("agent-cli.exe" if os.name == "nt" else "agent-cli")
+    tool.write_text("#!/bin/sh\nexit 0\n")
+    tool.chmod(0o755)
+    monkeypatch.setattr(process_module.Path, "home", lambda: home)
+
+    provider = ClaudeProvider(executable="agent-cli")
+    environment = provider._environment({"PATH": str(tmp_path / "service-only")})
+
+    assert str(tool_dir) in environment["PATH"].split(os.pathsep)
+    assert provider._executable_exists(environment)
+
+
 def test_codex_diagnosis_exposes_only_visible_account_models_in_priority_order(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     provider = CodexProvider(executable="fake-codex")
-    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    monkeypatch.setattr(provider, "_executable_exists", lambda *_: True)
     models = json.dumps({"models": [
         {"slug": "hidden", "display_name": "Hidden", "visibility": "hide", "priority": 0},
         {"slug": "gpt-terra", "display_name": "Terra", "visibility": "list", "priority": 2},
@@ -237,7 +254,7 @@ def test_codex_model_catalog_failure_stays_unavailable_without_failing_provider(
     monkeypatch, output: str
 ) -> None:  # type: ignore[no-untyped-def]
     provider = CodexProvider(executable="fake-codex")
-    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    monkeypatch.setattr(provider, "_executable_exists", lambda *_: True)
     probes = iter([
         complete(["codex", "--version"]),
         complete(["codex", "login", "status"]),
@@ -255,7 +272,7 @@ def test_codex_model_catalog_command_failure_stays_unavailable_without_failing_p
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
     provider = CodexProvider(executable="fake-codex")
-    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    monkeypatch.setattr(provider, "_executable_exists", lambda *_: True)
     probes = iter([
         complete(["codex", "--version"]),
         complete(["codex", "login", "status"]),
@@ -271,7 +288,7 @@ def test_codex_model_catalog_command_failure_stays_unavailable_without_failing_p
 
 def test_claude_diagnosis_exposes_stable_aliases_as_unverified(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     provider = ClaudeProvider(executable="fake-claude")
-    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    monkeypatch.setattr(provider, "_executable_exists", lambda *_: True)
     probes = iter([complete(["claude", "--version"]), complete(["claude", "auth", "status"])])
     monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(probes))
 
@@ -298,7 +315,7 @@ def test_nested_provider_errors_keep_safe_actionable_model_detail() -> None:
 
 def test_claude_api_billing_route_requires_acknowledgement_before_start(monkeypatch, tmp_path: Path) -> None:
     provider = ClaudeProvider(executable="fake-claude")
-    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    monkeypatch.setattr(provider, "_executable_exists", lambda *_: True)
     probes = iter([complete(["claude", "--version"])])
     monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(probes))
     monkeypatch.setattr(process_module, "spawn_process", lambda *args, **kwargs: pytest.fail("must not start"))
@@ -444,7 +461,7 @@ def test_start_failures_separate_the_diagnostic_stage_from_the_spawn_stage(
     monkeypatch, fixture_script: Path, tmp_path: Path
 ) -> None:  # type: ignore[no-untyped-def]
     claude = ClaudeProvider(executable="fake-claude")
-    monkeypatch.setattr(claude, "_executable_exists", lambda: True)
+    monkeypatch.setattr(claude, "_executable_exists", lambda *_: True)
     probes = iter([complete(["claude", "--version"])])
     monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(probes))
 

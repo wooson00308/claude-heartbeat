@@ -480,6 +480,7 @@ class CliProvider:
         result = dict(os.environ)
         if environment is not None:
             result.update(environment)
+        result["PATH"] = augment_path(result.get("PATH"))
         return result
 
     def _diagnose(
@@ -488,7 +489,7 @@ class CliProvider:
         *,
         billing_route_acknowledged: bool,
     ) -> ProviderDiagnostic:
-        if not self._executable_exists():
+        if not self._executable_exists(environment):
             return ProviderDiagnostic(self.name, "executable_missing", self.executable)
 
         version_probe = run_probe([self.executable, "--version"], environment=environment)
@@ -522,11 +523,13 @@ class CliProvider:
             )
         return ProviderDiagnostic(self.name, "ready", self.executable, version=".".join(map(str, parsed_version)))
 
-    def _executable_exists(self) -> bool:
+    def _executable_exists(self, environment: Mapping[str, str]) -> bool:
         if os.path.sep in self.executable or (os.altsep and os.altsep in self.executable):
             path = Path(self.executable)
             return path.is_file()
-        return shutil.which(self.executable) is not None
+        # 자식에게 줄 PATH로 찾는다. 프로세스 자신의 PATH로 찾으면 여기서는 있다고 답한 도구를
+        # 프로브와 스폰이 못 찾는 어긋남이 생긴다.
+        return shutil.which(self.executable, path=environment.get("PATH")) is not None
 
     @staticmethod
     def _probe_failure_status(output: str) -> DiagnosticStatus:
@@ -853,6 +856,35 @@ def version_at_least(actual: tuple[int, ...], minimum: tuple[int, ...]) -> bool:
     return actual + (0,) * (width - len(actual)) >= minimum + (0,) * (width - len(minimum))
 
 
+# 로그인 셸이 아닌 자리(launchd·systemd 서비스, Finder가 띄운 앱)가 만든 프로세스는 셸의 PATH를
+# 물려받지 못해, 같은 기기에서 셸은 찾는 실행 도구를 여기서만 놓친다. 그 차이는 사용자가 고칠 일이
+# 아니므로, 표준 사용자 설치 위치를 PATH 뒤에 보강해 어디서 떠도 같은 도구가 보이게 한다.
+# 뒤에 붙이므로 사용자 PATH에 이미 있는 도구가 언제나 이긴다.
+def well_known_tool_dirs() -> tuple[str, ...]:
+    dirs = [str(Path.home() / ".local" / "bin")]
+    if os.name != "nt":
+        dirs += ["/opt/homebrew/bin", "/usr/local/bin"]
+    return tuple(dirs)
+
+
+def augment_path(value: str | None) -> str:
+    entries = [entry for entry in (value or "").split(os.pathsep) if entry]
+    for directory in well_known_tool_dirs():
+        if directory not in entries and os.path.isdir(directory):
+            entries.append(directory)
+    return os.pathsep.join(entries)
+
+
+def _resolve_command(command: Sequence[str], environment: Mapping[str, str]) -> list[str]:
+    # Windows는 자식 환경이 아니라 부모의 PATH로 실행 파일을 찾으므로, 보강된 PATH로만 보이는
+    # 이름은 여기서 절대 경로가 되어야 한다. POSIX에서는 답이 같고 조회만 한 번 앞당겨진다.
+    resolved = list(command)
+    found = shutil.which(resolved[0], path=environment.get("PATH")) if resolved else None
+    if found:
+        resolved[0] = found
+    return resolved
+
+
 def run_probe(
     command: Sequence[str],
     *,
@@ -862,7 +894,7 @@ def run_probe(
     """Run a short probe without a shell and classify launch failures safely."""
     try:
         return subprocess.run(
-            list(command),
+            _resolve_command(command, environment),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -932,7 +964,7 @@ def spawn_process(
         options["start_new_session"] = True
 
     try:
-        return subprocess.Popen(list(command), **options)  # type: ignore[arg-type]
+        return subprocess.Popen(_resolve_command(command, environment), **options)  # type: ignore[arg-type]
     except FileNotFoundError:
         return ProcessExecution(returncode=None, state="start_failed", detail="executable_missing")
     except PermissionError:

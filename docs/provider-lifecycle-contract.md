@@ -34,12 +34,14 @@ provider를 호출한다. 역할, 대상, lease 식별자 중 하나라도 다�
 | `LifecycleFailure` | `reservation` | `reservation_malformed` | 예약 응답을 읽을 수 없음 |
 | `LifecycleFailure` | `reservation` | `unsupported_reservation_contract` | 지원하지 않는 예약 계약 버전 |
 | `LifecycleFailure` | `reservation` | `reservation_mismatch` | 요청이 예약된 작업과 다름 |
-| `LifecycleFailure` | `provider_start` | `diagnostic` | 진단 실패. 실행 파일 없음, 로그인 필요, 과금 경로 미확인 등 |
+| `LifecycleFailure` | `provider_start` | `provider_<진단 상태>` | 진단 실패. 상태가 사유에 그대로 남는다 — `provider_executable_missing`, `provider_login_required`, `provider_unsupported_version`, `provider_billing_route_acknowledgement_required` 등 |
 | `LifecycleFailure` | `provider_start` | `spawn` | 실행 파일을 시작하지 못함 |
 | `LifecycleFailure` | `provider_start` | `prompt_delivery` | 프로세스는 생겼으나 prompt 전달 실패. 프로세스 트리는 정리한 뒤 반환한다 |
 | `ProviderRunHandle` | - | - | 시작 성공 |
 
-`diagnostic` 실패에는 `start_failure.diagnostic`이 실려 있어 원인 상태를 그대로 읽을 수 있다.
+진단 실패에는 `start_failure.diagnostic`이 실려 있어 원인 상태를 그대로 읽을 수 있다. 진단이
+상태를 싣지 못한 경우에만 사유가 단계 이름 `diagnostic`으로 남는다. 소비자 화면은 사유 코드를
+사람 문장으로 옮기고, 모르는 코드는 원문 대신 일반 안내로 보여 준다.
 
 ## 실행 핸들
 

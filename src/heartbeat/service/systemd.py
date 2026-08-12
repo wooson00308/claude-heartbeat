@@ -116,7 +116,7 @@ class SystemdAdapter(ServiceAdapter):
 
         home = str(Path.home())
         bin_dir = str(Path(bin_path).parent)
-        path_env = f"{bin_dir}:/usr/local/bin:/usr/bin:/bin"
+        path_env = f"{bin_dir}:{home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
         return UNIT_TEMPLATE.format(
             heartbeat_bin=bin_path,
