@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -426,9 +427,10 @@ def build_plan(
             if diagnostic.status != "ready":
                 granted = 0
                 plan.excluded.append(f"provider_{diagnostic.status}")
-            if model_status == "unavailable":
-                granted = 0
-                plan.excluded.append("model_unavailable")
+            # A stored model that vanished from the account catalog is not the user's
+            # mistake to fix — CLI updates rename models. The run proceeds on the CLI
+            # default instead (see start), so the plan keeps its grant and the
+            # diagnostic's modelStatus carries the fact for the screen.
         if granted < request.slots and not plan.excluded:
             plan.excluded.append(
                 "execution_limit" if policy.execution_limit is not None and granted == policy.execution_limit
@@ -699,7 +701,13 @@ def _start_run_row(
         provider = provider_factory(policy.provider)
         diagnostic = provider.diagnose()
         if _model_status(policy.model, diagnostic.model_catalog.status, diagnostic.model_catalog.models) == "unavailable":
-            return _fail(store, row, stage="request_validation", reason="model_unavailable")
+            # The stored model vanished from the account catalog — CLI updates rename
+            # models, and failing every run until the user rediscovers settings is the
+            # wrong owner for that event. Run on the CLI default and record what was
+            # substituted so the screen can say it.
+            row["requestedModel"] = policy.model
+            row["modelFallback"] = True
+            policy = dataclasses.replace(policy, model=None)
     row["state"] = "reserved"
     store.save_run(row)
     reservation = helpers.reserve(role, f"heartbeat-runtime-{role}")
