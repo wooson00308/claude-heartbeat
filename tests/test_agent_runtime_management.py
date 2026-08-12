@@ -45,7 +45,7 @@ def _version(version_dir: Path) -> Path:
 def device(tmp_path: Path):  # type: ignore[no-untyped-def]
     install_root = tmp_path / "install"
     current = _version(install_root / "versions" / "0.8.0")
-    candidate = _version(install_root / "versions" / "0.9.0")
+    candidate = _version(install_root / "versions" / "0.9.1")
     launcher = activate_stable_launcher(install_root, current)
     store = AgentStore(tmp_path / "agent.sqlite3")
     return {
@@ -103,7 +103,7 @@ def test_plan_reports_impact_without_changing_anything(device) -> None:  # type:
                        service_reader=_reader(_service(executable=str(device["launcher"]))))
 
     assert plan.result == "ready"
-    assert plan.target_version == "0.9.0"
+    assert plan.target_version == "0.9.1"
     assert plan.installed_version == "0.8.0"
     assert plan.launcher_switch_required is True
     assert plan.service_transition_required is True
@@ -196,8 +196,8 @@ def test_a_confirmed_plan_moves_the_launcher_and_reports_every_stage(device) -> 
     assert applied.result == "success"
     assert [stage.stage for stage in applied.stages] == list(UPDATE_STAGES)
     assert [stage.status for stage in applied.stages] == ["ok"] * len(UPDATE_STAGES)
-    assert applied.runnable_version == "0.9.0"
-    assert "0.9.0" in device["launcher"].read_text(encoding="utf-8")
+    assert applied.runnable_version == "0.9.1"
+    assert "0.9.1" in device["launcher"].read_text(encoding="utf-8")
 
 
 def test_a_failed_verification_leaves_the_launcher_and_service_alone(device) -> None:  # type: ignore[no-untyped-def]
@@ -250,9 +250,9 @@ def test_a_failed_service_stage_is_not_reported_as_a_whole_success(device) -> No
 
     assert applied.result == "partial_success"
     assert applied.stages[3].status == "failed"
-    assert applied.runnable_version == "0.9.0"
+    assert applied.runnable_version == "0.9.1"
     assert applied.recovery_actions == ("retry_service_transition",)
-    assert "0.9.0" in device["launcher"].read_text(encoding="utf-8")
+    assert "0.9.1" in device["launcher"].read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("platform", ["launchd", "systemd", "task_scheduler"])
@@ -353,7 +353,7 @@ def test_update_commands_travel_through_the_json_envelope(tmp_path: Path, device
 
     assert code == 0
     assert planned["outcome"] == "success"
-    assert planned["data"]["targetVersion"] == "0.9.0"
+    assert planned["data"]["targetVersion"] == "0.9.1"
     assert planned["data"]["stages"] == list(UPDATE_STAGES)
     assert unconfirmed["outcome"] == "failure"
     assert unconfirmed["data"]["result"] == "confirmation_required"
@@ -405,7 +405,7 @@ def test_the_plan_answers_every_fact_the_app_would_otherwise_parse(device) -> No
 
     assert set(described) == PLAN_FIELDS
     assert described["installedVersion"] == "0.8.0"
-    assert described["targetVersion"] == "0.9.0"
+    assert described["targetVersion"] == "0.9.1"
     assert described["activeRuns"] == 1 and described["projects"] == ["project-one"]
     assert described["service"]["label"] and described["service"]["executable"]
     assert json.loads(json.dumps(described)) == described
