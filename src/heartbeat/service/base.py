@@ -127,6 +127,10 @@ class ServiceAdapter:
         """해제. 0 = success."""
         raise NotImplementedError
 
+    def migrate(self) -> int:
+        """Replace an existing registration and restore it on verification failure."""
+        raise NotImplementedError
+
     def detect(self) -> str | None:
         """이 머신에 실제로 등록된 heartbeat 서비스 이름. 미등록이면 None.
 

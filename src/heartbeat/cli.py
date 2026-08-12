@@ -19,7 +19,7 @@ from heartbeat.core import (
     run_job,
     LOG_DIR,
 )
-from heartbeat.service import install_service, uninstall_service
+from heartbeat.service import install_service, migrate_service, uninstall_service
 
 HEARTBEAT_FILE = Path.home() / ".claude" / "HEARTBEAT.md"
 SKILLS_DIR = Path.home() / ".claude" / "skills"
@@ -444,6 +444,11 @@ def main() -> None:
         "--print-only", action="store_true",
         help="실제 해제 없이 해제 명령만 출력",
     )
+    p_migrate_service = sub.add_parser(
+        "migrate-service",
+        help="Safely replace an existing heartbeat service with the managed dispatcher",
+    )
+    p_migrate_service.add_argument("--confirmed", action="store_true")
 
     args = parser.parse_args()
 
@@ -558,6 +563,9 @@ def main() -> None:
 
     elif args.command == "uninstall-service":
         sys.exit(uninstall_service(print_only=args.print_only))
+
+    elif args.command == "migrate-service":
+        sys.exit(migrate_service(confirmed=args.confirmed))
 
     elif args.command == "agent-worker":
         from heartbeat.agent_dispatch import serve_queued_run

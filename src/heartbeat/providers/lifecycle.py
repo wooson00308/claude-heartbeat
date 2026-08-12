@@ -288,6 +288,13 @@ def recover_run(
 
 def last_event_kind(event_path: Path) -> str | None:
     """Return the kind of the last complete event, or None when there is none."""
+    event = last_event(event_path)
+    kind = event.get("kind") if event is not None else None
+    return kind if isinstance(kind, str) else None
+
+
+def last_event(event_path: Path) -> dict[str, object] | None:
+    """Return the final complete normalized event without retaining raw provider output."""
     try:
         with event_path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
@@ -305,8 +312,7 @@ def last_event_kind(event_path: Path) -> str | None:
         decoded = json.loads(lines[-1])
     except json.JSONDecodeError:
         return None
-    kind = decoded.get("kind") if isinstance(decoded, dict) else None
-    return kind if isinstance(kind, str) else None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def _matches(

@@ -55,11 +55,12 @@ heartbeat agent provider diagnose
     "workingDirectory": "/absolute/project/path",
     "projectMaxParallel": 3,
     "deviceMaxParallel": 16,
+    "automationEnabled": false,
     "paused": false,
     "eventRetentionDays": 30,
     "roles": {
       "planner": {"provider": "claude", "model": null, "executionMode": "once", "maxParallel": 1, "pollIntervalSeconds": 300, "executionLimit": null},
-      "architect": {"provider": "codex", "model": "gpt-5.6", "executionMode": "continuous", "maxParallel": 1, "pollIntervalSeconds": 300, "executionLimit": null},
+      "architect": {"provider": "codex", "model": "gpt-5.6-sol", "executionMode": "continuous", "maxParallel": 1, "pollIntervalSeconds": 300, "executionLimit": null},
       "developer": {"provider": "claude", "model": null, "executionMode": "once", "maxParallel": 1, "pollIntervalSeconds": 300, "executionLimit": null}
     }
   }
@@ -93,10 +94,12 @@ OS와 앱을 위해 남긴 메모리, 에이전트 프로세스 트리당 1.5 Gi
 때만 권장값이 실제 적용값이 된다. 프로젝트별 상한 합은 예약량이 아니며 프로젝트들이 현재 빈 기기 슬롯을
 공유한다.
 
-상태 응답은 해당 프로젝트의 설정, 큐, 실행, 오류만 반환한다. 아직 아무것도 시작하지 않은 프로젝트의
-큐·실행·오류 배열은 비어 있다. 큐에는 아직 쓰이지 않은 계획과 반복 실행이 이어갈 지시가 들어가고,
-실행에는 예약·시작·복구를 거친 행이 들어간다. 이 분리가 dispatcher의 저장 경계이므로 다른 프로젝트의
-상태는 섞이지 않는다.
+상태 응답은 해당 프로젝트의 설정, 큐, 실행, 오류와 `automation`을 반환한다. 아직 아무것도 시작하지
+않은 프로젝트의 큐·실행·오류 배열은 비어 있다. 큐에는 아직 쓰이지 않은 일회용 계획만 들어가고,
+반복 의도는 `automation.roles`로 분리된다. 역할별 watching/waiting/running/attention 상태와 다음·마지막
+확인 시각, watcher의 watching/degraded/stopped 상태, dispatcher 실행 여부를 이 객체에서 읽는다.
+실행에는 예약·시작·복구를 실제로 거친 행만 들어간다. 대상 없음과 수동 대상 경합은 실행 행이나 오류를
+만들지 않는다.
 
 실행 상태 이름은 reserved, queued, running, paused, succeeded, failed, cancelled,
 recovery_required다. 앱은 SQLite 행이 아니라 `state` 응답의 이 이름을 사용한다.
@@ -126,18 +129,17 @@ recovery_required다. 앱은 SQLite 행이 아니라 `state` 응답의 이 이�
 provider 시작, 이벤트 기록, lease 갱신과 종료 정리를 소유하므로 제어 명령이나 앱이 먼저 끝나도
 provider의 표준 출력 파이프와 감시 수명이 끊기지 않는다.
 
-`continuous` 역할을 확인해 시작하면 런타임은 역할당 반복 지시 하나를 저장하고 기기당 반복 dispatcher
-하나를 별도 프로세스로 띄운다. dispatcher는 앱과 짧은 제어 명령의 자식 수명에 묶이지 않으며, 빈 슬롯이
-생겨도 역할의 `pollIntervalSeconds`가 지난 뒤에만 자격을 다시 판단한다. `executionLimit`은 사용자가
-확인한 반복 시작 한 번에서 새로 시작할 수 있는 총 실행 수다. 최초 실행도 그 수에 포함하고, 한도에
-도달하거나 수동 대상 목록을 모두 처리하면 해당 반복 지시를 제거한다. 같은 역할을 다시 시작하면 이전
-지시를 중복 적재하지 않고 새 확인 내용으로 교체한다. 역할 설정을 `once`로 저장하면 남은 반복 지시를
-제거한다.
+`automationEnabled`를 켜고 역할을 `continuous`로 저장하면 런타임은 역할당 자동 배정 의도 하나를
+저장하고 기기당 dispatcher 하나를 별도 프로세스로 띄운다. 직접 배정은 이 의도를 만들거나 바꾸지 않는다.
+master를 끄면 새 자동 배정만 중단하고 역할 선택과 실행 중 세션은 유지한다. 역할을 `once`로 저장하면
+그 역할의 자동 배정 의도만 제거한다.
 
-반복 dispatcher는 모든 프로젝트를 한 프로세스에서 공정 순서로 훑는다. 각 실제 역할 실행은 다시 자기
-전용 감독 프로세스로 분리되므로 dispatcher가 종료돼도 이미 시작된 CLI와 lease 정리는 계속된다. 프로젝트
-일시 정지는 반복 지시를 지우지 않고 새 배정만 멈추며, 재개·상태 조회·Heartbeat 사용자 서비스의 다음
-tick은 저장된 반복 지시가 있는데 dispatcher가 사라졌을 때 하나만 다시 띄운다.
+dispatcher는 활성 프로젝트의 `.workflow`를 감시하고 파일 변경을 500ms debounce한 뒤 즉시 재판정한다.
+watcher가 없거나 실패하면 역할의 `pollIntervalSeconds`를 안전 확인 주기로 사용하고 상태를 `degraded`로
+낮춰 보고한다. 프로젝트 사이는 마지막 배정이 오래된 순서, 같은 프로젝트의 역할 사이는
+`lastAssignedAt`이 오래된 순서로 빈 자리를 나눈다. 역할 내부 후보 순서는 `wf-eligible --json`이 정한
+순서를 바꾸지 않으며 실제 실행 직전 `wf-reserve`가 다시 판정한다. 각 실행은 자기 감독 프로세스로
+분리되므로 dispatcher가 종료돼도 이미 시작된 CLI와 lease 정리는 계속된다.
 
 ### 예약 도구와 lease
 
@@ -167,17 +169,29 @@ lease 갱신과 반납은 `wf-claim.sh`를 직접 호출한다. 실행 중 갱�
 `logs.read`는 실행 식별자와 `cursor`만 받아 민감정보가 제거된 이벤트 묶음과 `nextCursor`를 반환한다.
 화면에서 받은 파일 경로는 쓰지 않는다.
 
-`provider.diagnose`는 그 프로젝트가 설정한 provider별 준비 상태를 반환한다.
+`provider.diagnose`는 그 프로젝트가 설정한 provider별 준비 상태와 `modelCatalog`를 반환한다. Codex는
+현재 로그인 계정이 목록에 공개한 모델만 `available`로 돌려준다. Claude는 CLI가 허용하는 공통 별칭을
+`unverified`로 돌려주며, 계정·게이트웨이별 정식 모델 이름은 실행 전까지 존재 여부를 단정하지 않는다.
+계획의 역할별 `diagnostic`은 `selectedModel`과 `modelStatus`를 함께 싣는다. Codex 카탈로그가 확인된
+상태에서 선택 모델이 목록에 없으면 `model_unavailable`로 제외하고 예약·쿼터·provider 시작을 수행하지 않는다.
 
 ### 복구
 
 실행 행은 실행 식별자, 프로젝트, 역할, provider, 예약 대상, `leaseId`, `resultPrefix`, 예약 만료
-시각, PID, 시작 시각, 프로세스 생성 신원, 감독 프로세스 신원, 이벤트 파일 경로, 마지막으로 읽은
+시각, PID, 시작 시각, 종료 시각, 프로세스 생성 신원, 감독 프로세스 신원, 이벤트 파일 경로, 마지막으로 읽은
 offset, 이전 실행 식별자를 담는다. 상태 조회와 데몬 tick은 같은 신원의 감독 프로세스가 살아 있으면
 그 실행의 이벤트나 lease를 대신 처리하지 않는다. 감독 프로세스가 사라진 예전 실행은 저장된 provider
 PID와 생성 신원을 대조해 회수한다. PID가 같아도 생성 신원이 다르거나 확인할 수 없으면 실행 중으로
 추측하지 않고 `recovery_required`로 남긴다. provider 프로세스가 이미 끝났으면 이벤트 파일의 마지막
 이벤트로 종료 상태를 정하고 lease를 반납한다.
+
+`finishedAt`은 성공·실패·취소·복구 필요 상태로 전환한 시각이며 활성 실행에서는 비어 있다. 이 필드가
+생기기 전의 종료 기록은 저장 행의 마지막 갱신 시각을 조회 응답에만 사용해 경과 시간을 고정하고, 과거
+행 자체를 추정 값으로 다시 쓰지 않는다.
+
+provider의 구조화 표준 출력만 실행 계약을 판정한다. 표준 오류의 일반 경고는 명시적인 완료 사건을
+실패로 뒤집지 않는다. 프로세스가 0이 아닌 코드로 끝났을 때는 민감정보를 제거한 표준 오류를 종료 사유로
+남기며, 내용이 없으면 종료 코드를 구조화된 사유로 남긴다.
 
 ## 저장소와 호환성
 
@@ -186,8 +200,9 @@ PID와 생성 신원을 대조해 회수한다. PID가 같아도 생성 신원�
 직접 열거나 마이그레이션하지 않는다. 기존 `jobs.d`, Heartbeat 잡, Dream 설정과 기존 `state.json`은
 새 에이전트 상태의 원천이 아니며 변경하지 않는다.
 
-기본 경로는 `~/.claude/heartbeat/agent-runtime.sqlite3`이다. 이 로컬 파일에는 프로젝트별 정책,
-일회용 시작 계획, 반복 지시, 실행 상태, 정규화된 진행 이벤트와 오류 단계, 현재 반복 dispatcher의
+기본 경로는 `~/.claude/heartbeat/agent-runtime.sqlite3`이다. schema v5는 프로젝트별 정책,
+일회용 시작 계획, `agent_automation`의 역할별 자동 배정 의도·확인 시각·공정성 기준, watcher 상태,
+실행 상태, 정규화된 진행 이벤트와 오류 단계, 현재 dispatcher의
 PID·프로세스 신원만 저장한다. 프로젝트 문서의 내용, 역할 prompt 원문, provider 인증 토큰, API 키와
 전체 환경 변수는 저장하지 않는다. SQLite가 필요한 이유는 앱이나 제어 명령이 종료된 뒤에도 반복 지시와
 실행 사실을 잃지 않고, 재시작 뒤 살아 있는 프로세스를 같은 PID의 다른 프로세스와 구분하며, 여러 시작
@@ -214,7 +229,7 @@ launcher를 실행해야 하며, `HEARTBEAT_RUNTIME_LAUNCHER`가 있으면 이�
 ```json
 {
   "schemaVersion": 1, "result": "ok", "checkedAt": "2026-08-08T08:41:23Z",
-  "runtimeVersion": "0.8.2", "installedVersion": "0.8.2", "runningVersion": "0.8.2",
+  "runtimeVersion": "0.9.0", "installedVersion": "0.9.0", "runningVersion": "0.9.0",
   "apiMajor": 1, "target": "macos-universal", "executable": "/…/heartbeat",
   "installRoot": "/…/install", "launcher": "/…/install/bin/heartbeat",
   "installResult": "installed", "recoverable": true,

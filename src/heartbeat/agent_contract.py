@@ -95,6 +95,7 @@ class AgentConfiguration:
     working_directory: str
     project_max_parallel: int
     device_max_parallel: int
+    automation_enabled: bool
     paused: bool
     event_retention_days: int
     roles: dict[str, RolePolicy]
@@ -105,6 +106,7 @@ class AgentConfiguration:
             "workingDirectory": self.working_directory,
             "projectMaxParallel": self.project_max_parallel,
             "deviceMaxParallel": self.device_max_parallel,
+            "automationEnabled": self.automation_enabled,
             "paused": self.paused,
             "eventRetentionDays": self.event_retention_days,
             "roles": {name: policy.to_dict() for name, policy in sorted(self.roles.items())},
@@ -126,6 +128,7 @@ def default_configuration(project_id: str, working_directory: str) -> AgentConfi
         working_directory=working_directory,
         project_max_parallel=DEFAULT_PROJECT_MAX_PARALLEL,
         device_max_parallel=DEFAULT_DEVICE_MAX_PARALLEL,
+        automation_enabled=False,
         paused=False,
         event_retention_days=DEFAULT_EVENT_RETENTION_DAYS,
         roles={role: policy for role in sorted(ROLES)},
@@ -170,7 +173,8 @@ def validate_configuration(value: Any, *, request_id: str | None = None) -> Agen
     """Validate and normalize a complete configuration without writing it."""
     config = _require_object(value, "configuration", request_id)
     allowed = {
-        "projectId", "workingDirectory", "projectMaxParallel", "deviceMaxParallel", "paused", "eventRetentionDays", "roles",
+        "projectId", "workingDirectory", "projectMaxParallel", "deviceMaxParallel", "automationEnabled",
+        "paused", "eventRetentionDays", "roles",
     }
     unknown = set(config) - allowed
     if unknown:
@@ -191,6 +195,11 @@ def validate_configuration(value: Any, *, request_id: str | None = None) -> Agen
         "deviceMaxParallel",
         request_id,
     )
+    automation_enabled = config.get("automationEnabled", False)
+    if not isinstance(automation_enabled, bool):
+        raise AgentContractError(
+            "invalid_request", "automationEnabled must be a boolean", request_id=request_id
+        )
     paused = config.get("paused", False)
     if not isinstance(paused, bool):
         raise AgentContractError("invalid_request", "paused must be a boolean", request_id=request_id)
@@ -246,6 +255,7 @@ def validate_configuration(value: Any, *, request_id: str | None = None) -> Agen
         working_directory=str(Path(working_directory)),
         project_max_parallel=project_max_parallel,
         device_max_parallel=device_max_parallel,
+        automation_enabled=automation_enabled,
         paused=paused,
         event_retention_days=event_retention_days,
         roles=roles,
@@ -294,5 +304,6 @@ def contract_description() -> dict[str, Any]:
             "deviceMaxParallel": DEFAULT_DEVICE_MAX_PARALLEL,
             "deviceMaxParallelIsRecommendationFallback": True,
             "eventRetentionDays": DEFAULT_EVENT_RETENTION_DAYS,
+            "automationEnabled": False,
         },
     }

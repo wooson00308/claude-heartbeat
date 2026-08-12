@@ -30,6 +30,8 @@ from heartbeat.providers.process import (
     ProviderEventBatch,
     ProviderExecutionRequest,
     ProviderExecutionResult,
+    ProviderModel,
+    ProviderModelCatalog,
     ProviderRunHandle,
     ProviderStartFailure,
 )
@@ -49,6 +51,8 @@ __all__ = [
     "ProviderEventBatch",
     "ProviderExecutionRequest",
     "ProviderExecutionResult",
+    "ProviderModel",
+    "ProviderModelCatalog",
     "ProviderName",
     "ProviderRunHandle",
     "ProviderStartFailure",

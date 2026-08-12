@@ -24,6 +24,7 @@ from heartbeat.agent_dispatch import (
     retry_run,
     serve_queued_run,
     start_one_run,
+    stop_continuous_dispatcher_for_service,
     tick_project,
 )
 from heartbeat.providers.process import process_identity
@@ -243,25 +244,28 @@ def test_the_real_repeat_dispatcher_outlives_the_control_call_and_starts_the_nex
     })
 
     assert ensure_continuous_dispatcher(store) is True
-    dispatcher = store.get_dispatcher()
-    assert dispatcher is not None and dispatcher["pid"] != os.getpid()
+    try:
+        dispatcher = store.get_dispatcher()
+        assert dispatcher is not None and dispatcher["pid"] != os.getpid()
 
-    deadline = time.monotonic() + 15
-    runs = store.list_runs("project-one")
-    while (
-        len(runs) < 2
-        or any(run["state"] in {"queued", "reserved", "running"} for run in runs)
-        or store.list_intents("project-one")
-    ) and time.monotonic() < deadline:
-        time.sleep(0.05)
+        deadline = time.monotonic() + 15
         runs = store.list_runs("project-one")
+        while (
+            len(runs) < 2
+            or any(run["state"] in {"queued", "reserved", "running"} for run in runs)
+            or store.list_intents("project-one")
+        ) and time.monotonic() < deadline:
+            time.sleep(0.05)
+            runs = store.list_runs("project-one")
 
-    assert len(runs) == 2
-    assert {run["state"] for run in runs} == {"succeeded"}
-    assert {run["targetId"] for run in runs} == {"TASK-A", "TASK-B"}
-    assert {run["intentId"] for run in runs} == {"intent-1"}
-    assert store.list_intents("project-one") == []
-    assert reserve_calls(root) == 2
+        assert len(runs) == 2
+        assert {run["state"] for run in runs} == {"succeeded"}
+        assert {run["targetId"] for run in runs} == {"TASK-A", "TASK-B"}
+        assert {run["intentId"] for run in runs} == {"intent-1"}
+        assert store.list_intents("project-one") == []
+        assert reserve_calls(root) == 2
+    finally:
+        assert stop_continuous_dispatcher_for_service(store) in {"stopped", "none"}
 
 
 def test_state_refresh_leaves_a_live_detached_supervisor_as_the_single_event_owner(

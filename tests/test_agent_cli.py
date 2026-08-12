@@ -219,12 +219,13 @@ def test_continuous_start_persists_one_role_instruction_and_starts_the_dispatche
         pollIntervalSeconds=30,
         executionLimit=3,
     )
-    _invoke("config.write", _request(configuration), execution_project.store)
+    configuration["automationEnabled"] = True
     started_dispatcher = []
     monkeypatch.setattr(
         "heartbeat.agent_dispatch.ensure_continuous_dispatcher",
         lambda store: started_dispatcher.append(store.database_path) or True,
     )
+    _invoke("config.write", _request(configuration), execution_project.store)
     _, planned = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
 
     exit_code, response = execution_project.call(
@@ -238,7 +239,7 @@ def test_continuous_start_persists_one_role_instruction_and_starts_the_dispatche
     assert response["outcome"] == "success"
     assert len(intents) == 1
     assert intents[0]["role"] == "developer"
-    assert intents[0]["startedCount"] == 1
+    assert intents[0]["startedCount"] == 0
     assert intents[0]["nextPollAt"].endswith("Z")
     assert started_dispatcher == [execution_project.store.database_path]
 
@@ -329,6 +330,9 @@ def test_provider_diagnose_reports_each_configured_provider(execution_project):
 
     assert exit_code == 0
     assert [item["status"] for item in response["data"]["providers"]] == ["ready"]
+    assert response["data"]["providers"][0]["modelCatalog"] == {
+        "status": "unavailable", "models": [],
+    }
 
 
 def test_cancel_previews_before_it_applies(execution_project):

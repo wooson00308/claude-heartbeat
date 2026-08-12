@@ -39,6 +39,7 @@ DiagnosticStatus = Literal[
     "billing_route_acknowledgement_required",
     "unavailable",
 ]
+ModelCatalogStatus = Literal["available", "unverified", "unavailable"]
 EventKind = Literal["started", "progress", "tool", "completed", "failed", "cancelled", "timed_out"]
 RunStatus = Literal["success", "failed", "usage_limited", "cancelled", "timed_out", "off_contract"]
 LineSource = Literal["stdout", "stderr"]
@@ -55,6 +56,28 @@ _BEARER_SECRET = re.compile(r"(?i)bearer\s+[^\s,;]+")
 
 
 @dataclass(frozen=True)
+class ProviderModel:
+    """One provider-owned model option safe to expose in a settings picker."""
+
+    id: str
+    label: str
+
+
+@dataclass(frozen=True)
+class ProviderModelCatalog:
+    """What the installed CLI can say about model selection without a paid run."""
+
+    status: ModelCatalogStatus
+    models: tuple[ProviderModel, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "models": [{"id": model.id, "label": model.label} for model in self.models],
+        }
+
+
+@dataclass(frozen=True)
 class ProviderDiagnostic:
     """A safe readiness result that never includes credential values."""
 
@@ -63,6 +86,7 @@ class ProviderDiagnostic:
     executable: str
     detail: str | None = None
     version: str | None = None
+    model_catalog: ProviderModelCatalog = ProviderModelCatalog("unavailable")
 
 
 @dataclass(frozen=True)
@@ -550,6 +574,7 @@ class _SupervisedRun:
         self._events: list[ProviderEvent] = []
         self._observed_status: RunStatus | None = None
         self._off_contract = False
+        self._stderr_detail: str | None = None
         self._execution: ProcessExecution | None = None
         self._result: ProviderExecutionResult | None = None
         self._finished = threading.Event()
@@ -598,6 +623,7 @@ class _SupervisedRun:
             on_line=self._consume,
         )
         self._execution = execution
+        terminal_detail = execution.detail
         if execution.state == "cancelled":
             status: RunStatus = "cancelled"
             terminal_kind: EventKind = "cancelled"
@@ -607,18 +633,25 @@ class _SupervisedRun:
         elif self._observed_status == "usage_limited":
             status = "usage_limited"
             terminal_kind = "failed"
-        elif self._observed_status == "failed" or execution.returncode != 0:
+            terminal_detail = self._last_failed_detail()
+        elif self._observed_status == "failed":
             status = "failed"
             terminal_kind = "failed"
+            terminal_detail = self._last_failed_detail()
+        elif execution.returncode != 0:
+            status = "failed"
+            terminal_kind = "failed"
+            terminal_detail = self._stderr_detail or f"provider exited with code {execution.returncode}"
         elif self._off_contract:
             status = "off_contract"
             terminal_kind = "failed"
+            terminal_detail = "provider output did not match the runtime contract"
         else:
             status = "success"
             terminal_kind = "completed"
 
         if not self._events or self._events[-1].kind != terminal_kind:
-            self._append(terminal_kind, detail=execution.detail)
+            self._append(terminal_kind, detail=terminal_detail)
         with self._write_lock:
             self._stream.close()
         self._result = ProviderExecutionResult(
@@ -627,30 +660,51 @@ class _SupervisedRun:
             diagnostic=self._diagnostic,
             events=tuple(self._events),
             returncode=execution.returncode,
-            detail=execution.detail,
+            detail=terminal_detail,
             run_id=self.handle.run_id,
         )
         self._finished.set()
 
-    def _consume(self, _source: LineSource, line: str) -> None:
+    def _consume(self, source: LineSource, line: str) -> None:
         if not line:
             return
         try:
             decoded = json.loads(line)
         except json.JSONDecodeError:
+            if source == "stderr":
+                self._remember_stderr(line)
+                return
             self._off_contract = True
             return
         if not isinstance(decoded, dict):
+            if source == "stderr":
+                self._remember_stderr(line)
+                return
             self._off_contract = True
             return
         normalized = self._provider.normalize_line(decoded)
         if not normalized:
+            if source == "stderr":
+                self._remember_stderr(line)
+                return
             self._off_contract = True
             return
         for value in normalized:
             self._append(value.kind, raw_id=value.raw_id, detail=value.detail)
             if value.status is not None:
                 self._observed_status = value.status
+
+    def _remember_stderr(self, line: str) -> None:
+        if self._stderr_detail is not None:
+            return
+        detail = redact_sensitive_text(line, secrets=self._secrets).strip()
+        self._stderr_detail = detail[:1_000] if detail else None
+
+    def _last_failed_detail(self) -> str | None:
+        return next(
+            (event.detail for event in reversed(self._events) if event.kind == "failed" and event.detail),
+            None,
+        )
 
     def _append(
         self,

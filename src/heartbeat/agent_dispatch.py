@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
@@ -27,6 +28,14 @@ from typing import Any
 
 import psutil
 
+try:
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:  # source installs may not have refreshed dependencies yet
+    FileSystemEvent = Any  # type: ignore[misc,assignment]
+    FileSystemEventHandler = object  # type: ignore[misc,assignment]
+    Observer = None  # type: ignore[assignment,misc]
+
 from heartbeat.agent_contract import (
     AgentConfiguration,
     validate_configuration,
@@ -36,7 +45,7 @@ from heartbeat.providers import ClaudeProvider, CodexProvider
 from heartbeat.providers.lifecycle import (
     Reservation,
     LifecycleFailure,
-    last_event_kind,
+    last_event,
     read_reservation,
     recover_run,
     start_reserved_run,
@@ -143,6 +152,36 @@ class WorkflowHelpers:
             return DispatchFailure(stage=stage, reason=outcome.reason)
         return outcome
 
+    def eligible(self, role: str) -> dict[str, Any] | DispatchFailure:
+        """Read the complete role verdict without reserving or starting anything."""
+        command, installed = self._helper(
+            ".workflow/rules/wf-eligible.sh", ".workflow/rules/wf-eligible.ps1"
+        )
+        if not installed:
+            # v0.8 projects only installed the atomic reservation helper. Keep
+            # that compatibility path until the app refreshes managed assets;
+            # only v0.9 assets can distinguish idle from an opaque refusal.
+            return {
+                "role": role,
+                "targetId": "__defer_to_reservation__",
+                "candidates": [],
+                "verdict": "eligible",
+                "deferred": True,
+            }
+        invocation = self.runner([*command, role, "--json"], self.working_directory)
+        if invocation.returncode not in (0, 1):
+            return DispatchFailure(
+                stage="request_validation" if invocation.returncode == 2 else "reservation",
+                reason="eligibility_usage_error" if invocation.returncode == 2 else "eligibility_unavailable",
+            )
+        try:
+            payload = json.loads(invocation.stdout)
+        except json.JSONDecodeError:
+            return DispatchFailure(stage="reservation", reason="eligibility_malformed")
+        if not isinstance(payload, dict) or payload.get("role") != role:
+            return DispatchFailure(stage="reservation", reason="eligibility_malformed")
+        return payload
+
     def renew(self, target_id: str, lease_id: str, minutes: int = RESERVATION_MINUTES) -> int:
         command, installed = self._helper(CLAIM_HELPER, CLAIM_HELPER_WINDOWS)
         if not installed:
@@ -202,6 +241,9 @@ class RolePlan:
     granted: int
     excluded: list[str] = field(default_factory=list)
     manual_targets: tuple[str, ...] = ()
+    target_id: str | None = None
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    verdict: str = "no_target"
     diagnostic: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -213,6 +255,9 @@ class RolePlan:
             "granted": self.granted,
             "excluded": sorted(set(self.excluded)),
             "manualTargets": list(self.manual_targets),
+            "targetId": self.target_id,
+            "candidates": self.candidates,
+            "verdict": self.verdict,
             "diagnostic": self.diagnostic,
         }
 
@@ -220,6 +265,32 @@ class RolePlan:
 def configuration_of(store: AgentStore, project_id: str) -> AgentConfiguration | None:
     stored = store.get_configuration(project_id)
     return validate_configuration(stored) if stored else None
+
+
+def sync_automation(store: AgentStore, configuration: AgentConfiguration) -> None:
+    """Keep role participation separate from the project's master switch."""
+    current = {intent["role"]: intent for intent in store.list_intents(configuration.project_id)}
+    disabled_roles = {
+        role for role, policy in configuration.roles.items() if policy.execution_mode != "continuous"
+    }
+    store.drop_role_intents(configuration.project_id, disabled_roles)
+    for role, policy in sorted(configuration.roles.items()):
+        if policy.execution_mode != "continuous" or role in current:
+            continue
+        store.activate_intent(
+            configuration.project_id,
+            {
+                "intentId": uuid.uuid4().hex,
+                "role": role,
+                "mode": "auto",
+                "manualTargets": [],
+                "startedCount": 0,
+                "nextPollAt": utc_now(),
+                "lastCheckAt": None,
+                "lastResult": "waiting",
+                "lastAssignedAt": None,
+            },
+        )
 
 
 def runtime_revision(store: AgentStore, configuration: AgentConfiguration) -> str:
@@ -294,14 +365,13 @@ def build_plan(
 
     for request in requests:
         policy = configuration.roles[request.role]
-        diagnostic = provider_factory(policy.provider).diagnose()
+        eligibility = _eligibility(helpers, request.role)
         plan = RolePlan(
             role=request.role,
             provider=policy.provider,
             execution_mode=policy.execution_mode,
             requested=request.slots,
             granted=0,
-            diagnostic={"status": diagnostic.status, "provider": diagnostic.provider, "version": diagnostic.version},
         )
         granted = min(request.slots, _role_remaining(store, configuration, request.role), budget)
         if policy.execution_limit is not None:
@@ -312,14 +382,53 @@ def build_plan(
         if locked:
             granted = 0
             plan.excluded.append("migration_lock")
-        if diagnostic.status != "ready":
+        if isinstance(eligibility, DispatchFailure):
             granted = 0
-            plan.excluded.append(f"provider_{diagnostic.status}")
+            plan.excluded.append(eligibility.reason)
+        else:
+            plan.target_id = eligibility.get("targetId")
+            raw_candidates = eligibility.get("candidates")
+            if isinstance(raw_candidates, list):
+                plan.candidates = [item for item in raw_candidates if isinstance(item, dict)]
+            raw_verdict = eligibility.get("verdict")
+            plan.verdict = raw_verdict if isinstance(raw_verdict, str) else "no_target"
         if request.manual_targets:
             accepted, reasons = validate_manual_targets(helpers, request.manual_targets, now=now)
+            eligible_ids = {
+                item.get("id") for item in plan.candidates if item.get("reason") == "eligible"
+            }
+            if not (isinstance(eligibility, dict) and eligibility.get("deferred") is True):
+                accepted = tuple(target for target in accepted if target in eligible_ids)
+            if not accepted and not reasons:
+                reasons.append("manual_target_unavailable")
             plan.manual_targets = accepted
             plan.excluded.extend(reasons)
             granted = min(granted, len(accepted))
+        elif plan.target_id is None:
+            granted = 0
+            plan.excluded.append(plan.verdict)
+
+        # Target availability is free to check. Provider diagnostics can launch
+        # a CLI, so only do it when there is work that could actually start.
+        if granted > 0:
+            diagnostic = provider_factory(policy.provider).diagnose()
+            model_status = _model_status(
+                policy.model, diagnostic.model_catalog.status, diagnostic.model_catalog.models
+            )
+            plan.diagnostic = {
+                "status": diagnostic.status,
+                "provider": diagnostic.provider,
+                "version": diagnostic.version,
+                "selectedModel": policy.model,
+                "modelStatus": model_status,
+                "modelCatalog": diagnostic.model_catalog.to_dict(),
+            }
+            if diagnostic.status != "ready":
+                granted = 0
+                plan.excluded.append(f"provider_{diagnostic.status}")
+            if model_status == "unavailable":
+                granted = 0
+                plan.excluded.append("model_unavailable")
         if granted < request.slots and not plan.excluded:
             plan.excluded.append(
                 "execution_limit" if policy.execution_limit is not None and granted == policy.execution_limit
@@ -348,6 +457,33 @@ def build_plan(
     }
 
 
+def _model_status(model: str | None, catalog_status: str, models: Sequence[object]) -> str:
+    if model is None:
+        return "default"
+    if catalog_status != "available":
+        return "unverified"
+    return "available" if any(getattr(candidate, "id", None) == model for candidate in models) else "unavailable"
+
+
+def _eligibility(helpers: WorkflowHelpers, role: str) -> dict[str, Any] | DispatchFailure:
+    """Use the richer eligibility contract when available.
+
+    Older embedders and release fixtures only implement atomic reservation. A
+    deferred sentinel keeps those callers on that safe path while managed
+    v0.9 projects expose the complete candidate list before reserving.
+    """
+    eligible = getattr(helpers, "eligible", None)
+    if not callable(eligible):
+        return {
+            "targetId": "deferred-reservation",
+            "targetKind": "reservation_helper",
+            "candidates": [],
+            "verdict": "eligible",
+            "deferred": True,
+        }
+    return eligible(role)
+
+
 def _new_run_row(
     configuration: AgentConfiguration,
     role: str,
@@ -368,6 +504,7 @@ def _new_run_row(
         "providerRunId": None,
         "pid": None,
         "startedAt": None,
+        "finishedAt": None,
         "processIdentity": None,
         "eventPath": None,
         "lastOffset": 0,
@@ -381,8 +518,85 @@ def _new_run_row(
     }
 
 
+def _not_started(
+    configuration: AgentConfiguration,
+    role: str,
+    provider: str,
+    *,
+    reason: str,
+    manual: bool,
+    previous_run_id: str | None = None,
+    intent_id: str | None = None,
+) -> dict[str, Any]:
+    """Return a start result that is deliberately absent from execution history."""
+    row = _new_run_row(configuration, role, provider, previous_run_id, intent_id)
+    row.update({
+        "state": "not_started" if manual else "idle",
+        "failureStage": "reservation" if manual else None,
+        "reason": reason,
+        "finishedAt": utc_now(),
+    })
+    return row
+
+
+def _preflight_target(
+    configuration: AgentConfiguration,
+    role: str,
+    helpers: WorkflowHelpers,
+    manual_targets: Sequence[str],
+    *,
+    previous_run_id: str | None = None,
+    intent_id: str | None = None,
+) -> dict[str, Any] | None:
+    policy = configuration.roles[role]
+    verdict = _eligibility(helpers, role)
+    if isinstance(verdict, DispatchFailure):
+        return _not_started(
+            configuration,
+            role,
+            policy.provider,
+            reason=verdict.reason,
+            manual=bool(manual_targets),
+            previous_run_id=previous_run_id,
+            intent_id=intent_id,
+        )
+    candidates = verdict.get("candidates")
+    eligible_ids = {
+        candidate.get("id")
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("reason") == "eligible"
+    } if isinstance(candidates, list) else set()
+    target_id = verdict.get("targetId")
+    if manual_targets:
+        if verdict.get("deferred") is True:
+            return None
+        if not any(target in eligible_ids for target in manual_targets):
+            return _not_started(
+                configuration,
+                role,
+                policy.provider,
+                reason="manual_target_unavailable",
+                manual=True,
+                previous_run_id=previous_run_id,
+                intent_id=intent_id,
+            )
+        return None
+    if not isinstance(target_id, str) or not target_id:
+        reason = verdict.get("verdict")
+        return _not_started(
+            configuration,
+            role,
+            policy.provider,
+            reason=reason if isinstance(reason, str) and reason else "no_target",
+            manual=False,
+            previous_run_id=previous_run_id,
+            intent_id=intent_id,
+        )
+    return None
+
+
 def _fail(store: AgentStore, row: dict[str, Any], *, stage: str, reason: str, state: str = "failed") -> dict[str, Any]:
-    row.update({"state": state, "failureStage": stage, "reason": reason})
+    row.update({"state": state, "failureStage": stage, "reason": reason, "finishedAt": utc_now()})
     store.save_run(row)
     store.record_error(row["projectId"], row["runId"], {"stage": stage, "reason": reason, "role": row["role"]})
     return row
@@ -401,6 +615,16 @@ def start_one_run(
 ) -> dict[str, Any]:
     """Start inside a persistent daemon or test process that owns supervision."""
     policy = configuration.roles[role]
+    preflight = _preflight_target(
+        configuration,
+        role,
+        helpers,
+        manual_targets,
+        previous_run_id=previous_run_id,
+        intent_id=intent_id,
+    )
+    if preflight is not None:
+        return preflight
     row = _new_run_row(configuration, role, policy.provider, previous_run_id, intent_id)
     row["manualTargets"] = list(manual_targets)
     return _start_run_row(
@@ -420,9 +644,21 @@ def queue_one_run(
     manual_targets: Sequence[str] = (),
     previous_run_id: str | None = None,
     intent_id: str | None = None,
+    helpers: WorkflowHelpers | None = None,
 ) -> dict[str, Any]:
     """Persist work before a detached supervisor is launched for it."""
     policy = configuration.roles[role]
+    helpers = helpers or WorkflowHelpers(Path(configuration.working_directory))
+    preflight = _preflight_target(
+        configuration,
+        role,
+        helpers,
+        manual_targets,
+        previous_run_id=previous_run_id,
+        intent_id=intent_id,
+    )
+    if preflight is not None:
+        return preflight
     row = _new_run_row(configuration, role, policy.provider, previous_run_id, intent_id)
     row.update({"state": "queued", "manualTargets": list(manual_targets)})
     store.save_run(row)
@@ -441,10 +677,45 @@ def _start_run_row(
     role = row["role"]
     policy = configuration.roles[role]
     manual_targets = tuple(row.get("manualTargets", ()))
+    preflight = _preflight_target(
+        configuration,
+        role,
+        helpers,
+        manual_targets,
+        previous_run_id=row.get("previousRunId"),
+        intent_id=row.get("intentId"),
+    )
+    if preflight is not None:
+        row.update({
+            "state": preflight["state"],
+            "failureStage": preflight["failureStage"],
+            "reason": preflight["reason"],
+            "finishedAt": preflight["finishedAt"],
+        })
+        store.save_run(row)
+        return row
+    provider = None
+    if policy.model is not None:
+        provider = provider_factory(policy.provider)
+        diagnostic = provider.diagnose()
+        if _model_status(policy.model, diagnostic.model_catalog.status, diagnostic.model_catalog.models) == "unavailable":
+            return _fail(store, row, stage="request_validation", reason="model_unavailable")
     row["state"] = "reserved"
     store.save_run(row)
     reservation = helpers.reserve(role, f"heartbeat-runtime-{role}")
     if isinstance(reservation, DispatchFailure):
+        if reservation.reason == "reservation_unavailable":
+            eligibility = _eligibility(helpers, role)
+            if isinstance(eligibility, dict) and eligibility.get("deferred") is True:
+                return _fail(store, row, stage=reservation.stage, reason=reservation.reason)
+            row.update({
+                "state": "not_started" if manual_targets else "idle",
+                "failureStage": "reservation" if manual_targets else None,
+                "reason": "manual_target_unavailable" if manual_targets else "no_target",
+                "finishedAt": utc_now(),
+            })
+            store.save_run(row)
+            return row
         return _fail(store, row, stage=reservation.stage, reason=reservation.reason)
     if manual_targets and reservation.target_id not in manual_targets:
         # The helper picks the target itself, so a manual request can only be
@@ -465,7 +736,7 @@ def _start_run_row(
         helpers.release(reservation.target_id, reservation.lease_id)
         return _fail(store, row, stage="reservation", reason="reservation_not_persisted")
 
-    provider = provider_factory(policy.provider)
+    provider = provider or provider_factory(policy.provider)
     event_root = default_event_root() / configuration.project_id
     request = ProviderExecutionRequest(
         project_id=configuration.project_id,
@@ -538,6 +809,7 @@ def queue_and_launch_run(
     intent_id: str | None = None,
 ) -> dict[str, Any]:
     """Queue one run and report whether its detached supervisor was created."""
+    helpers = WorkflowHelpers(Path(configuration.working_directory))
     row = queue_one_run(
         store,
         configuration,
@@ -545,12 +817,17 @@ def queue_and_launch_run(
         manual_targets=manual_targets,
         previous_run_id=previous_run_id,
         intent_id=intent_id,
+        helpers=helpers,
     )
+    if row["state"] in {"idle", "not_started"}:
+        return row
     if launch_run_worker(store, row["runId"]):
         deadline = time.monotonic() + WORKER_START_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             current = store.get_run(row["runId"]) or row
             if current["state"] not in {"queued", "reserved"} or current.get("targetId"):
+                if current["state"] in {"idle", "not_started"}:
+                    store.delete_run(current["runId"])
                 return current
             worker_pid = current.get("supervisorPid")
             if isinstance(worker_pid, int) and observe_process(worker_pid).liveness == "gone":
@@ -591,7 +868,7 @@ def serve_queued_run(
         provider_factory=provider_factory,
     )
     if started["state"] != "running":
-        return 1
+        return 0 if started["state"] in {"idle", "not_started"} else 1
 
     while True:
         time.sleep(max(0.01, poll_seconds))
@@ -623,6 +900,30 @@ def _dispatcher_is_live(row: dict[str, Any]) -> bool:
     )
 
 
+def _claim_dispatcher_process(store: AgentStore, pid: int, identity: str) -> bool:
+    """Claim the singleton after proving any prior owner is stale.
+
+    A service restart can kill the previous process before its ``finally`` block
+    releases the database row.  An unreadable process is never guessed about,
+    while a gone process or a reused PID can be released with the persisted
+    identity as the compare-and-delete guard.
+    """
+    current = store.get_dispatcher()
+    if current is not None:
+        current_identity = current.get("processIdentity")
+        observation = observe_process(current["pid"])
+        if (
+            observation.liveness == "running"
+            and bool(current_identity)
+            and observation.identity == current_identity
+        ):
+            return current["pid"] == pid and current_identity == identity
+        if observation.liveness == "unknown":
+            return False
+        store.release_dispatcher(current["pid"], current_identity)
+    return store.claim_dispatcher(pid, identity)
+
+
 def launch_continuous_dispatcher(store: AgentStore) -> bool:
     """Detach one device-wide scheduler from the short control command."""
     environment = dict(os.environ)
@@ -647,7 +948,7 @@ def launch_continuous_dispatcher(store: AgentStore) -> bool:
 
 def ensure_continuous_dispatcher(store: AgentStore) -> bool:
     """Keep one scheduler alive whenever at least one repeat intent exists."""
-    if not store.list_all_intents():
+    if not _active_automation_intents(store):
         return False
     current = store.get_dispatcher()
     if current is not None:
@@ -668,6 +969,40 @@ def ensure_continuous_dispatcher(store: AgentStore) -> bool:
     return False
 
 
+def stop_continuous_dispatcher_for_service(
+    store: AgentStore,
+    *,
+    timeout_seconds: float = 5.0,
+) -> str:
+    """Stop only the persisted dispatcher process whose OS identity still matches.
+
+    The managed OS service must own the singleton after migration. A detached
+    dispatcher left by an earlier control call would otherwise keep the DB claim
+    forever and make the service repeatedly restart. PID reuse and unreadable
+    process state are never guessed.
+    """
+    row = store.get_dispatcher()
+    if row is None:
+        return "none"
+    observation = observe_process(row["pid"])
+    identity = row.get("processIdentity")
+    if observation.liveness == "unknown":
+        return "blocked"
+    if observation.liveness == "gone" or not identity or observation.identity != identity:
+        store.release_dispatcher(row["pid"], identity)
+        return "none"
+    try:
+        process = psutil.Process(row["pid"])
+        process.terminate()
+        process.wait(timeout=max(0.1, timeout_seconds))
+    except psutil.NoSuchProcess:
+        pass
+    except (psutil.AccessDenied, psutil.TimeoutExpired):
+        return "blocked"
+    store.release_dispatcher(row["pid"], identity)
+    return "stopped"
+
+
 def _parse_utc(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -684,7 +1019,7 @@ def _next_poll_at(now: datetime, seconds: int) -> str:
 
 def _dispatcher_sleep_seconds(store: AgentStore, *, now: datetime) -> float:
     waits: list[float] = []
-    for intent in store.list_all_intents():
+    for intent in _active_automation_intents(store):
         configuration = configuration_of(store, intent["projectId"])
         if configuration is None or not configuration.paused:
             due = _parse_utc(intent.get("nextPollAt"))
@@ -694,19 +1029,147 @@ def _dispatcher_sleep_seconds(store: AgentStore, *, now: datetime) -> float:
     return min(DISPATCHER_POLL_CAP_SECONDS, min(waits))
 
 
+def _active_automation_intents(store: AgentStore) -> list[dict[str, Any]]:
+    active = []
+    for intent in store.list_all_intents():
+        configuration = configuration_of(store, intent["projectId"])
+        if (
+            configuration is not None
+            and configuration.automation_enabled
+            and not configuration.paused
+            and configuration.roles.get(intent["role"]) is not None
+            and configuration.roles[intent["role"]].execution_mode == "continuous"
+        ):
+            active.append(intent)
+    return active
+
+
+class _WorkflowEventHandler(FileSystemEventHandler):  # type: ignore[misc]
+    def __init__(self, project_id: str, changed: Callable[[str], None]) -> None:
+        super().__init__()
+        self.project_id = project_id
+        self.changed = changed
+
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        if not getattr(event, "is_directory", False):
+            self.changed(self.project_id)
+
+
+class WorkflowChangeWatcher:
+    """Watch enabled projects and expose only debounced project identities."""
+
+    def __init__(self, store: AgentStore, *, debounce_seconds: float = 0.5) -> None:
+        self.store = store
+        self.debounce_seconds = debounce_seconds
+        self._observer: Any | None = None
+        self._roots: dict[str, str] = {}
+        self._changed_at: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self.status = "stopped"
+
+    def _changed(self, project_id: str) -> None:
+        with self._lock:
+            self._changed_at[project_id] = time.monotonic()
+
+    def refresh(self, configurations: Sequence[AgentConfiguration]) -> None:
+        roots = {
+            configuration.project_id: str(Path(configuration.working_directory) / ".workflow")
+            for configuration in configurations
+            if (Path(configuration.working_directory) / ".workflow").is_dir()
+        }
+        if roots == self._roots and self._observer is not None:
+            return
+        self.stop()
+        self._roots = roots
+        if not roots:
+            return
+        if Observer is None:
+            self.status = "degraded"
+            for project_id in roots:
+                self.store.save_watcher_state(
+                    project_id,
+                    "degraded",
+                    error="watcher_dependency_unavailable",
+                )
+            return
+        try:
+            observer = Observer()
+            for project_id, root in roots.items():
+                observer.schedule(_WorkflowEventHandler(project_id, self._changed), root, recursive=True)
+            observer.start()
+            self._observer = observer
+            self.status = "watching"
+            for project_id in roots:
+                self.store.save_watcher_state(project_id, "watching")
+        except (OSError, RuntimeError) as error:
+            self.status = "degraded"
+            self._observer = None
+            for project_id in roots:
+                self.store.save_watcher_state(
+                    project_id,
+                    "degraded",
+                    error=type(error).__name__,
+                )
+
+    def ready_projects(self) -> list[str]:
+        now = time.monotonic()
+        with self._lock:
+            ready = [
+                project_id
+                for project_id, changed_at in self._changed_at.items()
+                if now - changed_at >= self.debounce_seconds
+            ]
+            for project_id in ready:
+                self._changed_at.pop(project_id, None)
+        return ready
+
+    def stop(self) -> None:
+        project_ids = tuple(self._roots)
+        observer = self._observer
+        self._observer = None
+        if observer is not None:
+            observer.stop()
+            observer.join(timeout=2)
+        self._roots = {}
+        with self._lock:
+            self._changed_at.clear()
+        self.status = "stopped"
+        for project_id in project_ids:
+            self.store.save_watcher_state(project_id, "stopped")
+
+
 def serve_continuous_intents(
     store: AgentStore,
     *,
     helpers_factory: Callable[[Path], WorkflowHelpers] = WorkflowHelpers,
     provider_factory: Callable[[str], AgentProvider] = build_provider,
 ) -> int:
-    """Own all repeat policies until none remain, independent of the GUI."""
+    """Own repeat policies for the lifetime of the managed OS service."""
     pid = os.getpid()
     identity = process_identity(pid)
-    if not identity or not store.claim_dispatcher(pid, identity):
+    if not identity or not _claim_dispatcher_process(store, pid, identity):
         return 0
+    watcher = WorkflowChangeWatcher(store)
     try:
-        while store.list_all_intents():
+        while True:
+            intents = _active_automation_intents(store)
+            configurations = []
+            seen_projects: set[str] = set()
+            for intent in intents:
+                if intent["projectId"] in seen_projects:
+                    continue
+                configuration = configuration_of(store, intent["projectId"])
+                if configuration is not None:
+                    configurations.append(configuration)
+                    seen_projects.add(configuration.project_id)
+            watcher.refresh(configurations)
+            for project_id in watcher.ready_projects():
+                store.mark_automations_due(project_id)
+                store.save_watcher_state(
+                    project_id,
+                    "watching",
+                    last_event_at=utc_now(),
+                )
             now = datetime.now(UTC)
             tick_all_projects(
                 store,
@@ -715,11 +1178,15 @@ def serve_continuous_intents(
                 detached_workers=True,
                 now=now,
             )
-            if not store.list_all_intents():
-                break
-            time.sleep(_dispatcher_sleep_seconds(store, now=datetime.now(UTC)))
+            if not intents:
+                watcher.refresh([])
+                time.sleep(1.0)
+                continue
+            fallback_sleep = _dispatcher_sleep_seconds(store, now=datetime.now(UTC))
+            time.sleep(min(0.1 if watcher.status == "watching" else 1.0, fallback_sleep))
         return 0
     finally:
+        watcher.stop()
         store.release_dispatcher(pid, identity)
 
 
@@ -828,6 +1295,7 @@ def reconcile_run(
                 "failureStage": "recovery",
                 "reason": "supervisor_identity_unverified",
                 "remaining": ["process_termination", "event_close", "lease_release"],
+                "finishedAt": utc_now(),
             })
             store.save_run(row)
             store.record_error(
@@ -843,6 +1311,7 @@ def reconcile_run(
                     "failureStage": "recovery",
                     "reason": "supervisor_gone",
                     "remaining": ["process_termination", "event_close", "lease_release"],
+                    "finishedAt": utc_now(),
                 })
                 store.save_run(row)
                 store.record_error(
@@ -882,20 +1351,34 @@ def reconcile_run(
             "failureStage": "recovery",
             "reason": recovery.reason,
             "remaining": list(recovery.remaining),
+            "finishedAt": utc_now(),
         })
         store.save_run(row)
         store.record_error(row["projectId"], row["runId"], {"stage": "recovery", "reason": recovery.reason})
         return row
 
-    terminal = TERMINAL_BY_EVENT.get(last_event_kind(Path(row["eventPath"])) or "", "failed")
+    final_event = last_event(Path(row["eventPath"]))
+    event_kind = final_event.get("kind") if final_event is not None else None
+    terminal = TERMINAL_BY_EVENT.get(event_kind if isinstance(event_kind, str) else "", "failed")
+    event_detail = final_event.get("detail") if final_event is not None else None
     released = _release_lease(helpers, row)
+    role_failure = released and terminal == "failed"
     row.update({
         "state": terminal if released else "recovery_required",
         "remaining": [] if released else ["lease_release"],
-        "failureStage": None if released else "cleanup",
-        "reason": None if released else "lease_release_failed",
+        "finishedAt": utc_now(),
+        "failureStage": "role_session" if role_failure else (None if released else "cleanup"),
+        "reason": (
+            (event_detail if isinstance(event_detail, str) and event_detail else "provider_failed")
+            if role_failure else (None if released else "lease_release_failed")
+        ),
     })
     store.save_run(row)
+    if role_failure:
+        store.record_error(
+            row["projectId"], row["runId"],
+            {"stage": "role_session", "reason": row["reason"], "role": row["role"]},
+        )
     return row
 
 
@@ -948,6 +1431,7 @@ def apply_cancel(store: AgentStore, row: dict[str, Any], *, helpers: WorkflowHel
     row.update({
         "state": "cancelled" if not remaining else "recovery_required",
         "remaining": remaining,
+        "finishedAt": utc_now(),
         "failureStage": None if not remaining else "cleanup",
         "reason": None if not remaining else "partial_cleanup",
     })
@@ -983,6 +1467,8 @@ class TickReport:
     project_id: str
     reconciled: int = 0
     started: int = 0
+    waiting: list[str] = field(default_factory=list)
+    attention: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
 
 
@@ -1009,9 +1495,10 @@ def tick_project(
         provider_factory=provider_factory,
     )
 
-    if configuration.paused:
+    if configuration.paused or not configuration.automation_enabled:
         return report
 
+    due_intents: list[dict[str, Any]] = []
     for intent in store.list_intents(project_id):
         role = intent["role"]
         policy = configuration.roles.get(role)
@@ -1030,12 +1517,36 @@ def tick_project(
         if due is not None and due > now:
             continue
         intent["nextPollAt"] = _next_poll_at(now, policy.poll_interval_seconds)
+        intent["lastCheckAt"] = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         store.save_intent(project_id, intent)
-        while _role_remaining(store, configuration, role) > 0 and min(
-            _project_remaining(store, configuration), _device_remaining(store, configuration)
-        ) > 0:
+        due_intents.append(intent)
+
+    role_order = {role: index for index, role in enumerate(("planner", "architect", "developer"))}
+    due_intents.sort(key=lambda intent: (
+        bool(intent.get("lastAssignedAt")),
+        intent.get("lastAssignedAt") or "",
+        role_order.get(intent["role"], len(role_order)),
+    ))
+
+    # One role gets one seat per pass. Re-sorting on the next tick by
+    # lastAssignedAt keeps scarce project slots moving between roles, while a
+    # single tick can still fill every currently available seat.
+    progress = True
+    while due_intents and progress and min(
+        _project_remaining(store, configuration), _device_remaining(store, configuration)
+    ) > 0:
+        progress = False
+        for intent in list(due_intents):
+            role = intent["role"]
+            policy = configuration.roles[role]
+            manual = tuple(intent.get("manualTargets", ()))
+            started_count = int(intent.get("startedCount", 0))
+            if _role_remaining(store, configuration, role) <= 0:
+                due_intents.remove(intent)
+                continue
             if policy.execution_limit is not None and started_count >= policy.execution_limit:
                 store.drop_intent(intent["intentId"])
+                due_intents.remove(intent)
                 break
             if detached_workers:
                 row = queue_and_launch_run(
@@ -1056,13 +1567,26 @@ def tick_project(
                     intent_id=intent["intentId"],
                 )
             if row["state"] not in {"queued", "reserved", "running"}:
-                report.failures.append(row.get("reason") or "start_failed")
-                if row.get("failureStage") == "request_validation":
+                reason = row.get("reason") or "start_failed"
+                intent["lastResult"] = reason
+                store.save_intent(project_id, intent)
+                if row["state"] == "idle":
+                    if reason in {"no-target", "no_target"}:
+                        report.waiting.append(role)
+                    else:
+                        report.attention.append(reason)
+                else:
+                    report.failures.append(reason)
+                if row.get("failureStage") == "request_validation" and row["state"] != "idle":
                     store.drop_intent(intent["intentId"])
-                break
+                due_intents.remove(intent)
+                continue
             report.started += 1
+            progress = True
             started_count += 1
             intent["startedCount"] = started_count
+            intent["lastResult"] = "running"
+            intent["lastAssignedAt"] = utc_now()
             if manual:
                 intent["manualTargets"] = [target for target in manual if target != row["targetId"]]
                 manual = tuple(intent["manualTargets"])
@@ -1070,8 +1594,13 @@ def tick_project(
                 policy.execution_limit is not None and started_count >= policy.execution_limit
             ):
                 store.drop_intent(intent["intentId"])
-                break
+                due_intents.remove(intent)
+                continue
             store.save_intent(project_id, intent)
+            if _role_remaining(store, configuration, role) <= 0:
+                due_intents.remove(intent)
+            if min(_project_remaining(store, configuration), _device_remaining(store, configuration)) <= 0:
+                break
     return report
 
 

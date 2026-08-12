@@ -41,7 +41,7 @@ class TaskSchedulerAdapter(ServiceAdapter):
     <StartWhenAvailable>true</StartWhenAvailable>
     <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
   </Settings>
-  <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>start</Arguments></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>agent-dispatcher</Arguments></Exec></Actions>
 </Task>
 '''
 
@@ -179,3 +179,32 @@ class TaskSchedulerAdapter(ServiceAdapter):
         except FileNotFoundError:
             print("⚠ schtasks.exe 없음 (Windows 전용)")
             return 1
+
+    def migrate(self) -> int:
+        try:
+            queried = subprocess.run(
+                ["schtasks.exe", "/query", "/tn", TASK_NAME, "/xml"],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            return 1
+        if queried.returncode != 0:
+            return self.install()
+        original = queried.stdout
+        installed = self.install()
+        status = self.inspect() if installed == 0 else None
+        if installed == 0 and status is not None and status.registered is True:
+            return 0
+        descriptor, xml_name = tempfile.mkstemp(
+            prefix="claude-heartbeat-rollback-", suffix=".xml",
+        )
+        xml_path = Path(xml_name)
+        try:
+            with open(descriptor, "w", encoding="utf-16") as definition_file:
+                definition_file.write(original)
+            subprocess.run(self._install_cmd(str(xml_path)), capture_output=True, text=True)
+        finally:
+            xml_path.unlink(missing_ok=True)
+        print("관리형 서비스 검증 실패. 기존 작업 스케줄러 정의를 복구했습니다.")
+        return 1

@@ -114,6 +114,7 @@ def test_contract_advertises_versions_commands_and_defaults():
     assert "run.start" in description["implementedCommands"]
     assert "run.start" not in description["reservedCommands"]
     assert description["defaults"] == {
+        "automationEnabled": False,
         "roleMaxParallel": 1,
         "projectMaxParallel": 3,
         "deviceMaxParallel": 16,

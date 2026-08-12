@@ -22,9 +22,11 @@ from heartbeat.providers.process import (
     ProviderDiagnostic,
     ProviderEventBatch,
     ProviderExecutionRequest,
+    ProviderModelCatalog,
     ProviderRunHandle,
     ProviderStartFailure,
     execute_process,
+    redact_sensitive_text,
 )
 
 
@@ -86,6 +88,12 @@ if prompt_path:
 if mode == "broken":
     print("not-json", flush=True)
     print(json.dumps({"type": "done"}), flush=True)
+elif mode == "stderr-warning":
+    print("warning: optional integration unavailable", file=sys.stderr, flush=True)
+    print(json.dumps({"type": "done"}), flush=True)
+elif mode == "stderr-failure":
+    print("selected model failed; token=private-value", file=sys.stderr, flush=True)
+    raise SystemExit(7)
 elif mode == "usage":
     print(json.dumps({"type": "failure", "message": "rate limit for test"}), flush=True)
 elif mode == "slow":
@@ -201,6 +209,93 @@ def test_missing_executable_is_not_confused_with_other_diagnostics() -> None:
     assert result.status == "executable_missing"
 
 
+def test_codex_diagnosis_exposes_only_visible_account_models_in_priority_order(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = CodexProvider(executable="fake-codex")
+    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    models = json.dumps({"models": [
+        {"slug": "hidden", "display_name": "Hidden", "visibility": "hide", "priority": 0},
+        {"slug": "gpt-terra", "display_name": "Terra", "visibility": "list", "priority": 2},
+        {"slug": "gpt-sol", "display_name": "Sol", "visibility": "list", "priority": 1},
+    ]})
+    probes = iter([
+        complete(["codex", "--version"]),
+        complete(["codex", "login", "status"]),
+        complete(["codex", "debug", "models"], stdout=models),
+    ])
+    monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(probes))
+
+    diagnostic = provider.diagnose(environment={})
+
+    assert diagnostic.model_catalog.status == "available"
+    assert [(model.id, model.label) for model in diagnostic.model_catalog.models] == [
+        ("gpt-sol", "Sol"), ("gpt-terra", "Terra"),
+    ]
+
+
+@pytest.mark.parametrize("output", ["not-json", "{}", '{"models": []}'])
+def test_codex_model_catalog_failure_stays_unavailable_without_failing_provider(
+    monkeypatch, output: str
+) -> None:  # type: ignore[no-untyped-def]
+    provider = CodexProvider(executable="fake-codex")
+    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    probes = iter([
+        complete(["codex", "--version"]),
+        complete(["codex", "login", "status"]),
+        complete(["codex", "debug", "models"], stdout=output),
+    ])
+    monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(probes))
+
+    diagnostic = provider.diagnose(environment={})
+
+    assert diagnostic.status == "ready"
+    assert diagnostic.model_catalog == ProviderModelCatalog("unavailable")
+
+
+def test_codex_model_catalog_command_failure_stays_unavailable_without_failing_provider(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    provider = CodexProvider(executable="fake-codex")
+    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    probes = iter([
+        complete(["codex", "--version"]),
+        complete(["codex", "login", "status"]),
+        complete(["codex", "debug", "models"], returncode=1, stderr="catalog unavailable"),
+    ])
+    monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(probes))
+
+    diagnostic = provider.diagnose(environment={})
+
+    assert diagnostic.status == "ready"
+    assert diagnostic.model_catalog == ProviderModelCatalog("unavailable")
+
+
+def test_claude_diagnosis_exposes_stable_aliases_as_unverified(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    provider = ClaudeProvider(executable="fake-claude")
+    monkeypatch.setattr(provider, "_executable_exists", lambda: True)
+    probes = iter([complete(["claude", "--version"]), complete(["claude", "auth", "status"])])
+    monkeypatch.setattr(process_module, "run_probe", lambda *args, **kwargs: next(probes))
+
+    catalog = provider.diagnose(environment={}).model_catalog
+
+    assert catalog.status == "unverified"
+    assert [model.id for model in catalog.models] == ["best", "fable", "opus", "sonnet", "haiku", "opusplan"]
+
+
+def test_nested_provider_errors_keep_safe_actionable_model_detail() -> None:
+    codex = CodexProvider().normalize_line({
+        "type": "error",
+        "error": {"message": "The 'gpt-5.6' model is not supported; token=private-value"},
+    })[0]
+    claude = ClaudeProvider().normalize_line({
+        "type": "error", "error": {"message": "selected model is unavailable"},
+    })[0]
+
+    assert redact_sensitive_text(codex.detail or "") == (
+        "The 'gpt-5.6' model is not supported; token=[REDACTED]"
+    )
+    assert claude.detail == "selected model is unavailable"
+
+
 def test_claude_api_billing_route_requires_acknowledgement_before_start(monkeypatch, tmp_path: Path) -> None:
     provider = ClaudeProvider(executable="fake-claude")
     monkeypatch.setattr(provider, "_executable_exists", lambda: True)
@@ -252,6 +347,31 @@ def test_broken_json_line_does_not_stop_the_process_and_is_reported_off_contract
 
     assert result.status == "off_contract"
     assert [event.kind for event in result.events][-2:] == ["completed", "failed"]
+
+
+def test_non_json_stderr_warning_does_not_flip_a_completed_run_to_failure(
+    fixture_script: Path, tmp_path: Path
+) -> None:
+    result = FixtureProvider(fixture_script).run(
+        request(tmp_path),
+        environment={"TEST_API_KEY": "not-used", "PROVIDER_TEST_MODE": "stderr-warning"},
+    )
+
+    assert result.status == "success"
+    assert result.events[-1].kind == "completed"
+
+
+def test_nonzero_exit_keeps_redacted_stderr_reason(
+    fixture_script: Path, tmp_path: Path
+) -> None:
+    result = FixtureProvider(fixture_script).run(
+        request(tmp_path),
+        environment={"TEST_API_KEY": "not-used", "PROVIDER_TEST_MODE": "stderr-failure"},
+    )
+
+    assert result.status == "failed"
+    assert result.returncode == 7
+    assert result.events[-1].detail == "selected model failed; token=[REDACTED]"
 
 
 def test_usage_limit_has_a_distinct_terminal_result(fixture_script: Path, tmp_path: Path) -> None:

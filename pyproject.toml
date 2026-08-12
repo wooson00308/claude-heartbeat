@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "portalocker>=2.7",  # cross-platform file lock (replaces fcntl)
     "psutil>=5.9",       # cross-platform process tree termination
+    "watchdog>=4.0",     # cross-platform workflow change notifications
 ]
 
 [project.optional-dependencies]

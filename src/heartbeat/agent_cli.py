@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sys
 import uuid
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -161,7 +160,12 @@ def _execution_command(
         diagnostics = [agent_dispatch.build_provider(name).diagnose() for name in providers]
         return "success", {
             "providers": [
-                {"provider": item.provider, "status": item.status, "version": item.version} for item in diagnostics
+                {
+                    "provider": item.provider,
+                    "status": item.status,
+                    "version": item.version,
+                    "modelCatalog": item.model_catalog.to_dict(),
+                } for item in diagnostics
             ]
         }
 
@@ -232,7 +236,7 @@ def _start_from_plan(
 
     started: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    continuous_activated = False
+    waiting: list[dict[str, Any]] = []
     for role_plan in plan["roles"]:
         remaining_targets = list(role_plan["manualTargets"])
         role_started = 0
@@ -249,6 +253,9 @@ def _start_from_plan(
                 role_started += 1
                 if remaining_targets and row["targetId"] in remaining_targets:
                     remaining_targets.remove(row["targetId"])
+            elif row["state"] == "idle":
+                waiting.append({"role": role_plan["role"], "reason": row["reason"]})
+                break
             else:
                 role_failure = {
                     "role": role_plan["role"],
@@ -257,37 +264,11 @@ def _start_from_plan(
                 }
                 failures.append(role_failure)
                 break
-        if role_plan["executionMode"] == "continuous":
-            policy = configuration.roles[role_plan["role"]]
-            retryable = role_failure is None or role_failure.get("stage") != "request_validation"
-            if retryable and (policy.execution_limit is None or role_started < policy.execution_limit):
-                store.activate_intent(
-                    configuration.project_id,
-                    {
-                        "intentId": uuid.uuid4().hex,
-                        "role": role_plan["role"],
-                        "mode": "manual" if role_plan["manualTargets"] else "auto",
-                        "manualTargets": remaining_targets,
-                        "startedCount": role_started,
-                        "nextPollAt": agent_dispatch._next_poll_at(
-                            datetime.now(UTC), policy.poll_interval_seconds
-                        ),
-                    },
-                )
-                continuous_activated = True
-
-    if continuous_activated and not agent_dispatch.ensure_continuous_dispatcher(store):
-        failures.append({
-            "role": "dispatcher",
-            "stage": "provider_start",
-            "reason": "continuous_dispatcher_not_started",
-        })
-
     if started and failures:
-        return "partial_success", {"started": started, "failures": failures}
+        return "partial_success", {"started": started, "failures": failures, "waiting": waiting}
     if failures:
-        return "failure", {"started": started, "failures": failures}
-    return "success", {"started": started, "failures": failures}
+        return "failure", {"started": started, "failures": failures, "waiting": waiting}
+    return "success", {"started": started, "failures": failures, "waiting": waiting}
 
 
 def run_agent_command(
@@ -317,13 +298,7 @@ def run_agent_command(
             configuration = validate_configuration(request.get("configuration"), request_id=request_id)
             if command == "config.write":
                 runtime_store.save_configuration(configuration)
-                runtime_store.drop_role_intents(
-                    configuration.project_id,
-                    {
-                        role for role, policy in configuration.roles.items()
-                        if policy.execution_mode != "continuous"
-                    },
-                )
+                agent_dispatch.sync_automation(runtime_store, configuration)
                 agent_dispatch.ensure_continuous_dispatcher(runtime_store)
                 configuration = validate_configuration(runtime_store.get_configuration(configuration.project_id))
             _write_json(
@@ -344,6 +319,9 @@ def run_agent_command(
         if command == "state.read":
             project_id = _project_id(request, request_id)
             runtime_store.prune_expired_plans(project_id)
+            configuration = agent_dispatch.configuration_of(runtime_store, project_id)
+            if configuration is not None:
+                runtime_store.prune_history(project_id, configuration.event_retention_days)
             agent_dispatch.reconcile_project_runs(runtime_store, project_id)
             agent_dispatch.ensure_continuous_dispatcher(runtime_store)
             state = runtime_store.get_state(project_id)

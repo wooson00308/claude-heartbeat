@@ -92,6 +92,33 @@ def test_windows_service_definition_restarts_after_crashes_and_rejects_duplicate
     assert "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" in definition
     assert "<LogonTrigger>" in definition
     assert r"C:\Runtime\bin\heartbeat.exe" in definition
+    assert "<Arguments>agent-dispatcher</Arguments>" in definition
+
+
+def test_all_service_definitions_launch_the_agent_dispatcher(monkeypatch):
+    monkeypatch.setattr(LaunchdAdapter, "_heartbeat_bin", lambda self: "/fake/heartbeat")
+    monkeypatch.setattr(SystemdAdapter, "_heartbeat_bin", lambda self: "/fake/heartbeat")
+
+    assert "<string>agent-dispatcher</string>" in LaunchdAdapter().render()
+    assert "ExecStart=/fake/heartbeat agent-dispatcher" in SystemdAdapter().render()
+
+
+def test_launchd_reads_both_boolean_and_word_disabled_formats(monkeypatch):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _completed(
+            0,
+            '\t"com.old-heartbeat" => disabled\n'
+            '\t"com.bool-heartbeat" => true\n'
+            '\t"com.live-heartbeat" => enabled\n',
+        ),
+    )
+
+    assert LaunchdAdapter()._disabled_labels() == {
+        "com.old-heartbeat",
+        "com.bool-heartbeat",
+    }
 
 
 # --- HIGH: systemctl 부재 (컨테이너/WSL1) ---
@@ -392,3 +419,77 @@ def test_inspect_writes_nothing_the_adapters_could_have_changed(monkeypatch, tmp
     TaskSchedulerAdapter().inspect()
 
     assert digests() == before
+
+
+def test_launchd_migration_preserves_foreign_plist_and_disables_its_label(monkeypatch, tmp_path):
+    program = tmp_path / "heartbeat"
+    program.write_text("#!/bin/sh\n", encoding="utf-8")
+    foreign = _plist(tmp_path / "com.old-heartbeat.plist", "com.old-heartbeat", program)
+    before = foreign.read_bytes()
+    adapter = _launchd(monkeypatch, [foreign])
+    own = tmp_path / "com.claude-heartbeat.plist"
+    monkeypatch.setattr(LaunchdAdapter, "_plist_path", lambda self: own)
+    monkeypatch.setattr(LaunchdAdapter, "_heartbeat_bin", lambda self: str(program))
+    disabled = set()
+    calls = []
+
+    def answer(command, *args, **kwargs):
+        calls.append(command)
+        if command[:2] == ["launchctl", "disable"]:
+            disabled.add("com.old-heartbeat")
+        if command[:2] == ["launchctl", "load"] and command[-1] == str(own):
+            own.write_text(adapter.render(), encoding="utf-8")
+        if command[:2] == ["launchctl", "list"]:
+            return _completed(0, '\t"PID" = 42;\n')
+        return _completed()
+
+    monkeypatch.setattr(adapter, "_disabled_labels", lambda: set(disabled))
+    monkeypatch.setattr(subprocess, "run", answer)
+    original_install = adapter.install
+
+    def install(print_only=False):
+        monkeypatch.setattr(adapter, "_heartbeat_plists", lambda: [own, foreign])
+        return original_install(print_only)
+
+    monkeypatch.setattr(adapter, "install", install)
+
+    assert adapter.migrate() == 0
+    assert foreign.read_bytes() == before
+    assert "com.old-heartbeat" in disabled
+    assert any(call[:2] == ["launchctl", "unload"] for call in calls)
+
+
+def test_launchd_migration_rolls_back_when_managed_service_does_not_run(monkeypatch, tmp_path):
+    program = tmp_path / "heartbeat"
+    program.write_text("#!/bin/sh\n", encoding="utf-8")
+    foreign = _plist(tmp_path / "com.old-heartbeat.plist", "com.old-heartbeat", program)
+    adapter = _launchd(monkeypatch, [foreign])
+    own = tmp_path / "com.claude-heartbeat.plist"
+    monkeypatch.setattr(LaunchdAdapter, "_plist_path", lambda self: own)
+    monkeypatch.setattr(LaunchdAdapter, "_heartbeat_bin", lambda self: str(program))
+    calls = []
+
+    def answer(command, *args, **kwargs):
+        calls.append(command)
+        if command[:2] == ["launchctl", "list"] and command[-1] == "com.old-heartbeat":
+            return _completed(1)
+        if command[:2] == ["launchctl", "load"] and command[-1] == str(own):
+            own.write_text(adapter.render(), encoding="utf-8")
+        if command[:2] == ["launchctl", "list"]:
+            return _completed(0, "")
+        return _completed()
+
+    monkeypatch.setattr(adapter, "_disabled_labels", lambda: {"com.old-heartbeat"} if own.exists() else set())
+    monkeypatch.setattr(subprocess, "run", answer)
+    original_install = adapter.install
+
+    def install(print_only=False):
+        monkeypatch.setattr(adapter, "_heartbeat_plists", lambda: [own, foreign])
+        return original_install(print_only)
+
+    monkeypatch.setattr(adapter, "install", install)
+
+    assert adapter.migrate() == 1
+    assert not own.exists()
+    assert any(call[:2] == ["launchctl", "enable"] for call in calls)
+    assert not any(call[:2] == ["launchctl", "load"] and call[-1] == str(foreign) for call in calls)

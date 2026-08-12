@@ -20,7 +20,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart={heartbeat_bin} start
+ExecStart={heartbeat_bin} agent-dispatcher
 Restart=always
 RestartSec=5
 StandardOutput=append:{log_dir}/systemd_stdout.log
@@ -228,3 +228,38 @@ class SystemdAdapter(ServiceAdapter):
 
         print(f"✓ systemd user unit 해제 완료: {unit_path}")
         return 0
+
+    def migrate(self) -> int:
+        unit_path = self._unit_path()
+        if not unit_path.exists():
+            return self.install()
+        try:
+            original = unit_path.read_bytes()
+        except OSError as error:
+            print(f"기존 unit 백업 실패: {error}")
+            return 1
+        try:
+            stopped = subprocess.run(
+                ["systemctl", "--user", "disable", "--now", UNIT_NAME],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            print("기존 unit 중지 실패: systemctl을 찾을 수 없습니다.")
+            return 1
+        if stopped.returncode != 0:
+            print(f"기존 unit 중지 실패: {stopped.stderr.strip()}")
+            return 1
+        installed = self.install()
+        status = self.inspect() if installed == 0 else None
+        if installed == 0 and status is not None and status.registered is True and status.running is True:
+            return 0
+        unit_path.write_bytes(original)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", UNIT_NAME],
+            capture_output=True,
+            text=True,
+        )
+        print("관리형 서비스 검증 실패. 기존 unit을 복구했습니다.")
+        return 1

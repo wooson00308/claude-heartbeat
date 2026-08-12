@@ -8,13 +8,13 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
 from heartbeat.agent_contract import AgentConfiguration
 
-AGENT_SCHEMA_VERSION = 3
+AGENT_SCHEMA_VERSION = 5
 DEFAULT_AGENT_DB = Path.home() / ".claude" / "heartbeat" / "agent-runtime.sqlite3"
 ACTIVE_RUN_STATES = frozenset({"reserved", "queued", "running", "paused"})
 ESTIMATED_MEMORY_PER_AGENT_BYTES = 1536 * 1024 * 1024
@@ -116,6 +116,7 @@ class AgentStore:
 
     @staticmethod
     def _initialize(connection: sqlite3.Connection) -> None:
+        previous_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS agent_configurations (
@@ -162,9 +163,123 @@ class AgentStore:
                 process_identity TEXT,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_automation (
+                automation_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                next_check_at TEXT,
+                last_check_at TEXT,
+                last_result TEXT,
+                last_assigned_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(project_id, role)
+            );
+            CREATE TABLE IF NOT EXISTS agent_watcher_state (
+                project_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                last_event_at TEXT,
+                error TEXT,
+                updated_at TEXT NOT NULL
+            );
             """
         )
+        if previous_version < 4:
+            AgentStore._migrate_codex_model_alias(connection)
+        if previous_version < 5:
+            AgentStore._migrate_automation_intents(connection)
         connection.execute(f"PRAGMA user_version={AGENT_SCHEMA_VERSION}")
+
+    @staticmethod
+    def _migrate_codex_model_alias(connection: sqlite3.Connection) -> None:
+        """Correct only the ChatGPT Codex alias that the CLI does not accept."""
+        rows = connection.execute(
+            "SELECT project_id, configuration_json FROM agent_configurations"
+        ).fetchall()
+        for project_id, payload in rows:
+            try:
+                configuration = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            roles = configuration.get("roles") if isinstance(configuration, dict) else None
+            if not isinstance(roles, dict):
+                continue
+            changed = False
+            for policy in roles.values():
+                if not isinstance(policy, dict):
+                    continue
+                if policy.get("provider") == "codex" and policy.get("model") == "gpt-5.6":
+                    policy["model"] = "gpt-5.6-sol"
+                    changed = True
+            if changed:
+                connection.execute(
+                    "UPDATE agent_configurations SET configuration_json = ?, updated_at = ? WHERE project_id = ?",
+                    (_dump(configuration), utc_now(), project_id),
+                )
+
+    @staticmethod
+    def _migrate_automation_intents(connection: sqlite3.Connection) -> None:
+        """Move only repeat intents out of the execution-plan queue.
+
+        A v4 intent meant that automation was actively running, so those
+        projects become enabled. Projects without one remain opt-in.
+        """
+        rows = connection.execute(
+            "SELECT run_id, project_id, payload_json, created_at FROM agent_queue"
+        ).fetchall()
+        enabled_projects: set[str] = set()
+        migrated_ids: list[str] = []
+        for run_id, project_id, payload_json, created_at in rows:
+            try:
+                payload = json.loads(payload_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(payload, dict) or not payload.get("intentId") or not payload.get("role"):
+                continue
+            intent_id = str(payload["intentId"])
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO agent_automation(
+                    automation_id, project_id, role, payload_json, next_check_at,
+                    last_check_at, last_result, last_assigned_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    intent_id,
+                    project_id,
+                    str(payload["role"]),
+                    _dump({key: value for key, value in payload.items() if key != "planId"}),
+                    payload.get("nextPollAt"),
+                    payload.get("lastCheckAt"),
+                    payload.get("lastResult"),
+                    payload.get("lastAssignedAt"),
+                    created_at,
+                    now,
+                ),
+            )
+            migrated_ids.append(run_id)
+            enabled_projects.add(project_id)
+        connection.executemany(
+            "DELETE FROM agent_queue WHERE run_id = ?", [(run_id,) for run_id in migrated_ids]
+        )
+
+        configurations = connection.execute(
+            "SELECT project_id, configuration_json FROM agent_configurations"
+        ).fetchall()
+        for project_id, configuration_json in configurations:
+            try:
+                configuration = json.loads(configuration_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(configuration, dict):
+                continue
+            configuration["automationEnabled"] = project_id in enabled_projects
+            connection.execute(
+                "UPDATE agent_configurations SET configuration_json = ? WHERE project_id = ?",
+                (_dump(configuration), project_id),
+            )
 
     def save_configuration(self, configuration: AgentConfiguration) -> None:
         """Atomically replace one project and the one device-wide limit."""
@@ -356,73 +471,100 @@ class AgentStore:
 
     def save_intent(self, project_id: str, intent: dict) -> None:
         """Store what a role should keep doing when a slot frees up."""
-        self.save_plan(project_id, {**intent, "planId": intent["intentId"]})
-
-    def activate_intent(self, project_id: str, intent: dict) -> None:
-        """Replace the one repeat instruction for a role with a new activation."""
-        payload = {**intent, "planId": intent["intentId"]}
+        intent_id = intent["intentId"]
+        now = utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                rows = connection.execute(
-                    "SELECT run_id, payload_json FROM agent_queue WHERE project_id = ?",
-                    (project_id,),
-                ).fetchall()
-                replaced = []
-                for run_id, payload_json in rows:
-                    current = json.loads(payload_json)
-                    if current.get("intentId") and current.get("role") == intent.get("role"):
-                        replaced.append((run_id, project_id))
-                connection.executemany(
-                    "DELETE FROM agent_queue WHERE run_id = ? AND project_id = ?",
-                    replaced,
-                )
                 connection.execute(
-                    "INSERT INTO agent_queue(run_id, project_id, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                    (intent["intentId"], project_id, _dump(payload), utc_now()),
+                    """
+                    INSERT INTO agent_automation(
+                        automation_id, project_id, role, payload_json, next_check_at,
+                        last_check_at, last_result, last_assigned_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, role) DO UPDATE SET
+                        automation_id=excluded.automation_id,
+                        payload_json=excluded.payload_json,
+                        next_check_at=excluded.next_check_at,
+                        last_check_at=excluded.last_check_at,
+                        last_result=excluded.last_result,
+                        last_assigned_at=excluded.last_assigned_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        intent_id,
+                        project_id,
+                        intent["role"],
+                        _dump(intent),
+                        intent.get("nextPollAt"),
+                        intent.get("lastCheckAt"),
+                        intent.get("lastResult"),
+                        intent.get("lastAssignedAt"),
+                        now,
+                        now,
+                    ),
                 )
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
 
+    def activate_intent(self, project_id: str, intent: dict) -> None:
+        """Replace the one repeat instruction for a role with a new activation."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "DELETE FROM agent_automation WHERE project_id = ? AND role = ?",
+                    (project_id, intent.get("role")),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        self.save_intent(project_id, intent)
+
     def list_intents(self, project_id: str) -> list[dict]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT payload_json FROM agent_queue WHERE project_id = ? ORDER BY created_at", (project_id,)
+                """
+                SELECT payload_json FROM agent_automation
+                WHERE project_id = ?
+                ORDER BY COALESCE(last_assigned_at, ''), created_at, role
+                """,
+                (project_id,),
             ).fetchall()
-        payloads = [json.loads(row[0]) for row in rows]
-        return [payload for payload in payloads if "intentId" in payload]
+        return [json.loads(row[0]) for row in rows]
 
     def list_all_intents(self) -> list[dict]:
         """Return every persistent repeat instruction, keeping project identity."""
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT project_id, payload_json FROM agent_queue ORDER BY created_at"
+                """
+                SELECT project_id, payload_json FROM agent_automation
+                ORDER BY COALESCE(last_assigned_at, ''), created_at, project_id, role
+                """
             ).fetchall()
-        intents = []
-        for project_id, payload_json in rows:
-            payload = json.loads(payload_json)
-            if "intentId" in payload:
-                intents.append({**payload, "projectId": project_id})
-        return intents
+        return [{**json.loads(payload), "projectId": project_id} for project_id, payload in rows]
 
     def get_intent(self, intent_id: str) -> dict | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT project_id, payload_json FROM agent_queue WHERE run_id = ?",
+                "SELECT project_id, payload_json FROM agent_automation WHERE automation_id = ?",
                 (intent_id,),
             ).fetchone()
         if row is None:
             return None
         payload = json.loads(row[1])
-        return {**payload, "projectId": row[0]} if "intentId" in payload else None
+        return {**payload, "projectId": row[0]}
 
     def drop_intent(self, intent_id: str) -> None:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                connection.execute("DELETE FROM agent_queue WHERE run_id = ?", (intent_id,))
+                connection.execute(
+                    "DELETE FROM agent_automation WHERE automation_id = ?", (intent_id,)
+                )
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")
@@ -435,24 +577,54 @@ class AgentStore:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                rows = connection.execute(
-                    "SELECT run_id, payload_json FROM agent_queue WHERE project_id = ?",
-                    (project_id,),
-                ).fetchall()
-                dropped = []
-                for run_id, payload_json in rows:
-                    payload = json.loads(payload_json)
-                    if payload.get("intentId") and payload.get("role") in roles:
-                        dropped.append((run_id, project_id))
-                connection.executemany(
-                    "DELETE FROM agent_queue WHERE run_id = ? AND project_id = ?",
-                    dropped,
+                placeholders = ",".join("?" for _ in roles)
+                cursor = connection.execute(
+                    f"DELETE FROM agent_automation WHERE project_id = ? AND role IN ({placeholders})",
+                    (project_id, *sorted(roles)),
                 )
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
-        return len(dropped)
+        return cursor.rowcount
+
+    def mark_automations_due(self, project_id: str) -> None:
+        """Wake every participating role after a debounced workflow change."""
+        for intent in self.list_intents(project_id):
+            intent["nextPollAt"] = utc_now()
+            self.save_intent(project_id, intent)
+
+    def save_watcher_state(
+        self,
+        project_id: str,
+        status: str,
+        *,
+        last_event_at: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_watcher_state(project_id, status, last_event_at, error, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    status=excluded.status,
+                    last_event_at=COALESCE(excluded.last_event_at, agent_watcher_state.last_event_at),
+                    error=excluded.error,
+                    updated_at=excluded.updated_at
+                """,
+                (project_id, status, last_event_at, error, utc_now()),
+            )
+
+    def watcher_state(self, project_id: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status, last_event_at, error, updated_at FROM agent_watcher_state WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"status": row[0], "lastEventAt": row[1], "error": row[2], "updatedAt": row[3]}
 
     def get_dispatcher(self) -> dict | None:
         """Read the one device-wide repeat dispatcher process identity."""
@@ -528,6 +700,63 @@ class AgentStore:
         with self._connection() as connection:
             row = connection.execute("SELECT details_json FROM agent_runs WHERE run_id = ?", (run_id,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def delete_run(self, run_id: str) -> None:
+        """Remove a transient row that never became an execution."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("DELETE FROM agent_events WHERE run_id = ?", (run_id,))
+                connection.execute("DELETE FROM agent_errors WHERE run_id = ?", (run_id,))
+                connection.execute("DELETE FROM agent_runs WHERE run_id = ?", (run_id,))
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def prune_history(self, project_id: str, retention_days: int) -> dict[str, int]:
+        """Apply the configured retention to terminal history and diagnostics."""
+        threshold = (datetime.now(UTC) - timedelta(days=retention_days)).replace(
+            microsecond=0
+        ).isoformat().replace("+00:00", "Z")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                terminal_rows = connection.execute(
+                    """
+                    SELECT run_id FROM agent_runs
+                    WHERE project_id = ? AND state NOT IN ('reserved','queued','running','paused')
+                      AND updated_at < ?
+                    """,
+                    (project_id, threshold),
+                ).fetchall()
+                run_ids = [row[0] for row in terminal_rows]
+                if run_ids:
+                    placeholders = ",".join("?" for _ in run_ids)
+                    events = connection.execute(
+                        f"DELETE FROM agent_events WHERE run_id IN ({placeholders})", run_ids
+                    ).rowcount
+                    errors = connection.execute(
+                        f"DELETE FROM agent_errors WHERE run_id IN ({placeholders})", run_ids
+                    ).rowcount
+                    runs = connection.execute(
+                        f"DELETE FROM agent_runs WHERE run_id IN ({placeholders})", run_ids
+                    ).rowcount
+                else:
+                    events = errors = runs = 0
+                events += connection.execute(
+                    "DELETE FROM agent_events WHERE project_id = ? AND created_at < ?",
+                    (project_id, threshold),
+                ).rowcount
+                errors += connection.execute(
+                    "DELETE FROM agent_errors WHERE project_id = ? AND created_at < ?",
+                    (project_id, threshold),
+                ).rowcount
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return {"runs": runs, "events": events, "errors": errors}
 
     def attach_supervisor(self, run_id: str, pid: int, identity: str | None) -> bool:
         """Attach the detached worker without overwriting a run it already advanced."""
@@ -630,7 +859,8 @@ class AgentStore:
                 "SELECT payload_json FROM agent_queue WHERE project_id = ? ORDER BY created_at", (project_id,)
             ).fetchall()
             runs = connection.execute(
-                "SELECT details_json FROM agent_runs WHERE project_id = ? ORDER BY updated_at DESC", (project_id,)
+                "SELECT details_json, updated_at FROM agent_runs WHERE project_id = ? ORDER BY updated_at DESC",
+                (project_id,),
             ).fetchall()
             errors = connection.execute(
                 "SELECT error_json FROM agent_errors WHERE project_id = ? ORDER BY created_at DESC", (project_id,)
@@ -638,9 +868,42 @@ class AgentStore:
         stored_configuration = json.loads(configuration[0]) if configuration else None
         if stored_configuration is not None:
             stored_configuration["deviceMaxParallel"] = self.device_limit()
+        run_values = [_run_for_state(row[0], row[1]) for row in runs]
+        active_roles = {
+            run.get("role")
+            for run in run_values
+            if run.get("state") in ACTIVE_RUN_STATES
+        }
+        watcher = self.watcher_state(project_id)
+        automation_roles = []
+        for intent in self.list_intents(project_id):
+            result = intent.get("lastResult")
+            if intent.get("role") in active_roles:
+                status = "running"
+            elif result in {"no-target", "no_target", "waiting", None}:
+                status = "waiting" if result in {"no-target", "no_target"} else "watching"
+            elif result == "running":
+                status = "watching"
+            else:
+                status = "attention"
+            automation_roles.append({**intent, "status": status})
         return {
             "configuration": stored_configuration,
             "queue": [json.loads(row[0]) for row in queue],
-            "runs": [json.loads(row[0]) for row in runs],
+            "automation": {
+                "enabled": bool(stored_configuration and stored_configuration.get("automationEnabled")),
+                "roles": automation_roles,
+                "watcher": watcher,
+                "dispatcher": self.get_dispatcher(),
+            },
+            "runs": run_values,
             "errors": [json.loads(row[0]) for row in errors],
         }
+
+
+def _run_for_state(payload: str, updated_at: str) -> dict:
+    """Expose a stable finish time without rewriting historical run rows."""
+    run = json.loads(payload)
+    if run.get("state") not in ACTIVE_RUN_STATES and not run.get("finishedAt"):
+        run["finishedAt"] = updated_at
+    return run

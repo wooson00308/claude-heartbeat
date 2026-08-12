@@ -16,14 +16,18 @@ from heartbeat import agent_dispatch
 from heartbeat.agent_contract import default_configuration, validate_configuration
 from heartbeat.agent_dispatch import (
     RoleSlots,
+    WorkflowChangeWatcher,
     WorkflowHelpers,
     build_plan,
     start_one_run,
+    stop_continuous_dispatcher_for_service,
     tick_all_projects,
     tick_project,
 )
 from heartbeat.agent_store import AgentStore
-from heartbeat.providers.process import CliProvider, NormalizedLine, ProviderDiagnostic
+from heartbeat.providers.process import (
+    CliProvider, NormalizedLine, ProviderDiagnostic, ProviderModel, ProviderModelCatalog,
+)
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the fake helpers are POSIX shell scripts")
 
@@ -68,6 +72,9 @@ print(json.dumps({"type": "progress"}), flush=True)
 if os.environ.get("PROVIDER_MODE") == "slow":
     while True:
         time.sleep(0.05)
+if os.environ.get("PROVIDER_MODE") == "fail":
+    print(json.dumps({"type": "failure", "message": "selected model is unavailable"}), flush=True)
+    raise SystemExit(1)
 print(json.dumps({"type": "done"}), flush=True)
 """
 
@@ -93,6 +100,11 @@ class FixtureProvider(CliProvider):
             return (NormalizedLine("progress", raw_id="fixture"),)
         if value.get("type") == "done":
             return (NormalizedLine("completed", raw_id="fixture"),)
+        if value.get("type") == "failure":
+            message = value.get("message")
+            return (NormalizedLine(
+                "failed", raw_id="fixture", detail=message if isinstance(message, str) else None, status="failed",
+            ),)
         return ()
 
     def _diagnose(self, environment, *, billing_route_acknowledged):  # type: ignore[no-untyped-def]
@@ -150,6 +162,10 @@ def provider_factory(fixture_script: Path, tmp_path: Path, monkeypatch):  # type
 def configure(store: AgentStore, root: Path, project_id: str, **overrides) -> object:  # type: ignore[no-untyped-def]
     data = default_configuration(project_id, str(root)).to_dict()
     data.update(overrides)
+    if "automationEnabled" not in overrides and any(
+        role.get("executionMode") == "continuous" for role in data["roles"].values()
+    ):
+        data["automationEnabled"] = True
     configuration = validate_configuration(data)
     store.save_configuration(configuration)
     return configuration
@@ -213,6 +229,350 @@ def test_started_runs_stop_at_the_smallest_limit(tmp_path: Path, provider_factor
     assert [row["state"] for row in rows] == ["running", "running", "failed"]
     assert rows[-1]["failureStage"] == "reservation"
     assert len(store.list_runs("project-one", states=frozenset({"running"}))) == 2
+
+
+@pytest.mark.parametrize(
+    ("model", "catalog", "expected_status", "expected_granted", "expected_excluded"),
+    [
+        (None, ProviderModelCatalog("available", (ProviderModel("gpt-sol", "Sol"),)), "default", 1, []),
+        ("gpt-sol", ProviderModelCatalog("available", (ProviderModel("gpt-sol", "Sol"),)), "available", 1, []),
+        ("gpt-old", ProviderModelCatalog("available", (ProviderModel("gpt-sol", "Sol"),)), "unavailable", 0, ["model_unavailable"]),
+        ("custom", ProviderModelCatalog("unverified", (ProviderModel("opus", "Opus"),)), "unverified", 1, []),
+        ("gpt-sol", ProviderModelCatalog("unavailable"), "unverified", 1, []),
+    ],
+)
+def test_plan_checks_models_before_reservation_without_blocking_unverified_choices(
+    tmp_path: Path,
+    model: str | None,
+    catalog: ProviderModelCatalog,
+    expected_status: str,
+    expected_granted: int,
+    expected_excluded: list[str],
+) -> None:
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    data = default_configuration("project-one", str(root)).to_dict()
+    data["roles"]["developer"]["provider"] = "codex"
+    data["roles"]["developer"]["model"] = model
+    configuration = validate_configuration(data)
+    store.save_configuration(configuration)
+
+    class CatalogProvider(FixtureProvider):
+        def diagnose(self, *, environment=None):  # type: ignore[no-untyped-def]
+            return ProviderDiagnostic("codex", "ready", self.executable, version="1.0", model_catalog=catalog)
+
+    plan = build_plan(
+        store, configuration, [RoleSlots(role="developer", slots=1)],
+        helpers=WorkflowHelpers(root),
+        provider_factory=lambda _name: CatalogProvider(root / "fixture.py"),
+    )
+
+    assert plan["roles"][0]["diagnostic"]["modelStatus"] == expected_status
+    assert plan["roles"][0]["granted"] == expected_granted
+    assert plan["roles"][0]["excluded"] == expected_excluded
+    assert reserve_calls(root) == 0
+
+
+def test_unavailable_model_stops_direct_and_repeat_starts_before_reservation(tmp_path: Path) -> None:
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    data = default_configuration("project-one", str(root)).to_dict()
+    data["roles"]["developer"].update({
+        "provider": "codex", "model": "gpt-old", "executionMode": "continuous",
+    })
+    data["automationEnabled"] = True
+    configuration = validate_configuration(data)
+    store.save_configuration(configuration)
+    catalog = ProviderModelCatalog("available", (ProviderModel("gpt-sol", "Sol"),))
+
+    class CatalogProvider(FixtureProvider):
+        def diagnose(self, *, environment=None):  # type: ignore[no-untyped-def]
+            return ProviderDiagnostic("codex", "ready", self.executable, version="1.0", model_catalog=catalog)
+
+    def provider_factory(_name: str) -> CatalogProvider:
+        return CatalogProvider(root / "fixture.py")
+
+    direct = start_one_run(
+        store, configuration, "developer", helpers=WorkflowHelpers(root), provider_factory=provider_factory,
+    )
+    store.save_intent("project-one", {
+        "intentId": "repeat", "role": "developer", "mode": "auto", "manualTargets": [],
+    })
+    repeated = tick_project(
+        store, "project-one", helpers_factory=WorkflowHelpers, provider_factory=provider_factory,
+    )
+
+    assert (direct["state"], direct["failureStage"], direct["reason"]) == (
+        "failed", "request_validation", "model_unavailable",
+    )
+    assert repeated.started == 0
+    assert repeated.failures == ["model_unavailable"]
+    assert store.list_intents("project-one") == []
+    assert reserve_calls(root) == 0
+
+
+def test_no_target_is_idle_without_run_error_lease_quota_or_provider(tmp_path: Path) -> None:
+    root = make_project(tmp_path)
+    (root / ".workflow" / "rules" / "wf-eligible.sh").write_text(
+        "#!/bin/sh\nprintf '%s\\n' '{\"schemaVersion\":1,\"role\":\"developer\",\"targetId\":null,\"targetKind\":null,\"candidates\":[],\"verdict\":\"no-target\"}'\nexit 1\n",
+        encoding="utf-8",
+    )
+    store = store_at(tmp_path)
+    configuration = configure(store, root, "project-one")
+    provider_calls = 0
+
+    def provider_factory(_name: str):  # type: ignore[no-untyped-def]
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("provider must not be touched while idle")
+
+    plan = build_plan(
+        store,
+        configuration,
+        [RoleSlots(role="developer", slots=1)],
+        helpers=WorkflowHelpers(root),
+        provider_factory=provider_factory,
+    )
+    result = start_one_run(
+        store,
+        configuration,
+        "developer",
+        helpers=WorkflowHelpers(root),
+        provider_factory=provider_factory,
+    )
+
+    assert plan["roles"][0]["granted"] == 0
+    assert plan["roles"][0]["excluded"] == ["no-target"]
+    assert (result["state"], result["reason"]) == ("idle", "no-target")
+    assert store.list_runs("project-one") == []
+    assert store.get_state("project-one")["errors"] == []
+    assert reserve_calls(root) == 0
+    assert provider_calls == 0
+
+
+def test_workflow_watcher_debounces_changes_and_persists_degraded_fallback(
+    tmp_path: Path, monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configuration = configure(store, root, "project-one")
+    clock = [10.0]
+    scheduled = []
+
+    class FakeObserver:
+        def schedule(self, handler, path, *, recursive):  # type: ignore[no-untyped-def]
+            scheduled.append((handler, path, recursive))
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def join(self, *, timeout):  # type: ignore[no-untyped-def]
+            del timeout
+
+    monkeypatch.setattr(agent_dispatch, "Observer", FakeObserver)
+    monkeypatch.setattr(agent_dispatch.time, "monotonic", lambda: clock[0])
+    watcher = WorkflowChangeWatcher(store, debounce_seconds=0.5)
+    watcher.refresh([configuration])
+
+    assert watcher.status == "watching"
+    assert scheduled[0][1] == str(root / ".workflow")
+    scheduled[0][0].on_any_event(type("Event", (), {"is_directory": False})())
+    clock[0] = 10.49
+    assert watcher.ready_projects() == []
+    clock[0] = 10.5
+    assert watcher.ready_projects() == ["project-one"]
+    assert store.get_state("project-one")["automation"]["watcher"]["status"] == "watching"
+    watcher.stop()
+    assert store.get_state("project-one")["automation"]["watcher"]["status"] == "stopped"
+
+    class BrokenObserver(FakeObserver):
+        def start(self) -> None:
+            raise OSError("watch unavailable")
+
+    monkeypatch.setattr(agent_dispatch, "Observer", BrokenObserver)
+    degraded = WorkflowChangeWatcher(store)
+    degraded.refresh([configuration])
+    watcher_state = store.get_state("project-one")["automation"]["watcher"]
+    assert degraded.status == "degraded"
+    assert watcher_state["status"] == "degraded"
+    assert watcher_state["error"] == "OSError"
+
+
+def test_service_handoff_terminates_only_the_exact_dispatcher_identity(monkeypatch) -> None:
+    released = []
+    terminated = []
+
+    class Store:
+        def get_dispatcher(self):  # type: ignore[no-untyped-def]
+            return {"pid": 4242, "processIdentity": "created-at"}
+
+        def release_dispatcher(self, pid, identity):  # type: ignore[no-untyped-def]
+            released.append((pid, identity))
+            return True
+
+    class Process:
+        def terminate(self) -> None:
+            terminated.append(True)
+
+        def wait(self, *, timeout):  # type: ignore[no-untyped-def]
+            assert timeout == 5.0
+
+    monkeypatch.setattr(
+        agent_dispatch,
+        "observe_process",
+        lambda pid: type("Observation", (), {
+            "liveness": "running", "identity": "created-at",
+        })(),
+    )
+    monkeypatch.setattr(agent_dispatch.psutil, "Process", lambda pid: Process())
+
+    assert stop_continuous_dispatcher_for_service(Store()) == "stopped"  # type: ignore[arg-type]
+    assert terminated == [True]
+    assert released == [(4242, "created-at")]
+
+
+def test_service_handoff_blocks_when_process_identity_cannot_be_read(monkeypatch) -> None:
+    class Store:
+        def get_dispatcher(self):  # type: ignore[no-untyped-def]
+            return {"pid": 4242, "processIdentity": "created-at"}
+
+        def release_dispatcher(self, pid, identity):  # type: ignore[no-untyped-def]
+            raise AssertionError("an unreadable process must not be released")
+
+    monkeypatch.setattr(
+        agent_dispatch,
+        "observe_process",
+        lambda pid: type("Observation", (), {"liveness": "unknown", "identity": None})(),
+    )
+    monkeypatch.setattr(
+        agent_dispatch.psutil,
+        "Process",
+        lambda pid: (_ for _ in ()).throw(AssertionError("must not terminate")),
+    )
+
+    assert stop_continuous_dispatcher_for_service(Store()) == "blocked"  # type: ignore[arg-type]
+
+
+def test_service_restart_reclaims_a_stale_dispatcher_row(monkeypatch) -> None:
+    released = []
+    claimed = []
+
+    class Store:
+        def get_dispatcher(self):  # type: ignore[no-untyped-def]
+            return {"pid": 4100, "processIdentity": "old-created-at"}
+
+        def release_dispatcher(self, pid, identity):  # type: ignore[no-untyped-def]
+            released.append((pid, identity))
+            return True
+
+        def claim_dispatcher(self, pid, identity):  # type: ignore[no-untyped-def]
+            claimed.append((pid, identity))
+            return True
+
+    monkeypatch.setattr(
+        agent_dispatch,
+        "observe_process",
+        lambda pid: type("Observation", (), {"liveness": "gone", "identity": None})(),
+    )
+
+    assert agent_dispatch._claim_dispatcher_process(Store(), 4200, "new-created-at") is True
+    assert released == [(4100, "old-created-at")]
+    assert claimed == [(4200, "new-created-at")]
+
+
+def test_service_restart_never_replaces_a_live_dispatcher(monkeypatch) -> None:
+    class Store:
+        def get_dispatcher(self):  # type: ignore[no-untyped-def]
+            return {"pid": 4100, "processIdentity": "created-at"}
+
+        def release_dispatcher(self, pid, identity):  # type: ignore[no-untyped-def]
+            raise AssertionError("a live dispatcher must not be released")
+
+        def claim_dispatcher(self, pid, identity):  # type: ignore[no-untyped-def]
+            raise AssertionError("a second dispatcher must not claim")
+
+    monkeypatch.setattr(
+        agent_dispatch,
+        "observe_process",
+        lambda pid: type("Observation", (), {
+            "liveness": "running", "identity": "created-at",
+        })(),
+    )
+
+    assert agent_dispatch._claim_dispatcher_process(Store(), 4200, "new-created-at") is False
+
+
+def test_role_fairness_assigns_the_least_recently_served_role_first(
+    tmp_path: Path, monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    data = default_configuration("project-one", str(root)).to_dict()
+    data["automationEnabled"] = True
+    data["projectMaxParallel"] = 1
+    for policy in data["roles"].values():
+        policy["executionMode"] = "continuous"
+        policy["pollIntervalSeconds"] = 300
+    configuration = validate_configuration(data)
+    store.save_configuration(configuration)
+    assigned_at = {
+        "planner": "2026-08-11T09:00:00Z",
+        "architect": "2026-08-11T08:00:00Z",
+        "developer": "2026-08-11T07:00:00Z",
+    }
+    for role, last_assigned_at in assigned_at.items():
+        store.save_intent("project-one", {
+            "intentId": f"auto-{role}", "role": role, "mode": "auto", "manualTargets": [],
+            "nextPollAt": "2026-08-11T06:00:00Z", "lastAssignedAt": last_assigned_at,
+        })
+    started: list[str] = []
+
+    def fake_start(store_arg, configuration_arg, role, **kwargs):  # type: ignore[no-untyped-def]
+        del configuration_arg, kwargs
+        started.append(role)
+        row = {
+            "runId": f"run-{role}", "projectId": "project-one", "role": role,
+            "provider": "claude", "state": "running", "targetId": f"TASK-{role}",
+            "startedAt": "2026-08-11T10:00:00Z", "finishedAt": None,
+        }
+        store_arg.save_run(row)
+        return row
+
+    monkeypatch.setattr(agent_dispatch, "start_one_run", fake_start)
+    report = tick_project(
+        store,
+        "project-one",
+        now=datetime(2026, 8, 11, 10, 0, tzinfo=UTC),
+    )
+
+    assert report.started == 1
+    assert started == ["developer"]
+
+
+def test_lost_manual_target_is_a_start_refusal_without_execution_history(tmp_path: Path) -> None:
+    root = make_project(tmp_path)
+    (root / ".workflow" / "rules" / "wf-eligible.sh").write_text(
+        "#!/bin/sh\nprintf '%s\\n' '{\"schemaVersion\":1,\"role\":\"developer\",\"targetId\":\"TASK-A\",\"targetKind\":null,\"candidates\":[{\"id\":\"TASK-A\",\"reason\":\"eligible\"}],\"verdict\":\"eligible\"}'\nexit 0\n",
+        encoding="utf-8",
+    )
+    store = store_at(tmp_path)
+    configuration = configure(store, root, "project-one")
+
+    result = start_one_run(
+        store,
+        configuration,
+        "developer",
+        helpers=WorkflowHelpers(root),
+        manual_targets=("TASK-B",),
+    )
+
+    assert (result["state"], result["reason"]) == ("not_started", "manual_target_unavailable")
+    assert store.list_runs("project-one") == []
+    assert store.get_state("project-one")["errors"] == []
+    assert reserve_calls(root) == 0
 
 
 def test_reservation_exit_codes_become_distinct_failure_stages(tmp_path: Path, provider_factory) -> None:  # type: ignore[no-untyped-def]
@@ -500,6 +860,27 @@ def test_role_prompt_reaches_stdin_but_never_the_database_or_events(
     assert secret not in json.dumps(recorded)
     assert secret.encode() not in (tmp_path / "agent.sqlite3").read_bytes()
     assert secret not in Path(row["eventPath"]).read_text(encoding="utf-8")
+
+
+def test_terminal_provider_failure_keeps_stage_and_safe_reason(
+    tmp_path: Path, provider_factory, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configuration = configure(store, root, "project-one")
+    monkeypatch.setenv("PROVIDER_MODE", "fail")
+
+    row = start_slots(store, configuration, root, provider_factory)[0]
+    wait_for_text(Path(row["eventPath"]), "selected model is unavailable")
+    result = agent_dispatch.reconcile_run(
+        store, dict(row), helpers=WorkflowHelpers(root), provider_factory=provider_factory,
+    )
+
+    assert (result["state"], result["failureStage"], result["reason"]) == (
+        "failed", "role_session", "selected model is unavailable",
+    )
+    assert result["finishedAt"] is not None
+    assert store.get_state("project-one")["errors"][-1]["stage"] == "role_session"
 
 
 def test_a_failing_agent_store_never_stops_the_heartbeat_loop(monkeypatch) -> None:  # type: ignore[no-untyped-def]
