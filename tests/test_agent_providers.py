@@ -177,7 +177,7 @@ def test_codex_command_is_json_exec_and_keeps_prompt_off_command_line(tmp_path: 
     command = CodexProvider(executable="fake-codex").command(value)
 
     assert command == [
-        "fake-codex", "exec", "--json", "--sandbox", "workspace-write", "-C", str(tmp_path), "-",
+        "fake-codex", "exec", "--json", "--skip-git-repo-check", "--sandbox", "workspace-write", "-C", str(tmp_path), "-",
     ]
     assert value.prompt not in command
     assert CodexProvider(executable="fake-codex").command(

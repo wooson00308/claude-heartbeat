@@ -21,10 +21,16 @@ class CodexProvider(CliProvider):
     executable = "codex"
 
     def command(self, request: ProviderExecutionRequest) -> list[str]:
+        # A non-developer's project folder is not a git repository, and codex
+        # refuses to run there without this flag ("Not inside a trusted
+        # directory", observed 2026-08-13). The undo-safety that check wants is
+        # not available on such machines at all — git may not even be
+        # installed — while file protection stays with the sandbox setting.
         command = [
             self.executable,
             "exec",
             "--json",
+            "--skip-git-repo-check",
             "--sandbox",
             "workspace-write",
             "-C",
