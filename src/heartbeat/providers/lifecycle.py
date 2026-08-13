@@ -170,9 +170,15 @@ def start_reserved_run(
 
     started = provider.start(request, environment=environment, cancel_event=cancel_event)
     if isinstance(started, ProviderStartFailure):
+        # 진단 실패의 사유는 단계 이름이 아니라 진단 상태다. detail이 그 상태를 담고 있으므로
+        # 계획 조회의 제외 사유와 같은 provider_ 접두 코드로 남긴다. 화면은 이 코드로 사용자가
+        # 할 다음 행동(설치·로그인·업데이트)을 말할 수 있다.
+        reason = started.stage
+        if started.stage == "diagnostic" and started.detail:
+            reason = f"provider_{started.detail}"
         return LifecycleFailure(
             stage="provider_start",
-            reason=started.stage,
+            reason=reason,
             start_failure=started,
         )
     if not _matches(reservation, started.role, started.target_id, started.lease_id):

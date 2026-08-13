@@ -236,7 +236,9 @@ def test_started_runs_stop_at_the_smallest_limit(tmp_path: Path, provider_factor
     [
         (None, ProviderModelCatalog("available", (ProviderModel("gpt-sol", "Sol"),)), "default", 1, []),
         ("gpt-sol", ProviderModelCatalog("available", (ProviderModel("gpt-sol", "Sol"),)), "available", 1, []),
-        ("gpt-old", ProviderModelCatalog("available", (ProviderModel("gpt-sol", "Sol"),)), "unavailable", 0, ["model_unavailable"]),
+        # 계정 목록에서 사라진 모델은 계획을 막지 않는다. 실행이 기본 모델로 대체하므로
+        # 진단의 modelStatus만 사실을 나른다.
+        ("gpt-old", ProviderModelCatalog("available", (ProviderModel("gpt-sol", "Sol"),)), "unavailable", 1, []),
         ("custom", ProviderModelCatalog("unverified", (ProviderModel("opus", "Opus"),)), "unverified", 1, []),
         ("gpt-sol", ProviderModelCatalog("unavailable"), "unverified", 1, []),
     ],
@@ -273,7 +275,7 @@ def test_plan_checks_models_before_reservation_without_blocking_unverified_choic
     assert reserve_calls(root) == 0
 
 
-def test_unavailable_model_stops_direct_and_repeat_starts_before_reservation(tmp_path: Path) -> None:
+def test_a_vanished_model_falls_back_to_the_cli_default_and_still_starts(tmp_path: Path) -> None:
     root = make_project(tmp_path)
     store = store_at(tmp_path)
     data = default_configuration("project-one", str(root)).to_dict()
@@ -295,20 +297,11 @@ def test_unavailable_model_stops_direct_and_repeat_starts_before_reservation(tmp
     direct = start_one_run(
         store, configuration, "developer", helpers=WorkflowHelpers(root), provider_factory=provider_factory,
     )
-    store.save_intent("project-one", {
-        "intentId": "repeat", "role": "developer", "mode": "auto", "manualTargets": [],
-    })
-    repeated = tick_project(
-        store, "project-one", helpers_factory=WorkflowHelpers, provider_factory=provider_factory,
-    )
 
-    assert (direct["state"], direct["failureStage"], direct["reason"]) == (
-        "failed", "request_validation", "model_unavailable",
-    )
-    assert repeated.started == 0
-    assert repeated.failures == ["model_unavailable"]
-    assert store.list_intents("project-one") == []
-    assert reserve_calls(root) == 0
+    assert direct["state"] == "running"
+    assert direct["requestedModel"] == "gpt-old"
+    assert direct["modelFallback"] is True
+    assert reserve_calls(root) == 1
 
 
 def test_no_target_is_idle_without_run_error_lease_quota_or_provider(tmp_path: Path) -> None:

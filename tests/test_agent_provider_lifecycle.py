@@ -257,7 +257,7 @@ def test_start_success_is_not_role_success_and_the_failing_stages_stay_apart(
     conclusion = conclude_run(role_provider, started)
 
     assert isinstance(diagnostic, LifecycleFailure)
-    assert (diagnostic.stage, diagnostic.reason) == ("provider_start", "diagnostic")
+    assert (diagnostic.stage, diagnostic.reason) == ("provider_start", "provider_executable_missing")
     assert diagnostic.start_failure is not None
     assert diagnostic.start_failure.diagnostic is not None
     assert diagnostic.start_failure.diagnostic.status == "executable_missing"

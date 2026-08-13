@@ -55,7 +55,7 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{python_dir}</string>
+        <string>{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{python_dir}</string>
         <key>HOME</key>
         <string>{home}</string>
     </dict>
