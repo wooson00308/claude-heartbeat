@@ -164,7 +164,7 @@ def test_claude_command_is_stream_json_and_keeps_prompt_off_command_line(tmp_pat
 
     command = ClaudeProvider(executable="fake-claude").command(value)
 
-    assert command == ["fake-claude", "-p", "--output-format", "stream-json", "--verbose"]
+    assert command == ["fake-claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
     assert value.prompt not in command
     assert ClaudeProvider(executable="fake-claude").command(
         ProviderExecutionRequest(**{**value.__dict__, "model": "sonnet"})
