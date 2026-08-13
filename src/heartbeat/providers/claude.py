@@ -33,7 +33,21 @@ class ClaudeProvider(CliProvider):
     billing_environment_keys = ("ANTHROPIC_API_KEY",)
 
     def command(self, request: ProviderExecutionRequest) -> list[str]:
-        command = [self.executable, "-p", "--output-format", "stream-json", "--verbose"]
+        # A headless run has nobody to answer permission prompts, so without an
+        # explicit policy every edit and command is silently denied — the
+        # session starts, does nothing, and reports empty-handed. That only
+        # went unnoticed on machines whose personal settings auto-approve.
+        # Full permission matches the trust the user already grants the
+        # parallel worker model (codex runs sandboxed full-auto); a managed
+        # per-project allowlist is the planned refinement.
+        command = [
+            self.executable,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+        ]
         if request.model:
             command.extend(["--model", request.model])
         return command
