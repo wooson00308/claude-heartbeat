@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -297,6 +298,10 @@ def apply_update(
 
     failed = [stage for stage in stages if stage.status == "failed"]
     if not failed:
+        keep = {version_dir.name}
+        if runnable:
+            keep.add(str(runnable))
+        _prune_old_versions(install_root, keep)
         return UpdateApplication(plan_id=plan_id, result="success", checked_at=checked_at(),
                                  stages=tuple(stages), runnable_version=switched)
     return UpdateApplication(
@@ -306,6 +311,30 @@ def apply_update(
         recovery_actions=tuple(f"retry_{stage.stage}" for stage in failed),
         detail="the launcher moved but a later stage did not finish",
     )
+
+
+def _prune_old_versions(install_root: Path, keep: set[str]) -> None:
+    """Remove version directories the retention policy no longer needs.
+
+    Every runtime release used to stay on disk forever — about 90MB each — so
+    a user machine grew without bound (observed 2026-08-13: five generations).
+    Only the newly activated version and the one it replaced (the rollback
+    target) remain. This runs only after a fully successful update, and a
+    directory that fails to delete is left for the next update to retry —
+    retention is hygiene, never a reason to fail an update that already worked.
+    """
+    versions_root = install_root / "versions"
+    try:
+        entries = [path for path in versions_root.iterdir() if path.is_dir()]
+    except OSError:
+        return
+    for path in entries:
+        if path.name in keep:
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            continue
 
 
 def _stopped_before_writing(plan_id: str, stages: list[StageResult], runnable: str | None) -> UpdateApplication:

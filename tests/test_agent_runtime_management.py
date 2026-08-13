@@ -409,3 +409,34 @@ def test_the_plan_answers_every_fact_the_app_would_otherwise_parse(device) -> No
     assert described["activeRuns"] == 1 and described["projects"] == ["project-one"]
     assert described["service"]["label"] and described["service"]["executable"]
     assert json.loads(json.dumps(described)) == described
+
+
+def test_a_successful_update_prunes_versions_beyond_current_and_previous(device) -> None:  # type: ignore[no-untyped-def]
+    # 릴리스마다 버전 디렉터리가 영원히 남아 사용자 기기가 한없이 자랐다(2026-08-13 실측 다섯 세대).
+    # 성공한 업데이트만이 청소하고, 방금 활성화한 버전과 그 직전(롤백 대상)은 남는다.
+    status = _service()
+    stale = device["root"] / "versions" / "0.7.0"
+    stale.mkdir(parents=True)
+    (stale / "heartbeat").write_text("old", encoding="utf-8")
+    plan = plan_update(device["root"], device["candidate"], store=device["store"], service_reader=_reader(status))
+
+    applied = apply_update(
+        device["root"], device["candidate"], store=device["store"], plan_id=plan.plan_id, confirmed=True,
+        service_reader=_reader(status), service_restart=lambda: RestartResult("ok", "restarted", "label"),
+    )
+
+    assert applied.result == "success"
+    names = sorted(path.name for path in (device["root"] / "versions").iterdir() if path.is_dir())
+    assert names == ["0.8.0", "0.9.1"]
+
+
+def test_a_refused_update_prunes_nothing(device) -> None:  # type: ignore[no-untyped-def]
+    status = _service()
+    stale = device["root"] / "versions" / "0.7.0"
+    stale.mkdir(parents=True)
+    plan = plan_update(device["root"], device["candidate"], store=device["store"], service_reader=_reader(status))
+
+    apply_update(device["root"], device["candidate"], store=device["store"],
+                 plan_id=plan.plan_id, confirmed=False, service_reader=_reader(status))
+
+    assert stale.is_dir()
