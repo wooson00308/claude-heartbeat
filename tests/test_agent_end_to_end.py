@@ -19,7 +19,12 @@ from pathlib import Path
 import pytest
 import psutil
 
-from heartbeat.agent_contract import contract_description, default_configuration, validate_configuration
+from heartbeat.agent_contract import (
+    REQUIRED_NOTICE_VERSION,
+    contract_description,
+    default_configuration,
+    validate_configuration,
+)
 from heartbeat.agent_dispatch import DispatchFailure, RoleSlots, build_plan, start_one_run
 from heartbeat.agent_store import AgentStore
 from heartbeat.providers.lifecycle import Reservation
@@ -167,6 +172,9 @@ def test_limits_choose_two_targets_and_fake_clis_leave_no_prompt_in_state(
     roles["developer"]["maxParallel"] = 3
     config = configuration(root, "project-one", projectMaxParallel=5, deviceMaxParallel=5, roles=roles)
     store.save_configuration(config)
+    # 실행은 유효한 동의가 있어야 시작한다. 이 시나리오가 확인하는 것은 한도와 예약이므로,
+    # 동의된 프로젝트를 준비해 두고 그 뒤의 판정만 관찰한다.
+    store.save_consent("project-one", REQUIRED_NOTICE_VERSION)
     store.save_run({
         "runId": "foreign", "projectId": "project-two", "role": "planner", "provider": "claude",
         "state": "running", "targetId": "TASK-X", "leaseId": "lease-x",
@@ -190,6 +198,7 @@ def test_migration_lock_and_no_target_start_no_provider(tmp_path: Path) -> None:
     root.mkdir()
     store = AgentStore(tmp_path / "agent.sqlite3")
     config = configuration(root, "project-one")
+    store.save_consent("project-one", REQUIRED_NOTICE_VERSION)
     calls = 0
 
     def forbidden_provider(name: str):  # type: ignore[no-untyped-def]
@@ -218,6 +227,7 @@ def test_competing_dispatchers_start_one_provider_for_one_target(
     root.mkdir()
     store = AgentStore(tmp_path / "agent.sqlite3")
     config = configuration(root, "project-one", projectMaxParallel=4, deviceMaxParallel=4)
+    store.save_consent("project-one", REQUIRED_NOTICE_VERSION)
     helpers = MemoryHelpers(root, ["TASK-SHARED", "TASK-SHARED", "TASK-SHARED", "TASK-SHARED"])
     factory = provider_factory(fixture_script)
     rows: list[dict] = []

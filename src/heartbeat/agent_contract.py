@@ -16,6 +16,11 @@ DEFAULT_ROLE_MAX_PARALLEL = 1
 DEFAULT_POLL_INTERVAL_SECONDS = 300
 DEFAULT_EVENT_RETENTION_DAYS = 30
 ROLES = frozenset({"planner", "architect", "developer"})
+
+# 지금 유효하다고 인정하는 고지 버전의 아래 끝이다. 고지 문구의 의미가 바뀌어 사용자가
+# 다시 읽어야 할 때만 올리고, 맞춤법이나 배치 수정으로는 올리지 않는다. 계약 조회 응답과
+# 동의 확인 처리가 모두 이 상수 하나만 읽으므로 요구 버전이 두 곳에서 갈라지지 않는다.
+REQUIRED_NOTICE_VERSION = 1
 EXECUTION_MODES = frozenset({"once", "continuous"})
 RUN_STATES = frozenset({
     "reserved", "queued", "running", "paused", "succeeded", "failed", "cancelled", "recovery_required",
@@ -31,6 +36,9 @@ AGENT_COMMANDS: tuple[str, ...] = (
     "config.read",
     "config.validate",
     "config.write",
+    "consent.grant",
+    "consent.read",
+    "consent.revoke",
     "contract.read",
     "logs.read",
     "plan.read",
@@ -290,6 +298,7 @@ def contract_description() -> dict[str, Any]:
     return {
         "supportedApiVersions": [API_VERSION],
         "runtimeVersion": __version__,
+        "requiredNoticeVersion": REQUIRED_NOTICE_VERSION,
         "implementedCommands": list(AGENT_COMMANDS),
         "runtimeCommands": list(RUNTIME_COMMANDS),
         "reservedCommands": list(RESERVED_COMMANDS),

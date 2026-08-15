@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from heartbeat.agent_cli import run_agent_command
-from heartbeat.agent_contract import default_configuration
+from heartbeat.agent_contract import REQUIRED_NOTICE_VERSION, default_configuration
 from heartbeat.agent_store import AgentStore
 
 
@@ -207,6 +207,69 @@ def test_start_needs_the_same_plan_and_an_explicit_confirmation(execution_projec
     assert execution_project.store.list_intents("project-one") == []
 
 
+def test_start_without_consent_waits_and_reserves_nothing(execution_project):
+    """동의가 없으면 확인된 계획으로도 시작하지 않고 대기 목록에만 사유가 실린다."""
+    from tests.test_agent_dispatch import reserve_calls
+
+    _, planned = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
+    execution_project.store.delete_consent("project-one")
+
+    exit_code, response = execution_project.call(
+        "run.start", planId=planned["data"]["plan"]["planId"], confirmed=True,
+    )
+
+    data = response["data"]
+    assert exit_code == 0
+    assert response["outcome"] == "success"
+    assert data["started"] == []
+    assert data["failures"] == []
+    assert data["waiting"] == [{"role": "developer", "reason": "execution_consent_required"}]
+    assert execution_project.store.list_runs("project-one") == []
+    assert execution_project.store.get_state("project-one")["errors"] == []
+    assert reserve_calls(execution_project.root) == 0
+
+
+def test_retry_without_consent_answers_its_own_reason_code(execution_project):
+    """동의 부족 재시도는 실행 도구 실패와 구분되는 사유 코드로 돌아온다."""
+    from tests.test_agent_dispatch import reserve_calls
+
+    store = execution_project.store
+    store.save_run({
+        "runId": "run-failed", "projectId": "project-one", "role": "developer", "provider": "claude",
+        "state": "failed", "failureStage": "provider_start", "reason": "provider_not_installed",
+    })
+    store.delete_consent("project-one")
+
+    exit_code, response = execution_project.call("run.retry", runId="run-failed")
+
+    assert exit_code == 1
+    assert response["outcome"] == "failure"
+    assert response["error"]["code"] == "execution_consent_required"
+    assert response["error"]["stage"] == "reservation"
+    assert response["error"]["code"] not in {
+        "provider_not_installed", "login_required", "permission_denied", "no_target", "execution_failed",
+    }
+    assert [row["runId"] for row in store.list_runs("project-one")] == ["run-failed"]
+    assert store.get_state("project-one")["errors"] == []
+    assert reserve_calls(execution_project.root) == 0
+
+
+def test_granting_consent_lets_the_same_start_request_proceed(execution_project):
+    """동의를 남긴 뒤에는 같은 요청이 평소대로 예약과 시작을 진행한다."""
+    _, first = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
+    execution_project.store.delete_consent("project-one")
+    refused = execution_project.call("run.start", planId=first["data"]["plan"]["planId"], confirmed=True)
+
+    execution_project.call("consent.grant", noticeVersion=REQUIRED_NOTICE_VERSION)
+    _, second = execution_project.call("plan.read", roles={"developer": {"slots": 1}})
+    allowed = execution_project.call("run.start", planId=second["data"]["plan"]["planId"], confirmed=True)
+
+    assert refused[1]["data"]["started"] == []
+    assert refused[1]["data"]["waiting"][0]["reason"] == "execution_consent_required"
+    assert allowed[0] == 0
+    assert len(allowed[1]["data"]["started"]) == 1
+
+
 def test_continuous_start_persists_one_role_instruction_and_starts_the_dispatcher(
     execution_project, monkeypatch
 ):
@@ -346,3 +409,124 @@ def test_cancel_previews_before_it_applies(execution_project):
     assert preview[1]["data"]["preview"]["cleanup"] == ["process_termination", "event_close", "lease_release"]
     assert execution_project.store.get_run(run_id)["state"] in {"cancelled", "recovery_required"}
     assert applied[1]["outcome"] in {"success", "partial_success"}
+
+
+def _consent_request(project_id, request_id="consent-1", **fields):
+    return json.dumps({"apiVersion": "1", "requestId": request_id, "projectId": project_id, **fields})
+
+
+def test_consent_read_answers_absent_consent_with_success_not_failure(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+
+    exit_code, response = _invoke("consent.read", _consent_request("project-one"), store)
+
+    assert exit_code == 0
+    assert response["outcome"] == "success"
+    assert response["data"]["consent"] == {
+        "projectId": "project-one",
+        "granted": False,
+        "valid": False,
+        "noticeVersion": None,
+        "grantedAt": None,
+        "requiredNoticeVersion": 1,
+    }
+
+
+def test_consent_grant_succeeds_without_a_stored_configuration_and_stamps_the_time(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+
+    exit_code, response = _invoke(
+        "consent.grant", _consent_request("project-one", noticeVersion=1), store
+    )
+    _, read = _invoke("consent.read", _consent_request("project-one", "consent-2"), store)
+
+    assert exit_code == 0
+    assert store.get_configuration("project-one") is None
+    assert response["data"]["consent"]["granted"] is True
+    assert response["data"]["consent"]["valid"] is True
+    assert response["data"]["consent"]["noticeVersion"] == 1
+    assert response["data"]["consent"]["grantedAt"]
+    # 동의 시각은 실행 환경이 정하므로 요청에는 없던 값이다.
+    assert read["data"]["consent"] == response["data"]["consent"]
+
+
+def test_consent_grant_below_the_required_notice_version_records_nothing(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+
+    exit_code, response = _invoke(
+        "consent.grant", _consent_request("project-one", noticeVersion=0), store
+    )
+    _, read = _invoke("consent.read", _consent_request("project-one", "consent-2"), store)
+
+    assert exit_code == 2
+    assert response["outcome"] == "failure"
+    assert response["error"]["code"] == "consent_notice_outdated"
+    assert store.get_consent("project-one") is None
+    assert read["data"]["consent"]["granted"] is False
+
+
+def test_consent_grant_rejects_a_notice_version_that_is_not_an_integer(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+
+    exit_code, response = _invoke(
+        "consent.grant", _consent_request("project-one", noticeVersion="1"), store
+    )
+
+    assert exit_code == 2
+    assert response["error"]["code"] == "invalid_request"
+    assert store.get_consent("project-one") is None
+
+
+def test_raising_the_required_notice_version_invalidates_without_deleting_the_record(tmp_path, monkeypatch):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+    _invoke("consent.grant", _consent_request("project-one", noticeVersion=1), store)
+
+    # 요구 버전은 계약 모듈 한 곳에만 있다. 동의 명령과 실행 판정이 같은 값을 읽으므로
+    # 여기를 올리면 응답의 valid와 실행이 판정하는 유효가 함께 움직인다.
+    monkeypatch.setattr("heartbeat.agent_contract.REQUIRED_NOTICE_VERSION", 2)
+    exit_code, response = _invoke("consent.read", _consent_request("project-one", "consent-2"), store)
+
+    assert exit_code == 0
+    assert response["data"]["consent"]["granted"] is True
+    assert response["data"]["consent"]["valid"] is False
+    assert response["data"]["consent"]["noticeVersion"] == 1
+    assert response["data"]["consent"]["requiredNoticeVersion"] == 2
+    # 기록 자체는 남아 있어야 한다.
+    assert store.get_consent("project-one")["noticeVersion"] == 1
+
+
+def test_consent_revoke_clears_only_the_named_project(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+    _invoke("consent.grant", _consent_request("project-one", noticeVersion=1), store)
+    _invoke("consent.grant", _consent_request("project-two", "consent-2", noticeVersion=1), store)
+
+    exit_code, response = _invoke("consent.revoke", _consent_request("project-one", "consent-3"), store)
+    _, other = _invoke("consent.read", _consent_request("project-two", "consent-4"), store)
+
+    assert exit_code == 0
+    assert response["data"]["consent"]["granted"] is False
+    assert store.get_consent("project-one") is None
+    assert other["data"]["consent"]["valid"] is True
+
+
+def test_consent_commands_are_reachable_from_the_argparse_boundary(tmp_path, monkeypatch, capsys):
+    """앱은 `heartbeat agent consent …` 프로세스 경계로만 들어온다.
+
+    핸들러와 계약 목록에만 있고 argparse 배선이 빠지면, 앱은 봉투 대신 usage 오류를
+    받는다. 그 사고는 핸들러 단위 검사로는 잡히지 않으므로 경계에서 고정한다.
+    """
+    import sys
+
+    from heartbeat import cli
+
+    monkeypatch.setenv("HEARTBEAT_AGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["heartbeat", "agent", "consent", "read"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(_consent_request("project-one")))
+
+    with pytest.raises(SystemExit) as outcome:
+        cli.main()
+
+    assert outcome.value.code == 0
+    envelope = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+    assert envelope["command"] == "consent.read"
+    assert envelope["data"]["consent"]["granted"] is False

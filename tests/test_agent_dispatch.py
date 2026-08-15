@@ -13,12 +13,19 @@ from pathlib import Path
 import pytest
 
 from heartbeat import agent_dispatch
-from heartbeat.agent_contract import default_configuration, validate_configuration
+from heartbeat.agent_contract import (
+    REQUIRED_NOTICE_VERSION,
+    default_configuration,
+    validate_configuration,
+)
 from heartbeat.agent_dispatch import (
+    EXECUTION_CONSENT_REQUIRED,
     RoleSlots,
     WorkflowChangeWatcher,
     WorkflowHelpers,
     build_plan,
+    queue_one_run,
+    serve_queued_run,
     start_one_run,
     stop_continuous_dispatcher_for_service,
     tick_all_projects,
@@ -159,7 +166,13 @@ def provider_factory(fixture_script: Path, tmp_path: Path, monkeypatch):  # type
     return lambda name: FixtureProvider(fixture_script)
 
 
-def configure(store: AgentStore, root: Path, project_id: str, **overrides) -> object:  # type: ignore[no-untyped-def]
+def configure(store: AgentStore, root: Path, project_id: str, consent: bool = True, **overrides) -> object:  # type: ignore[no-untyped-def]
+    """Configure one project, consented by default.
+
+    실행은 유효한 동의가 있어야 시작한다. 설정만 있고 동의가 없는 상태는 사용자가 아직
+    고지를 읽지 않은 프로젝트라는 별도의 사례이므로, 그 사례를 다루는 검사만 consent를
+    끄고 나머지는 평소의 동의된 프로젝트를 쓴다.
+    """
     data = default_configuration(project_id, str(root)).to_dict()
     data.update(overrides)
     if "automationEnabled" not in overrides and any(
@@ -168,6 +181,8 @@ def configure(store: AgentStore, root: Path, project_id: str, **overrides) -> ob
         data["automationEnabled"] = True
     configuration = validate_configuration(data)
     store.save_configuration(configuration)
+    if consent:
+        store.save_consent(project_id, REQUIRED_NOTICE_VERSION)
     return configuration
 
 
@@ -285,6 +300,7 @@ def test_a_vanished_model_falls_back_to_the_cli_default_and_still_starts(tmp_pat
     data["automationEnabled"] = True
     configuration = validate_configuration(data)
     store.save_configuration(configuration)
+    store.save_consent("project-one", REQUIRED_NOTICE_VERSION)
     catalog = ProviderModelCatalog("available", (ProviderModel("gpt-sol", "Sol"),))
 
     class CatalogProvider(FixtureProvider):
@@ -511,6 +527,7 @@ def test_role_fairness_assigns_the_least_recently_served_role_first(
         policy["pollIntervalSeconds"] = 300
     configuration = validate_configuration(data)
     store.save_configuration(configuration)
+    store.save_consent("project-one", REQUIRED_NOTICE_VERSION)
     assigned_at = {
         "planner": "2026-08-11T09:00:00Z",
         "architect": "2026-08-11T08:00:00Z",
@@ -653,6 +670,134 @@ def test_paused_project_blocks_new_assignment_only(tmp_path: Path, provider_fact
     assert reports["project-one"].started == 0
     assert reports["project-two"].started >= 1
     assert store.get_run(running["runId"])["state"] in {"running", "succeeded"}
+
+
+@pytest.mark.parametrize(
+    ("grant_notice_version", "revoke"),
+    [
+        (None, False),   # 동의를 남긴 적이 없는 프로젝트
+        (1, True),       # 동의를 남겼다가 철회한 프로젝트
+        (1, False),      # 요구 고지 버전이 올라 기존 동의가 무효가 된 프로젝트
+    ],
+)
+def test_automatic_assignment_without_valid_consent_starts_nothing(
+    tmp_path: Path, provider_factory, monkeypatch, grant_notice_version, revoke,
+) -> None:  # type: ignore[no-untyped-def]
+    """동의가 유효하지 않으면 자동 배정이 예약도 시작도 하지 않는다."""
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configure(store, root, "project-one", consent=False, roles=continuous_roles(root, "project-one"))
+    if grant_notice_version is not None:
+        store.save_consent("project-one", grant_notice_version)
+    if revoke:
+        store.delete_consent("project-one")
+    if grant_notice_version is not None and not revoke:
+        monkeypatch.setattr("heartbeat.agent_contract.REQUIRED_NOTICE_VERSION", grant_notice_version + 1)
+    store.save_intent(
+        "project-one", {"intentId": "intent-1", "role": "developer", "mode": "auto", "manualTargets": []},
+    )
+
+    report = tick_project(store, "project-one", helpers_factory=WorkflowHelpers, provider_factory=provider_factory)
+
+    assert report.started == 0
+    assert store.list_runs("project-one") == []
+    assert reserve_calls(root) == 0
+    assert store.get_state("project-one")["errors"] == []
+    assert int(store.list_intents("project-one")[0].get("startedCount", 0)) == 0
+
+
+def test_missing_consent_leaves_a_running_session_and_its_recovery_untouched(
+    tmp_path: Path, provider_factory,
+) -> None:  # type: ignore[no-untyped-def]
+    """동의를 철회해도 이미 실행 중이던 세션과 회복 절차는 그대로 돈다."""
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configure(store, root, "project-one", roles=continuous_roles(root, "project-one"))
+    control(root, "reserve-limit", "5")
+    running = start_slots(store, agent_dispatch.configuration_of(store, "project-one"), root, provider_factory)[0]
+    store.delete_consent("project-one")
+    store.save_intent(
+        "project-one", {"intentId": "intent-1", "role": "developer", "mode": "auto", "manualTargets": []},
+    )
+    reserved_before = reserve_calls(root)
+
+    report = tick_project(store, "project-one", helpers_factory=WorkflowHelpers, provider_factory=provider_factory)
+
+    assert running["state"] == "running"
+    assert store.get_run(running["runId"])["state"] in {"running", "succeeded"}
+    assert report.started == 0
+    assert reserve_calls(root) == reserved_before
+    assert len(store.list_runs("project-one")) == 1
+
+
+def test_granting_consent_lets_the_same_assignment_run_as_before(
+    tmp_path: Path, provider_factory,
+) -> None:  # type: ignore[no-untyped-def]
+    """동의를 남기면 같은 요청이 평소대로 예약과 시작을 진행한다."""
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configure(store, root, "project-one", consent=False, roles=continuous_roles(root, "project-one"))
+    store.save_intent(
+        "project-one", {"intentId": "intent-1", "role": "developer", "mode": "auto", "manualTargets": []},
+    )
+
+    refused = tick_project(store, "project-one", helpers_factory=WorkflowHelpers, provider_factory=provider_factory)
+    store.save_consent("project-one", REQUIRED_NOTICE_VERSION)
+    allowed = tick_project(store, "project-one", helpers_factory=WorkflowHelpers, provider_factory=provider_factory)
+
+    assert refused.started == 0
+    assert allowed.started == 1
+    assert reserve_calls(root) == 1
+
+
+def test_a_project_without_consent_does_not_stop_another_project_on_the_device(
+    tmp_path: Path, provider_factory,
+) -> None:  # type: ignore[no-untyped-def]
+    """동의가 없는 프로젝트 때문에 같은 기기의 동의된 프로젝트가 멈추지 않는다."""
+    silent = make_project(tmp_path, "silent")
+    active = make_project(tmp_path, "active")
+    store = store_at(tmp_path)
+    configure(store, silent, "project-one", consent=False, roles=continuous_roles(silent, "project-one"))
+    configure(store, active, "project-two", roles=continuous_roles(active, "project-two"))
+    store.save_intent(
+        "project-one", {"intentId": "intent-1", "role": "developer", "mode": "auto", "manualTargets": []},
+    )
+    store.save_intent(
+        "project-two", {"intentId": "intent-2", "role": "developer", "mode": "auto", "manualTargets": []},
+    )
+
+    reports = {report.project_id: report for report in tick_all_projects(
+        store, helpers_factory=WorkflowHelpers, provider_factory=provider_factory
+    )}
+
+    assert reports["project-one"].started == 0
+    assert reports["project-two"].started >= 1
+    assert store.list_runs("project-one") == []
+    assert reserve_calls(silent) == 0
+
+
+def test_a_queued_run_does_not_start_after_consent_is_revoked(
+    tmp_path: Path, provider_factory,
+) -> None:  # type: ignore[no-untyped-def]
+    """큐에서 기다리던 실행도 시작 전 확인을 지나므로 예약 없이 대기 사유만 남긴다."""
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configuration = configure(store, root, "project-one")
+    queued = queue_one_run(store, configuration, "developer")  # type: ignore[arg-type]
+    store.delete_consent("project-one")
+
+    exit_code = serve_queued_run(
+        store, queued["runId"], helpers_factory=WorkflowHelpers, provider_factory=provider_factory,
+    )
+
+    served = store.get_run(queued["runId"])
+    assert queued["state"] == "queued"
+    assert exit_code == 0
+    assert served["state"] == "idle"
+    assert served["reason"] == EXECUTION_CONSENT_REQUIRED
+    assert served["targetId"] is None
+    assert reserve_calls(root) == 0
+    assert store.get_state("project-one")["errors"] == []
 
 
 def test_once_does_not_refill_and_continuous_does(tmp_path: Path, provider_factory) -> None:  # type: ignore[no-untyped-def]

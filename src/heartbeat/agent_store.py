@@ -176,6 +176,11 @@ class AgentStore:
                 updated_at TEXT NOT NULL,
                 UNIQUE(project_id, role)
             );
+            CREATE TABLE IF NOT EXISTS agent_consents (
+                project_id TEXT PRIMARY KEY,
+                notice_version INTEGER NOT NULL,
+                granted_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS agent_watcher_state (
                 project_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
@@ -410,6 +415,41 @@ class AgentStore:
                 connection.execute("ROLLBACK")
                 raise
         return configuration
+
+    def get_consent(self, project_id: str) -> dict | None:
+        """Read one project's execution consent, or None when it never granted."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT notice_version, granted_at FROM agent_consents WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {"projectId": project_id, "noticeVersion": int(row[0]), "grantedAt": row[1]}
+
+    def save_consent(self, project_id: str, notice_version: int) -> dict:
+        """Record that this project read the notice, stamping the time here.
+
+        The moment is the runtime's own reading of the clock and never comes from
+        the request, so a caller cannot backdate a consent it did not give.
+        """
+        granted_at = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_consents(project_id, notice_version, granted_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    notice_version=excluded.notice_version,
+                    granted_at=excluded.granted_at
+                """,
+                (project_id, notice_version, granted_at),
+            )
+        return {"projectId": project_id, "noticeVersion": notice_version, "grantedAt": granted_at}
+
+    def delete_consent(self, project_id: str) -> None:
+        """Drop only this project's consent, leaving every other project alone."""
+        with self._connection() as connection:
+            connection.execute("DELETE FROM agent_consents WHERE project_id = ?", (project_id,))
 
     def save_plan(self, project_id: str, plan: dict) -> None:
         """Store one execution plan so a later start can prove it is the same one."""
