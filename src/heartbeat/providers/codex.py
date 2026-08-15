@@ -25,14 +25,21 @@ class CodexProvider(CliProvider):
         # refuses to run there without this flag ("Not inside a trusted
         # directory", observed 2026-08-13). The undo-safety that check wants is
         # not available on such machines at all — git may not even be
-        # installed — while file protection stays with the sandbox setting.
+        # installed.
+        #
+        # Full access is the user's decision (2026-08-15) and matches both the
+        # execution consent notice and how claude sessions already run
+        # (2026-08-13). workspace-write additionally forbade writing `.git`,
+        # so codex sessions could edit files but never commit — shared trees
+        # silted up with uncommitted work and isolated copies failed at
+        # `git add` with "Operation not permitted" (mech-arena).
         command = [
             self.executable,
             "exec",
             "--json",
             "--skip-git-repo-check",
             "--sandbox",
-            "workspace-write",
+            "danger-full-access",
             "-C",
             str(request.project_root),
         ]

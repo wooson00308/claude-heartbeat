@@ -183,8 +183,10 @@ def test_codex_command_is_json_exec_and_keeps_prompt_off_command_line(tmp_path: 
 
     command = CodexProvider(executable="fake-codex").command(value)
 
+    # 전권 실행은 사용자 결정(2026-08-15)이며 클로드 세션·실행 권한 동의 고지와 같은 수준이다.
+    # workspace-write는 `.git` 쓰기를 막아 세션이 커밋을 못 했다.
     assert command == [
-        "fake-codex", "exec", "--json", "--skip-git-repo-check", "--sandbox", "workspace-write", "-C", str(tmp_path), "-",
+        "fake-codex", "exec", "--json", "--skip-git-repo-check", "--sandbox", "danger-full-access", "-C", str(tmp_path), "-",
     ]
     assert value.prompt not in command
     assert CodexProvider(executable="fake-codex").command(
