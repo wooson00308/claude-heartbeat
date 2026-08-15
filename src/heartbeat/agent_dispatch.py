@@ -37,6 +37,7 @@ except ImportError:  # source installs may not have refreshed dependencies yet
     FileSystemEventHandler = object  # type: ignore[misc,assignment]
     Observer = None  # type: ignore[assignment,misc]
 
+from heartbeat import agent_contract
 from heartbeat.agent_contract import (
     AgentConfiguration,
     validate_configuration,
@@ -266,6 +267,31 @@ class RolePlan:
 def configuration_of(store: AgentStore, project_id: str) -> AgentConfiguration | None:
     stored = store.get_configuration(project_id)
     return validate_configuration(stored) if stored else None
+
+
+# 동의가 없어 시작하지 못한 것은 실행 실패가 아니라 대기다. 실패로 기록하면 사용자는
+# 실행 도구나 권한에서 원인을 찾게 되고, 정작 고칠 자리인 동의 화면에 도달하지 못한다.
+EXECUTION_CONSENT_REQUIRED = "execution_consent_required"
+
+
+def consent_is_valid(record: dict[str, Any] | None) -> bool:
+    """Judge one consent record against the notice version required now.
+
+    This is the only place the rule lives. The consent commands answer with the
+    same judgement, so what the app is told is valid and what execution treats
+    as valid cannot drift apart.
+    """
+    if record is None:
+        return False
+    notice_version = record.get("noticeVersion")
+    # 요구 버전은 계약 모듈에서 그때그때 읽는다. 값을 여기로 복사해 두면 요구 버전이
+    # 올라갔을 때 명령이 답하는 유효와 실행이 판정하는 유효가 갈라진다.
+    return isinstance(notice_version, int) and notice_version >= agent_contract.REQUIRED_NOTICE_VERSION
+
+
+def project_may_execute(store: AgentStore, project_id: str) -> bool:
+    """Answer whether this project may start a new run at all."""
+    return consent_is_valid(store.get_consent(project_id))
 
 
 def sync_automation(store: AgentStore, configuration: AgentConfiguration) -> None:
@@ -542,6 +568,7 @@ def _not_started(
 
 
 def _preflight_target(
+    store: AgentStore,
     configuration: AgentConfiguration,
     role: str,
     helpers: WorkflowHelpers,
@@ -551,6 +578,19 @@ def _preflight_target(
     intent_id: str | None = None,
 ) -> dict[str, Any] | None:
     policy = configuration.roles[role]
+    if not project_may_execute(store, configuration.project_id):
+        # 자격 조회보다 앞이다. 예약 도구 호출과 실행 도구 시작이 모두 이 뒤에 있으므로
+        # 여기서 멈추면 대상 선점도 한도 차감도 일어나지 않는다. 수동 대상을 지정한
+        # 요청도 대기로 돌려주어, 동의 부족이 실패 목록에 실리지 않게 한다.
+        return _not_started(
+            configuration,
+            role,
+            policy.provider,
+            reason=EXECUTION_CONSENT_REQUIRED,
+            manual=False,
+            previous_run_id=previous_run_id,
+            intent_id=intent_id,
+        )
     verdict = _eligibility(helpers, role)
     if isinstance(verdict, DispatchFailure):
         return _not_started(
@@ -618,6 +658,7 @@ def start_one_run(
     """Start inside a persistent daemon or test process that owns supervision."""
     policy = configuration.roles[role]
     preflight = _preflight_target(
+        store,
         configuration,
         role,
         helpers,
@@ -652,6 +693,7 @@ def queue_one_run(
     policy = configuration.roles[role]
     helpers = helpers or WorkflowHelpers(Path(configuration.working_directory))
     preflight = _preflight_target(
+        store,
         configuration,
         role,
         helpers,
@@ -680,6 +722,7 @@ def _start_run_row(
     policy = configuration.roles[role]
     manual_targets = tuple(row.get("manualTargets", ()))
     preflight = _preflight_target(
+        store,
         configuration,
         role,
         helpers,
@@ -1503,7 +1546,12 @@ def tick_project(
         provider_factory=provider_factory,
     )
 
-    if configuration.paused or not configuration.automation_enabled:
+    # 회복 뒤, 배정 루프 앞이다. 앞에 두면 실행 중이던 세션의 감시가 끊기고, 뒤에 두면
+    # 의도의 시작 수가 먼저 올라간다. 이 자리에서 반환하면 그 프로젝트만 멈추므로 같은
+    # 기기의 다른 프로젝트 배정은 그대로 이어진다.
+    if configuration.paused or not configuration.automation_enabled or not project_may_execute(
+        store, project_id
+    ):
         return report
 
     due_intents: list[dict[str, Any]] = []

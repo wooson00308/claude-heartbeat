@@ -8,7 +8,9 @@ import pytest
 
 from heartbeat import __version__
 from heartbeat.agent_contract import (
+    AGENT_COMMANDS,
     API_VERSION,
+    REQUIRED_NOTICE_VERSION,
     AgentContractError,
     contract_description,
     default_configuration,
@@ -139,3 +141,12 @@ def test_response_envelope_keeps_request_identity_and_failure_stage():
     assert response["command"] == "config.write"
     assert response["outcome"] == "failure"
     assert response["error"]["stage"] == "request_validation"
+
+
+def test_contract_announces_the_three_consent_commands_and_the_required_notice_version():
+    description = contract_description()
+
+    assert {"consent.read", "consent.grant", "consent.revoke"} <= set(description["implementedCommands"])
+    assert description["requiredNoticeVersion"] == REQUIRED_NOTICE_VERSION
+    # 계약이 알리는 목록과 라우팅 기준이 갈라지지 않는지 함께 고정한다.
+    assert description["implementedCommands"] == list(AGENT_COMMANDS)

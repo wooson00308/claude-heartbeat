@@ -282,3 +282,62 @@ def test_retention_removes_only_old_terminal_history(tmp_path):
 
     assert removed == {"runs": 1, "events": 1, "errors": 1}
     assert {run["runId"] for run in store.list_runs("project-one")} == {"recent", "running"}
+
+
+def test_consent_round_trips_and_stores_only_the_three_recorded_values(tmp_path):
+    database = tmp_path / "agent.sqlite3"
+    store = AgentStore(database)
+
+    assert store.get_consent("project-one") is None
+
+    saved = store.save_consent("project-one", 1)
+
+    assert saved["projectId"] == "project-one"
+    assert saved["noticeVersion"] == 1
+    assert store.get_consent("project-one") == saved
+    with sqlite3.connect(database) as connection:
+        columns = [
+            column[1]
+            for column in connection.execute("PRAGMA table_info(agent_consents)").fetchall()
+        ]
+        rows = connection.execute("SELECT * FROM agent_consents").fetchall()
+    # 저장된 행 전체를 문자열로 만들어, 요청에 없던 값이 함께 실리지 않았음을 확인한다.
+    assert columns == ["project_id", "notice_version", "granted_at"]
+    assert str(rows) == str([("project-one", 1, saved["grantedAt"])])
+
+
+def test_consent_is_recorded_and_revoked_per_project(tmp_path):
+    store = AgentStore(tmp_path / "agent.sqlite3")
+    store.save_consent("project-one", 1)
+    store.save_consent("project-two", 1)
+
+    store.delete_consent("project-one")
+
+    assert store.get_consent("project-one") is None
+    assert store.get_consent("project-two")["noticeVersion"] == 1
+    # 없는 기록을 지우는 것은 실패가 아니다.
+    store.delete_consent("project-one")
+    assert store.get_consent("project-one") is None
+
+
+def test_database_written_before_consent_existed_gains_the_table_and_keeps_its_rows(tmp_path):
+    database = tmp_path / "agent.sqlite3"
+    store = AgentStore(database)
+    store.save_configuration(_configuration("project-one", tmp_path))
+    store.save_run({
+        "runId": "run-1", "projectId": "project-one", "role": "developer",
+        "provider": "codex", "state": "succeeded",
+    })
+    store.save_intent("project-one", {
+        "intentId": "intent-1", "role": "developer", "mode": "auto", "manualTargets": [],
+    })
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE agent_consents")
+
+    reopened = AgentStore(database)
+
+    assert reopened.get_consent("project-one") is None
+    assert reopened.save_consent("project-one", 1)["noticeVersion"] == 1
+    assert reopened.get_configuration("project-one")["projectId"] == "project-one"
+    assert {run["runId"] for run in reopened.list_runs("project-one")} == {"run-1"}
+    assert reopened.list_intents("project-one")[0]["intentId"] == "intent-1"

@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any, TextIO
 
+from heartbeat import agent_contract
 from heartbeat.agent_contract import (
     AGENT_COMMANDS,
     ROLES,
@@ -27,6 +28,9 @@ EXECUTION_COMMANDS = (
     "logs.read", "provider.diagnose",
 )
 UPDATE_COMMANDS = ("update.plan", "update.apply")
+# 동의 명령은 저장된 프로젝트 설정을 요구하지 않는다. 사용자가 자동 배정을 처음 켜는
+# 순간에는 아직 설정이 저장되기 전일 수 있어, 설정을 먼저 요구하면 동의를 남길 방법이 없다.
+CONSENT_COMMANDS = ("consent.read", "consent.grant", "consent.revoke")
 
 
 def _read_json(stream: TextIO) -> dict[str, Any]:
@@ -55,6 +59,53 @@ def _configuration_or_reject(store: AgentStore, project_id: str, request_id: str
     if configuration is None:
         raise AgentContractError("project_not_configured", "projectId has no stored configuration", request_id=request_id)
     return configuration
+
+
+def _consent_payload(project_id: str, record: dict[str, Any] | None) -> dict[str, Any]:
+    """Shape the one consent view every consent command answers with.
+
+    ``granted`` says a record exists at all; ``valid`` says that record still
+    meets the notice version the runtime requires now. Raising the required
+    version therefore turns an old consent invalid without deleting it.
+    """
+    notice_version = record["noticeVersion"] if record is not None else None
+    return {
+        "consent": {
+            "projectId": project_id,
+            "granted": record is not None,
+            "valid": agent_dispatch.consent_is_valid(record),
+            "noticeVersion": notice_version,
+            "grantedAt": record["grantedAt"] if record is not None else None,
+            "requiredNoticeVersion": agent_contract.REQUIRED_NOTICE_VERSION,
+        }
+    }
+
+
+def _consent_command(
+    command: str,
+    request: dict[str, Any],
+    request_id: str,
+    store: AgentStore,
+) -> dict[str, Any]:
+    """Read, grant, or revoke one project's execution consent."""
+    project_id = _project_id(request, request_id)
+    if command == "consent.read":
+        return _consent_payload(project_id, store.get_consent(project_id))
+
+    if command == "consent.revoke":
+        store.delete_consent(project_id)
+        return _consent_payload(project_id, store.get_consent(project_id))
+
+    notice_version = request.get("noticeVersion")
+    if isinstance(notice_version, bool) or not isinstance(notice_version, int):
+        raise AgentContractError("invalid_request", "noticeVersion must be an integer", request_id=request_id)
+    if notice_version < agent_contract.REQUIRED_NOTICE_VERSION:
+        raise AgentContractError(
+            "consent_notice_outdated",
+            f"noticeVersion must be at least {agent_contract.REQUIRED_NOTICE_VERSION}",
+            request_id=request_id,
+        )
+    return _consent_payload(project_id, store.save_consent(project_id, notice_version))
 
 
 def _role_requests(request: dict[str, Any], request_id: str) -> list[RoleSlots]:
@@ -208,7 +259,13 @@ def _execution_command(
             previous_run_id=previous["runId"],
         )
         outcome = "success" if row["state"] in {"queued", "reserved", "running"} else "failure"
-        return outcome, {"run": row, "previousRunId": previous["runId"]}
+        data = {"run": row, "previousRunId": previous["runId"]}
+        if row.get("reason") == agent_dispatch.EXECUTION_CONSENT_REQUIRED:
+            # 봉투의 사유 코드는 응답 데이터의 최상위에서 온다. 여기서 싣지 않으면 동의
+            # 부족이 일반 실패인 execution_failed로 바뀌어, 실행 도구 설치 실패나 권한
+            # 부족과 구분되지 않는다.
+            data.update({"reason": row["reason"], "stage": "reservation"})
+        return outcome, data
 
     raise AgentContractError("unsupported_command", "agent command is not implemented", request_id=request_id)
 
@@ -315,6 +372,10 @@ def run_agent_command(
                 "configuration": configuration,
                 "deviceCapacity": runtime_store.device_capacity(),
             }), output_stream)
+            return 0
+        if command in CONSENT_COMMANDS:
+            data = _consent_command(command, request, request_id, runtime_store)
+            _write_json(envelope(command, request_id, outcome="success", data=data), output_stream)
             return 0
         if command == "state.read":
             project_id = _project_id(request, request_id)

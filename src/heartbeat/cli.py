@@ -405,6 +405,8 @@ def main() -> None:
     agent_sub.add_parser("contract", help="Print the supported agent contract as JSON")
     p_agent_config = agent_sub.add_parser("config", help="Validate, write, or read agent configuration")
     p_agent_config.add_argument("operation", choices=["validate", "write", "read"])
+    p_agent_consent = agent_sub.add_parser("consent", help="Read, grant, or revoke one project's execution consent")
+    p_agent_consent.add_argument("operation", choices=["read", "grant", "revoke"])
     agent_sub.add_parser("state", help="Read project-scoped agent state")
     agent_sub.add_parser("plan", help="Read an execution plan without starting anything")
     agent_sub.add_parser("logs", help="Read redacted run events from a cursor")
@@ -605,11 +607,14 @@ def main() -> None:
             "project pause": "project.pause",
             "project resume": "project.resume",
             "provider diagnose": "provider.diagnose",
+            "consent read": "consent.read",
+            "consent grant": "consent.grant",
+            "consent revoke": "consent.revoke",
         }
         selected = getattr(args, "agent_command", None)
         if selected == "config":
             selected = args.operation
-        elif selected in {"run", "project", "provider"}:
+        elif selected in {"run", "project", "provider", "consent"}:
             selected = f"{selected} {args.operation}"
         if selected not in command_map:
             p_agent.print_help()
