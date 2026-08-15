@@ -12,6 +12,6 @@ editable 설치의 메타데이터는 `pip install -e`를 마지막으로 돌린
 상수가 맞는 답이다.
 """
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 __all__ = ["__version__"]

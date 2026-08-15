@@ -576,7 +576,12 @@ class _SupervisedRun:
         self._started_monotonic = time.monotonic()
         self._events: list[ProviderEvent] = []
         self._observed_status: RunStatus | None = None
-        self._off_contract = False
+        # 표준 출력에서 계약이 알아들은 줄과 못 알아들은 줄을 따로 센다. 판정은 스트림 단위다 —
+        # 계약을 말하는 스트림에 낯선 줄이 섞인 것(CLI가 새 이벤트 타입을 더한 경우)은 무시하고,
+        # 한 줄도 알아듣지 못한 스트림만 계약 밖으로 본다. 2026-08-15 실측: Claude CLI 2.1.233이
+        # `rate_limit_event`를 새로 내보내며 완료까지 간 실행이 전부 실패로 뒤집혔다.
+        self._normalized_any = False
+        self._unrecognized_stdout = False
         self._stderr_detail: str | None = None
         self._execution: ProcessExecution | None = None
         self._result: ProviderExecutionResult | None = None
@@ -645,7 +650,7 @@ class _SupervisedRun:
             status = "failed"
             terminal_kind = "failed"
             terminal_detail = self._stderr_detail or f"provider exited with code {execution.returncode}"
-        elif self._off_contract:
+        elif self._unrecognized_stdout and not self._normalized_any:
             status = "off_contract"
             terminal_kind = "failed"
             terminal_detail = "provider output did not match the runtime contract"
@@ -677,21 +682,22 @@ class _SupervisedRun:
             if source == "stderr":
                 self._remember_stderr(line)
                 return
-            self._off_contract = True
+            self._unrecognized_stdout = True
             return
         if not isinstance(decoded, dict):
             if source == "stderr":
                 self._remember_stderr(line)
                 return
-            self._off_contract = True
+            self._unrecognized_stdout = True
             return
         normalized = self._provider.normalize_line(decoded)
         if not normalized:
             if source == "stderr":
                 self._remember_stderr(line)
                 return
-            self._off_contract = True
+            self._unrecognized_stdout = True
             return
+        self._normalized_any = True
         for value in normalized:
             self._append(value.kind, raw_id=value.raw_id, detail=value.detail)
             if value.status is not None:
