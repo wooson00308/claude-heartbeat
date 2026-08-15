@@ -272,6 +272,36 @@ def test_start_success_is_not_role_success_and_the_failing_stages_stay_apart(
     )
 
 
+def test_contract_two_carries_the_isolated_working_copy_and_contract_one_stays_bare() -> None:
+    """예약 헬퍼 v4는 개발 대상에 격리 작업 사본을 실은 계약 2를 낸다(2026-08-15 실측).
+
+    계약 1만 알던 런타임은 그 예약을 반납할 방법도 없이 거절해 죽은 선점만 남겼다. 계약 2를
+    받아들인다는 것이 곧 격리 필드를 알아본다는 선언이므로, 두 계약을 함께 고정한다.
+    """
+    isolated = reserved(
+        contractVersion=2,
+        workspacePath="/repo/.workflow/.runtime/worktrees/TASK-1/lease-1",
+        controlRoot="/repo/.workflow",
+        baseCommit="0123abc",
+        branch="wf-iso/TASK-1/lease-1",
+    )
+    bare = reserved()
+
+    assert isolated.contract_version == 2
+    assert isolated.workspace_path == "/repo/.workflow/.runtime/worktrees/TASK-1/lease-1"
+    assert isolated.control_root == "/repo/.workflow"
+    assert isolated.base_commit == "0123abc"
+    assert isolated.branch == "wf-iso/TASK-1/lease-1"
+    assert bare.contract_version == 1
+    assert bare.workspace_path is None
+    assert bare.branch is None
+
+    # 격리 필드가 있다고 주장하면서 빈 값을 실은 예약은 계약 밖이다.
+    blank = read_reservation(0, reservation_payload(contractVersion=2, workspacePath="  "))
+    assert isinstance(blank, LifecycleFailure)
+    assert blank.reason == "reservation_malformed"
+
+
 def test_reservation_failures_and_mismatches_never_start_a_provider(
     script: Path, tmp_path: Path
 ) -> None:
@@ -283,7 +313,7 @@ def test_reservation_failures_and_mismatches_never_start_a_provider(
     unavailable = read_reservation(1, "")
     usage_error = read_reservation(2, "")
     malformed = read_reservation(0, "not json at all")
-    future_contract = read_reservation(0, reservation_payload(contractVersion=2))
+    future_contract = read_reservation(0, reservation_payload(contractVersion=3))
     other_target = start_reserved_run(
         provider, reservation, request(tmp_path, reservation, target_id="TASK-2")
     )
