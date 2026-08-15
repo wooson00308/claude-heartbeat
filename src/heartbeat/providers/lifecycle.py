@@ -33,6 +33,18 @@ from heartbeat.providers.process import (
 
 PROVIDER_LIFECYCLE_CONTRACT_VERSION = 1
 RESERVATION_CONTRACT_VERSION = 1
+# 계약 2는 개발 세션의 격리 작업 사본을 싣는다. 사본 준비와 세션 지시는 예약 헬퍼가 하고, 이
+# 런타임은 그 사실을 담은 필드를 알아보고 통과시킨다. 버전을 검증하는 이유가 "격리를 모르는
+# 실행 환경은 개발 실행을 시작하지 않는다"이므로, 여기 들어 있다는 것이 곧 그 선언이다.
+SUPPORTED_RESERVATION_CONTRACT_VERSIONS = (1, 2)
+# 계약 2가 실어 오는 격리 필드. 없으면 None으로 남는다 — 계약 1의 예약과 격리를 준비하지 않는
+# 역할(기획자·아키텍트)의 예약이 그 모양이다.
+_ISOLATION_FIELDS = {
+    "workspace_path": "workspacePath",
+    "control_root": "controlRoot",
+    "base_commit": "baseCommit",
+    "branch": "branch",
+}
 TERMINAL_EVENT_KINDS = frozenset({"completed", "failed", "cancelled", "timed_out"})
 
 LifecycleStage = Literal["reservation", "provider_start"]
@@ -62,6 +74,11 @@ class Reservation:
     expires_at: str
     prompt_version: int
     role_prompt: str
+    # 계약 2의 격리 작업 사본. 계약 1이거나 격리 없는 역할이면 None이다.
+    workspace_path: str | None = None
+    control_root: str | None = None
+    base_commit: str | None = None
+    branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -123,7 +140,8 @@ def read_reservation(exit_code: int, payload: str) -> Reservation | LifecycleFai
         return LifecycleFailure(stage="reservation", reason="reservation_malformed")
     if not isinstance(decoded, dict):
         return LifecycleFailure(stage="reservation", reason="reservation_malformed")
-    if decoded.get("contractVersion") != RESERVATION_CONTRACT_VERSION:
+    contract_version = decoded.get("contractVersion")
+    if contract_version not in SUPPORTED_RESERVATION_CONTRACT_VERSIONS:
         return LifecycleFailure(stage="reservation", reason="unsupported_reservation_contract")
 
     text_fields = {
@@ -143,10 +161,25 @@ def read_reservation(exit_code: int, payload: str) -> Reservation | LifecycleFai
     prompt_version = decoded.get("promptVersion")
     if isinstance(prompt_version, bool) or not isinstance(prompt_version, int):
         return LifecycleFailure(stage="reservation", reason="reservation_malformed")
+    isolation: dict[str, str | None] = {}
+    for field, key in _ISOLATION_FIELDS.items():
+        value = decoded.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            return LifecycleFailure(stage="reservation", reason="reservation_malformed")
+        isolation[field] = value
     return Reservation(
-        contract_version=RESERVATION_CONTRACT_VERSION,
+        contract_version=contract_version,
         prompt_version=prompt_version,
-        **values,
+        role=values["role"],
+        target_id=values["target_id"],
+        lease_id=values["lease_id"],
+        result_prefix=values["result_prefix"],
+        expires_at=values["expires_at"],
+        role_prompt=values["role_prompt"],
+        workspace_path=isolation["workspace_path"],
+        control_root=isolation["control_root"],
+        base_commit=isolation["base_commit"],
+        branch=isolation["branch"],
     )
 
 
