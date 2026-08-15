@@ -89,6 +89,13 @@ if prompt_path:
 if mode == "broken":
     print("not-json", flush=True)
     print(json.dumps({"type": "done"}), flush=True)
+elif mode == "unknown-type":
+    print(json.dumps({"type": "rate_limit_event"}), flush=True)
+    print(json.dumps({"type": "done"}), flush=True)
+elif mode == "foreign":
+    print(json.dumps({"type": "rate_limit_event"}), flush=True)
+    print(json.dumps({"banner": "hello"}), flush=True)
+    raise SystemExit(0)
 elif mode == "stderr-warning":
     print("warning: optional integration unavailable", file=sys.stderr, flush=True)
     print(json.dumps({"type": "done"}), flush=True)
@@ -354,16 +361,33 @@ def test_run_streams_prompt_through_stdin_and_redacts_prompt_and_environment_sec
     ] * len(result.events)
 
 
-def test_broken_json_line_does_not_stop_the_process_and_is_reported_off_contract(
+def test_a_stray_line_amid_contract_traffic_does_not_flip_the_run(
+    fixture_script: Path, tmp_path: Path
+) -> None:
+    """계약을 말하는 스트림에 섞인 낯선 줄은 무시한다.
+
+    2026-08-15 실측: Claude CLI 2.1.233이 `rate_limit_event`를 새로 내보내자, 한 줄 오독을
+    전체 실패로 접던 이전 규칙이 완료까지 간 세션을 전부 실패로 뒤집고 재배정 루프를 만들었다.
+    """
+    for mode in ["broken", "unknown-type"]:
+        result = FixtureProvider(fixture_script).run(
+            request(tmp_path),
+            environment={"TEST_API_KEY": "not-used", "PROVIDER_TEST_MODE": mode},
+        )
+        assert result.status == "success", mode
+        assert result.events[-1].kind == "completed", mode
+
+
+def test_a_stream_with_no_contract_line_at_all_is_off_contract(
     fixture_script: Path, tmp_path: Path
 ) -> None:
     result = FixtureProvider(fixture_script).run(
         request(tmp_path),
-        environment={"TEST_API_KEY": "not-used", "PROVIDER_TEST_MODE": "broken"},
+        environment={"TEST_API_KEY": "not-used", "PROVIDER_TEST_MODE": "foreign"},
     )
 
     assert result.status == "off_contract"
-    assert [event.kind for event in result.events][-2:] == ["completed", "failed"]
+    assert result.events[-1].kind == "failed"
 
 
 def test_non_json_stderr_warning_does_not_flip_a_completed_run_to_failure(
