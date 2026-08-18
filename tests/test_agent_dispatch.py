@@ -1021,6 +1021,52 @@ def test_terminal_provider_failure_keeps_stage_and_safe_reason(
     assert store.get_state("project-one")["errors"][-1]["stage"] == "role_session"
 
 
+def test_an_unobservable_worker_is_left_alone_not_killed(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    monkeypatch.setattr(
+        agent_dispatch,
+        "observe_process",
+        lambda pid: type("Observation", (), {"liveness": "unknown", "identity": None})(),
+    )
+    row = {
+        "runId": "run-unknown", "projectId": "project-one", "state": "running",
+        "supervisorPid": 4242, "supervisorIdentity": "worker-at",
+    }
+
+    result = agent_dispatch.reconcile_run(store, dict(row), helpers=WorkflowHelpers(root))
+
+    # An unreadable worker is not judged: the run keeps its state, nothing is
+    # persisted, and the next reconcile observes again.
+    assert result["state"] == "running"
+    assert result.get("reason") is None
+    assert store.get_run("run-unknown") is None
+
+
+def test_a_reused_worker_pid_still_fails_identity_verification(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    monkeypatch.setattr(
+        agent_dispatch,
+        "observe_process",
+        lambda pid: type("Observation", (), {"liveness": "running", "identity": "someone-else"})(),
+    )
+    row = {
+        "runId": "run-reused", "projectId": "project-one", "state": "running",
+        "supervisorPid": 4242, "supervisorIdentity": "worker-at",
+    }
+
+    result = agent_dispatch.reconcile_run(store, dict(row), helpers=WorkflowHelpers(root))
+
+    assert (result["state"], result["reason"]) == (
+        "recovery_required", "supervisor_identity_unverified",
+    )
+
+
 def test_a_failing_agent_store_never_stops_the_heartbeat_loop(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from heartbeat import core
 
