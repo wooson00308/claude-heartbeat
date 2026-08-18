@@ -30,6 +30,12 @@ from typing import Literal, Protocol
 
 import psutil
 
+# Windows에서 콘솔 창 없이 자식을 만드는 creationflags 값. 디스패처와 워커는 콘솔 없는
+# (detached) 프로세스로 돌기 때문에, 콘솔 자식을 그대로 만들면 호출마다 새 콘솔 창이 화면에
+# 나타난다(2026-08-18 Windows 실측: 앱을 열어 두는 동안 주기적인 cmd 창 깜빡임). POSIX에서는
+# 0이라 아무 뜻이 없고, creationflags 인자는 그 플랫폼에서 무시된다.
+NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 DiagnosticStatus = Literal[
     "ready",
     "executable_missing",
@@ -907,6 +913,7 @@ def run_probe(
             text=True,
             encoding="utf-8",
             errors="replace",
+            creationflags=NO_WINDOW,
             env=dict(environment),
             timeout=timeout_seconds,
             check=False,
@@ -965,7 +972,7 @@ def spawn_process(
         "env": dict(environment),
     }
     if os.name == "nt":
-        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | NO_WINDOW
     else:
         options["start_new_session"] = True
 

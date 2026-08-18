@@ -12,6 +12,11 @@ from .base import RestartResult, ServiceAdapter, ServiceStatus
 
 TASK_NAME = "claude-heartbeat"
 
+# Windows에서 콘솔 창 없이 schtasks를 부른다. 이 어댑터는 앱이 띄운 콘솔 없는 CLI에서 돌기
+# 때문에, schtasks 자식이 콘솔을 새로 만들면 화면에 창이 깜빡인다(사유 전문은
+# providers/process.py의 NO_WINDOW). POSIX에는 이 플래그가 없어 0으로 둔다.
+_NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 class TaskSchedulerAdapter(ServiceAdapter):
     name = "task_scheduler"
@@ -66,7 +71,7 @@ class TaskSchedulerAdapter(ServiceAdapter):
     def detect(self) -> str | None:
         try:
             result = subprocess.run(
-                ["schtasks.exe", "/query", "/tn", TASK_NAME], capture_output=True, text=True,
+                ["schtasks.exe", "/query", "/tn", TASK_NAME], capture_output=True, text=True, creationflags=_NO_WINDOW,
             )
         except FileNotFoundError:
             return None
@@ -77,7 +82,7 @@ class TaskSchedulerAdapter(ServiceAdapter):
         try:
             queried = subprocess.run(
                 ["schtasks.exe", "/query", "/tn", TASK_NAME, "/xml", "ONELINE"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, creationflags=_NO_WINDOW,
             )
         except FileNotFoundError:
             return ""
@@ -89,7 +94,7 @@ class TaskSchedulerAdapter(ServiceAdapter):
     def inspect(self) -> ServiceStatus:
         try:
             queried = subprocess.run(
-                ["schtasks.exe", "/query", "/tn", TASK_NAME], capture_output=True, text=True,
+                ["schtasks.exe", "/query", "/tn", TASK_NAME], capture_output=True, text=True, creationflags=_NO_WINDOW,
             )
         except FileNotFoundError:
             return ServiceStatus(self.name, "tool_missing", registered=None, running=None,
@@ -127,9 +132,9 @@ class TaskSchedulerAdapter(ServiceAdapter):
             return RestartResult("skipped", "not-registered")
 
         try:
-            subprocess.run(["schtasks.exe", "/end", "/tn", task], capture_output=True, text=True)
+            subprocess.run(["schtasks.exe", "/end", "/tn", task], capture_output=True, text=True, creationflags=_NO_WINDOW)
             result = subprocess.run(
-                ["schtasks.exe", "/run", "/tn", task], capture_output=True, text=True,
+                ["schtasks.exe", "/run", "/tn", task], capture_output=True, text=True, creationflags=_NO_WINDOW,
             )
         except FileNotFoundError:
             return RestartResult("failed", "schtasks-missing", task)
@@ -167,20 +172,21 @@ class TaskSchedulerAdapter(ServiceAdapter):
             with open(descriptor, "w", encoding="utf-16") as definition_file:
                 definition_file.write(definition)
             cmd = self._install_cmd(str(xml_path))
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, text=True, creationflags=_NO_WINDOW)
             registered = True
             subprocess.run(
                 ["schtasks.exe", "/run", "/tn", TASK_NAME],
                 check=True,
                 capture_output=True,
                 text=True,
+                creationflags=_NO_WINDOW,
             )
             print(f"✓ Task Scheduler 등록 완료: {TASK_NAME}")
             return 0
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             if registered:
                 try:
-                    subprocess.run(self._uninstall_cmd(), capture_output=True, text=True)
+                    subprocess.run(self._uninstall_cmd(), capture_output=True, text=True, creationflags=_NO_WINDOW)
                 except FileNotFoundError:
                     pass
             stderr = getattr(exc, "stderr", "") or str(exc)
@@ -198,7 +204,7 @@ class TaskSchedulerAdapter(ServiceAdapter):
             return 0
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, creationflags=_NO_WINDOW)
             if result.returncode == 0:
                 print(f"✓ Task Scheduler 해제 완료: {TASK_NAME}")
                 return 0
@@ -214,6 +220,7 @@ class TaskSchedulerAdapter(ServiceAdapter):
                 ["schtasks.exe", "/query", "/tn", TASK_NAME, "/xml"],
                 capture_output=True,
                 text=True,
+                creationflags=_NO_WINDOW,
             )
         except FileNotFoundError:
             return 1
@@ -231,7 +238,7 @@ class TaskSchedulerAdapter(ServiceAdapter):
         try:
             with open(descriptor, "w", encoding="utf-16") as definition_file:
                 definition_file.write(original)
-            subprocess.run(self._install_cmd(str(xml_path)), capture_output=True, text=True)
+            subprocess.run(self._install_cmd(str(xml_path)), capture_output=True, text=True, creationflags=_NO_WINDOW)
         finally:
             xml_path.unlink(missing_ok=True)
         print("관리형 서비스 검증 실패. 기존 작업 스케줄러 정의를 복구했습니다.")

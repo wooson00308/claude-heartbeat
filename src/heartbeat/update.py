@@ -42,6 +42,11 @@ EXIT_SELF_RESTART_BLOCKED = 32
 GIT_TIMEOUT = 120
 PIP_TIMEOUT = 600
 
+# Windows에서 콘솔 창 없이 자식을 만든다. 이 명령은 앱이 띄운 콘솔 없는 CLI에서 돌기 때문에,
+# git·pip 자식이 콘솔을 새로 만들면 화면에 창이 깜빡인다(사유 전문은 providers/process.py의
+# NO_WINDOW). POSIX에서는 0이라 아무 뜻이 없다.
+_NO_WINDOW: int = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 _VERSION_RE = re.compile(r"""^__version__\s*=\s*["']([^"']+)["']""", re.M)
 
 
@@ -98,6 +103,7 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(root), *args],
         capture_output=True, text=True, timeout=GIT_TIMEOUT,
+        creationflags=_NO_WINDOW,
     )
 
 
@@ -205,6 +211,7 @@ def _step_deps(root: Path) -> int | None:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "-e", str(root)],
             capture_output=True, text=True, timeout=PIP_TIMEOUT,
+            creationflags=_NO_WINDOW,
         )
     except subprocess.TimeoutExpired:
         _emit(step="deps", status="failed", detail="pip-timeout")

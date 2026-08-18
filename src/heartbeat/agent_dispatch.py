@@ -53,6 +53,7 @@ from heartbeat.providers.lifecycle import (
     start_reserved_run,
 )
 from heartbeat.providers.process import (
+    NO_WINDOW,
     AgentProvider,
     ProviderExecutionRequest,
     ProviderRunHandle,
@@ -108,6 +109,7 @@ def run_tool(argv: Sequence[str], cwd: Path) -> ToolInvocation:
             errors="replace",
             timeout=120,
             check=False,
+            creationflags=NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         return ToolInvocation(returncode=1, stdout="")
