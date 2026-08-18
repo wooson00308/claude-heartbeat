@@ -1338,9 +1338,16 @@ def reconcile_run(
     worker_identity = row.get("supervisorIdentity")
     if isinstance(worker_pid, int) and worker_identity and worker_pid != supervisor_pid:
         worker = observe_process(worker_pid)
-        if worker.liveness == "unknown" or (
-            worker.liveness == "running" and worker.identity != worker_identity
-        ):
+        if worker.liveness == "unknown":
+            # ``observe_process`` keeps ``unknown`` apart from ``gone`` so that an
+            # unreadable process is never judged, and every other caller honours
+            # that by leaving the state alone.  A worker can be momentarily
+            # unobservable while it spawns its provider, and judging that beat as
+            # an identity failure destroyed five newborn runs in one tick
+            # (2026-08-18).  Leave the row as it stands; the next reconcile
+            # observes again.
+            return row
+        if worker.liveness == "running" and worker.identity != worker_identity:
             row.update({
                 "state": "recovery_required",
                 "failureStage": "recovery",
