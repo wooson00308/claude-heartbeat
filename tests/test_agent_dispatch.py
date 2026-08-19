@@ -1076,3 +1076,208 @@ def test_a_failing_agent_store_never_stops_the_heartbeat_loop(monkeypatch) -> No
     monkeypatch.setattr("heartbeat.agent_store.AgentStore.__init__", explode)
 
     core._tick_agent_projects()
+
+
+# ---------------------------------------------------------------------------
+# 슬롯 점유: 장부가 놓은 실행은 정리가 끝나기 전까지 자리를 지킨다.
+# 2026-08-19 실측 — 허위 즉살로 장부에서 빠진 세션 위에 새 세션이 계속 겹쳐
+# 한 프로젝트에서 역할 세션 7개가 동시에 돌았다 (#39).
+
+
+def dropped_run(run_id: str = "run-dropped", role: str = "developer", **overrides):  # type: ignore[no-untyped-def]
+    row = {
+        "runId": run_id, "projectId": "project-one", "role": role, "provider": "claude",
+        "state": "recovery_required", "reason": "supervisor_identity_unverified",
+        "remaining": ["process_termination", "event_close", "lease_release"],
+        "pid": 4242, "processIdentity": "born-at",
+    }
+    row.update(overrides)
+    return row
+
+
+def observation(liveness: str, identity: str | None = None):  # type: ignore[no-untyped-def]
+    return type("Observation", (), {"liveness": liveness, "identity": identity})()
+
+
+def test_a_dropped_run_with_unfinished_cleanup_still_holds_every_limit(
+    tmp_path: Path, provider_factory
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    roles = default_configuration("project-one", str(root)).to_dict()["roles"]
+    roles["developer"]["maxParallel"] = 1
+    configuration = configure(store, root, "project-one", projectMaxParallel=2, deviceMaxParallel=5, roles=roles)
+    store.save_run(dropped_run())
+
+    plan = build_plan(
+        store,
+        configuration,
+        [RoleSlots(role="developer", slots=1)],
+        helpers=WorkflowHelpers(root),
+        provider_factory=provider_factory,
+    )
+
+    assert (plan["deviceOccupied"], plan["projectOccupied"]) == (1, 1)
+    assert (plan["deviceRemaining"], plan["projectRemaining"]) == (4, 1)
+    assert plan["roles"][0]["granted"] == 0
+    # 평소의 한도 도달과 갈라서 낸다. 활성 0건에 한도 도달만 보이던 화면이 원인을 읽지
+    # 못하게 했다.
+    assert plan["roles"][0]["excluded"] == ["slots_held_by_unrecovered_runs"]
+
+
+def test_a_dropped_run_with_finished_cleanup_frees_its_slot(
+    tmp_path: Path, provider_factory
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    roles = default_configuration("project-one", str(root)).to_dict()["roles"]
+    roles["developer"]["maxParallel"] = 1
+    configuration = configure(store, root, "project-one", projectMaxParallel=2, deviceMaxParallel=5, roles=roles)
+    store.save_run(dropped_run(remaining=[]))
+
+    plan = build_plan(
+        store,
+        configuration,
+        [RoleSlots(role="developer", slots=1)],
+        helpers=WorkflowHelpers(root),
+        provider_factory=provider_factory,
+    )
+
+    assert (plan["deviceOccupied"], plan["projectOccupied"]) == (0, 0)
+    assert plan["roles"][0]["granted"] == 1
+    assert plan["roles"][0]["excluded"] == []
+
+
+@pytest.mark.parametrize(
+    ("liveness", "identity"),
+    [("running", "born-at"), ("unknown", None)],
+)
+def test_sweep_leaves_a_live_or_unobservable_session_alone(
+    tmp_path: Path, monkeypatch, provider_factory, liveness: str, identity: str | None
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configure(store, root, "project-one")
+    store.save_run(dropped_run(targetId="TASK-9", leaseId="lease-TASK-9"))
+    monkeypatch.setattr(agent_dispatch, "observe_process", lambda pid: observation(liveness, identity))
+
+    swept = agent_dispatch.sweep_dropped_runs(
+        store, "project-one", helpers=WorkflowHelpers(root), provider_factory=provider_factory
+    )
+
+    stored = store.get_run("run-dropped")
+    assert swept == 0
+    assert stored["state"] == "recovery_required"
+    assert stored["remaining"] == ["process_termination", "event_close", "lease_release"]
+    # 살아 있는 세션의 lease를 반납하면 같은 대상에 두 번째 세션이 붙는다.
+    assert claim_log(root) == []
+
+
+@pytest.mark.parametrize(
+    ("liveness", "identity"),
+    [("gone", None), ("running", "someone-else")],
+)
+def test_sweep_finishes_cleanup_once_the_process_is_gone_or_its_pid_reused(
+    tmp_path: Path, monkeypatch, provider_factory, liveness: str, identity: str | None
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configuration = configure(store, root, "project-one")
+    events = tmp_path / "events.jsonl"
+    events.write_text('{"kind":"completed"}\n', encoding="utf-8")
+    store.save_run(dropped_run(
+        targetId="TASK-9", leaseId="lease-TASK-9", providerRunId="prov-9",
+        startedAt="2026-08-19T14:00:00Z", eventPath=str(events), lastOffset=0,
+    ))
+    monkeypatch.setattr(agent_dispatch, "observe_process", lambda pid: observation(liveness, identity))
+
+    swept = agent_dispatch.sweep_dropped_runs(
+        store, "project-one", helpers=WorkflowHelpers(root), provider_factory=provider_factory
+    )
+
+    stored = store.get_run("run-dropped")
+    assert swept == 1
+    assert (stored["state"], stored["remaining"]) == ("succeeded", [])
+    assert claim_log(root) == ["release TASK-9 lease-TASK-9"]
+    plan = build_plan(
+        store,
+        configuration,
+        [RoleSlots(role="developer", slots=1)],
+        helpers=WorkflowHelpers(root),
+        provider_factory=provider_factory,
+    )
+    assert (plan["projectOccupied"], plan["roles"][0]["granted"]) == (0, 1)
+
+
+def test_sweep_keeps_the_slot_while_a_cleanup_step_still_fails(
+    tmp_path: Path, monkeypatch, provider_factory
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configure(store, root, "project-one")
+    store.save_run(dropped_run(targetId="TASK-9", leaseId="lease-TASK-9"))
+    monkeypatch.setattr(agent_dispatch, "observe_process", lambda pid: observation("gone"))
+    control(root, "claim-release-code", "1")
+
+    first = agent_dispatch.sweep_dropped_runs(
+        store, "project-one", helpers=WorkflowHelpers(root), provider_factory=provider_factory
+    )
+    held = store.get_run("run-dropped")
+    control(root, "claim-release-code", "0")
+    second = agent_dispatch.sweep_dropped_runs(
+        store, "project-one", helpers=WorkflowHelpers(root), provider_factory=provider_factory
+    )
+
+    assert (first, second) == (0, 1)
+    assert (held["state"], held["remaining"]) == ("recovery_required", ["lease_release"])
+    # 이벤트 파일이 없는 행의 종료 상태는 기본값 실패다.
+    assert store.get_run("run-dropped")["state"] == "failed"
+
+
+def test_runtime_revision_tracks_occupied_runs(tmp_path: Path) -> None:
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configuration = configure(store, root, "project-one")
+
+    before = agent_dispatch.runtime_revision(store, configuration)
+    store.save_run(dropped_run())
+
+    # 점유가 계획의 배정 수를 바꾸므로, 지문이 달라져야 이전 계획이 runtime_changed로
+    # 거부된다.
+    assert agent_dispatch.runtime_revision(store, configuration) != before
+
+
+def test_tick_sweeps_dropped_runs_before_refilling_their_slots(
+    tmp_path: Path, monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    data = default_configuration("project-one", str(root)).to_dict()
+    data["automationEnabled"] = True
+    data["projectMaxParallel"] = 1
+    data["roles"]["developer"].update({"executionMode": "continuous", "pollIntervalSeconds": 300})
+    configuration = validate_configuration(data)
+    store.save_configuration(configuration)
+    store.save_consent("project-one", REQUIRED_NOTICE_VERSION)
+    store.save_intent("project-one", {
+        "intentId": "auto-developer", "role": "developer", "mode": "auto", "manualTargets": [],
+        "nextPollAt": "2026-08-19T06:00:00Z", "lastAssignedAt": None,
+    })
+    store.save_run(dropped_run())
+    monkeypatch.setattr(agent_dispatch, "observe_process", lambda pid: observation("gone"))
+
+    def fake_start(store_arg, configuration_arg, role, **kwargs):  # type: ignore[no-untyped-def]
+        del configuration_arg, kwargs
+        row = {
+            "runId": f"run-{role}", "projectId": "project-one", "role": role,
+            "provider": "claude", "state": "running", "targetId": f"TASK-{role}",
+            "startedAt": "2026-08-19T10:00:00Z", "finishedAt": None,
+        }
+        store_arg.save_run(row)
+        return row
+
+    monkeypatch.setattr(agent_dispatch, "start_one_run", fake_start)
+    report = tick_project(store, "project-one", now=datetime(2026, 8, 19, 10, 0, tzinfo=UTC))
+
+    # 정리가 집계보다 먼저라서, 놓인 슬롯이 같은 주기에 바로 쓰인다.
+    assert (report.cleaned, report.started) == (1, 1)

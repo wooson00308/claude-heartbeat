@@ -74,6 +74,12 @@ LEASE_DIRECTORY = ".workflow/.runtime/leases"
 RESERVATION_MINUTES = 30
 PLAN_TTL_SECONDS = 120
 ACTIVE_STATES = frozenset({"reserved", "queued", "running", "paused"})
+
+# 장부가 recovery_required로 내렸지만 정리가 끝나지 않은 실행의 상태. 그 프로세스는
+# 아직 살아 일하고 있을 수 있으므로(#38의 오판이 정확히 그 모양) 슬롯 계산은 활성과
+# 함께 센다. ``remaining``을 비우는 것은 sweep_dropped_runs뿐이라, 끝났음이 증명된
+# 행만 점유에서 빠진다.
+OCCUPYING_STATES = frozenset({"recovery_required"})
 WORKER_POLL_SECONDS = 2.0
 WORKER_START_TIMEOUT_SECONDS = 10.0
 DISPATCHER_POLL_CAP_SECONDS = 5.0
@@ -325,8 +331,16 @@ def sync_automation(store: AgentStore, configuration: AgentConfiguration) -> Non
 def runtime_revision(store: AgentStore, configuration: AgentConfiguration) -> str:
     """Fingerprint everything a plan assumed, so a changed world is visible."""
     active = sorted(run["runId"] for run in store.list_runs(states=ACTIVE_STATES))
+    # 점유 실행도 계획의 배정 수를 정하므로 지문에 들어간다. 빠뜨리면 정리가 슬롯을
+    # 놓은 뒤에도 점유를 가정한 이전 계획이 그대로 적용된다.
+    occupied = sorted(run["runId"] for run in _occupying_runs(store))
     payload = json.dumps(
-        {"configuration": configuration.to_dict(), "deviceMaxParallel": store.device_limit(), "active": active},
+        {
+            "configuration": configuration.to_dict(),
+            "deviceMaxParallel": store.device_limit(),
+            "active": active,
+            "occupied": occupied,
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -334,19 +348,39 @@ def runtime_revision(store: AgentStore, configuration: AgentConfiguration) -> st
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
+def _occupying_runs(store: AgentStore, project_id: str | None = None) -> list[dict[str, Any]]:
+    """Dropped runs whose cleanup has not finished: they still hold their slot.
+
+    The ledger dropping a run says nothing about its process, which may still
+    be alive and working on its target. Counting these rows as free is what
+    let real concurrency climb past every limit (2026-08-19: seven sessions on
+    one project). Only a finished cleanup — an empty ``remaining`` — proves the
+    slot is truly free, and ``sweep_dropped_runs`` is the one place that
+    empties it.
+    """
+    return [
+        run for run in store.list_runs(project_id, states=OCCUPYING_STATES)
+        if run.get("remaining")
+    ]
+
+
 def _device_remaining(store: AgentStore, configuration: AgentConfiguration) -> int:
     limit = store.device_limit()
-    return max(0, limit - len(store.list_runs(states=ACTIVE_STATES)))
+    held = len(store.list_runs(states=ACTIVE_STATES)) + len(_occupying_runs(store))
+    return max(0, limit - held)
 
 
 def _project_remaining(store: AgentStore, configuration: AgentConfiguration) -> int:
-    active = len(store.list_runs(configuration.project_id, states=ACTIVE_STATES))
-    return max(0, configuration.project_max_parallel - active)
+    held = len(store.list_runs(configuration.project_id, states=ACTIVE_STATES)) + len(
+        _occupying_runs(store, configuration.project_id)
+    )
+    return max(0, configuration.project_max_parallel - held)
 
 
 def _role_remaining(store: AgentStore, configuration: AgentConfiguration, role: str) -> int:
     active = [run for run in store.list_runs(configuration.project_id, states=ACTIVE_STATES) if run["role"] == role]
-    return max(0, configuration.roles[role].max_parallel - len(active))
+    occupied = [run for run in _occupying_runs(store, configuration.project_id) if run["role"] == role]
+    return max(0, configuration.roles[role].max_parallel - len(active) - len(occupied))
 
 
 def validate_manual_targets(
@@ -388,9 +422,18 @@ def build_plan(
     now = now or datetime.now(UTC)
     device_remaining = _device_remaining(store, configuration)
     project_remaining = _project_remaining(store, configuration)
+    device_occupied = len(_occupying_runs(store))
+    project_occupying = _occupying_runs(store, configuration.project_id)
     locked = helpers.migration_locked()
     plans: list[RolePlan] = []
     budget = min(device_remaining, project_remaining)
+    # 점유가 없었다면 남았을 몫. granted가 이보다 작게 잡힌 역할은 평소의 한도 도달이
+    # 아니라 장부가 놓은 실행이 자리를 잡고 있는 것이므로, 배제 사유를 갈라서 낸다.
+    # 활성 0건인데 한도 도달로만 보이던 화면(2026-08-19)이 이 구분이 필요한 이유다.
+    budget_if_swept = min(
+        device_remaining + device_occupied,
+        project_remaining + len(project_occupying),
+    )
 
     for request in requests:
         policy = configuration.roles[request.role]
@@ -403,8 +446,15 @@ def build_plan(
             granted=0,
         )
         granted = min(request.slots, _role_remaining(store, configuration, request.role), budget)
+        granted_if_swept = min(
+            request.slots,
+            _role_remaining(store, configuration, request.role)
+            + sum(1 for run in project_occupying if run["role"] == request.role),
+            budget_if_swept,
+        )
         if policy.execution_limit is not None:
             granted = min(granted, policy.execution_limit)
+            granted_if_swept = min(granted_if_swept, policy.execution_limit)
         if configuration.paused:
             granted = 0
             plan.excluded.append("project_paused")
@@ -460,12 +510,15 @@ def build_plan(
             # default instead (see start), so the plan keeps its grant and the
             # diagnostic's modelStatus carries the fact for the screen.
         if granted < request.slots and not plan.excluded:
-            plan.excluded.append(
-                "execution_limit" if policy.execution_limit is not None and granted == policy.execution_limit
-                else "limit_reached"
-            )
+            if policy.execution_limit is not None and granted == policy.execution_limit:
+                plan.excluded.append("execution_limit")
+            elif granted < granted_if_swept:
+                plan.excluded.append("slots_held_by_unrecovered_runs")
+            else:
+                plan.excluded.append("limit_reached")
         plan.granted = granted
         budget -= granted
+        budget_if_swept -= granted
         plans.append(plan)
 
     return {
@@ -475,6 +528,8 @@ def build_plan(
         "expiresAt": (now + timedelta(seconds=PLAN_TTL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "deviceRemaining": device_remaining,
         "projectRemaining": project_remaining,
+        "deviceOccupied": device_occupied,
+        "projectOccupied": len(project_occupying),
         "limits": {
             "projectMaxParallel": configuration.project_max_parallel,
             "deviceMaxParallel": store.device_limit(),
@@ -1463,6 +1518,62 @@ def reconcile_project_runs(
     return reconciled
 
 
+def sweep_dropped_runs(
+    store: AgentStore,
+    project_id: str,
+    *,
+    helpers: WorkflowHelpers,
+    provider_factory: Callable[[str], AgentProvider] = build_provider,
+) -> int:
+    """Finish the cleanup dropped runs still owe, and only then free their slots.
+
+    A row whose process still matches its recorded identity is a wrongly
+    dropped worker that is alive and working: it is left completely alone —
+    killing it would destroy healthy work, and releasing its lease would let a
+    second session claim the same target. Unknown liveness counts as alive,
+    because judging an unobservable process was the original mistake. A gone
+    process (a reused PID is gone: the identity no longer matches) has nothing
+    left to protect, so its remaining steps run here and the row moves to the
+    terminal state its last event describes.
+    """
+    finished = 0
+    for row in _occupying_runs(store, project_id):
+        pid = row.get("pid")
+        if isinstance(pid, int):
+            observation = observe_process(pid)
+            identity = row.get("processIdentity")
+            if observation.liveness == "unknown":
+                continue
+            if observation.liveness == "running" and (not identity or observation.identity == identity):
+                continue
+        remaining = [step for step in row.get("remaining", ()) if step != "process_termination"]
+        if "event_close" in remaining:
+            # 남길 수 있는 이벤트는 장부로 옮기고 닫는다. 이벤트 파일이 이미 사라진
+            # 행에서 닫기를 미제로 남기면 그 슬롯이 영영 풀리지 않으므로, 옮기기는
+            # 최선 노력이고 닫힘은 여기서 확정된다.
+            try:
+                _drain_events(store, provider_factory(row["provider"]), row)
+            except Exception:  # noqa: BLE001 - 기록을 더 못 옮겨도 정리는 진행한다
+                pass
+            remaining.remove("event_close")
+        if "lease_release" in remaining and _release_lease(helpers, row):
+            remaining.remove("lease_release")
+        if remaining:
+            row["remaining"] = remaining
+            store.save_run(row)
+            continue
+        final_event = last_event(Path(row["eventPath"])) if row.get("eventPath") else None
+        event_kind = final_event.get("kind") if final_event is not None else None
+        row.update({
+            "state": TERMINAL_BY_EVENT.get(event_kind if isinstance(event_kind, str) else "", "failed"),
+            "remaining": [],
+            "finishedAt": row.get("finishedAt") or utc_now(),
+        })
+        store.save_run(row)
+        finished += 1
+    return finished
+
+
 def preview_cancel(row: dict[str, Any]) -> dict[str, Any]:
     """Describe what a cancel would touch, without touching any of it."""
     observation = observe_process(row["pid"]) if row.get("pid") else None
@@ -1526,6 +1637,7 @@ class TickReport:
 
     project_id: str
     reconciled: int = 0
+    cleaned: int = 0
     started: int = 0
     waiting: list[str] = field(default_factory=list)
     attention: list[str] = field(default_factory=list)
@@ -1552,6 +1664,15 @@ def tick_project(
         store,
         project_id,
         helpers_factory=helpers_factory,
+        provider_factory=provider_factory,
+    )
+    # 슬롯 집계를 읽기 전이어야 한다. 뒤에 두면 정리로 풀릴 슬롯이 이 주기 내내 점유로
+    # 잡혀 배정이 한 주기를 통째로 쉰다. 일시정지 판정보다도 앞이다 — 정리는 배정이
+    # 아니라 위생이라, 멈춘 프로젝트의 밀린 정리도 여기서 함께 끝난다.
+    report.cleaned = sweep_dropped_runs(
+        store,
+        project_id,
+        helpers=helpers,
         provider_factory=provider_factory,
     )
 
