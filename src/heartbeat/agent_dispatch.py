@@ -1420,7 +1420,20 @@ def reconcile_run(
             return row
         if worker.liveness == "gone" and row.get("pid"):
             provider_process = observe_process(row["pid"])
-            if provider_process.liveness != "gone":
+            provider_identity = row.get("processIdentity")
+            if (
+                provider_process.liveness == "running"
+                and provider_identity
+                and provider_process.identity == provider_identity
+            ):
+                # 감독자만 죽고 provider는 신원까지 검증된 채 살아 있다. 실행을 놓는
+                # 대신 감독 소유를 지우고 아래 provider 복구로 넘어간다. 이후에는 이
+                # 재조정 주체(데몬 tick·상태 조회)가 이벤트 옮기기·lease 갱신·종료
+                # 정리를 이어받으므로, 세션이 앱 밖으로 빠지지 않는다.
+                row["supervisorPid"] = None
+                row["supervisorIdentity"] = None
+                store.save_run(row)
+            elif provider_process.liveness != "gone":
                 row.update({
                     "state": "recovery_required",
                     "failureStage": "recovery",
@@ -1518,34 +1531,81 @@ def reconcile_project_runs(
     return reconciled
 
 
+def _restore_run(store: AgentStore, row: dict[str, Any]) -> None:
+    """Return a wrongly dropped run to the ledger as the active run it still is."""
+    row.update({
+        "state": "running",
+        "remaining": [],
+        "failureStage": None,
+        "reason": None,
+        "finishedAt": None,
+    })
+    store.save_run(row)
+
+
 def sweep_dropped_runs(
     store: AgentStore,
     project_id: str,
     *,
     helpers: WorkflowHelpers,
     provider_factory: Callable[[str], AgentProvider] = build_provider,
-) -> int:
-    """Finish the cleanup dropped runs still owe, and only then free their slots.
+) -> tuple[int, int]:
+    """Give dropped runs their real fate each cycle, and return (adopted, finished).
 
-    A row whose process still matches its recorded identity is a wrongly
-    dropped worker that is alive and working: it is left completely alone —
-    killing it would destroy healthy work, and releasing its lease would let a
-    second session claim the same target. Unknown liveness counts as alive,
-    because judging an unobservable process was the original mistake. A gone
-    process (a reused PID is gone: the identity no longer matches) has nothing
-    left to protect, so its remaining steps run here and the row moves to the
-    terminal state its last event describes.
+    A run dropped by a recovery misjudgement whose processes are still verifiably
+    alive is not shown politely as an external session — it is returned to the
+    ledger. A living supervisor with its recorded identity gets the run back
+    untouched; a supervisorless provider with its recorded identity is adopted
+    with cleared supervisor ownership, so the next reconcile pass (daemon tick,
+    state read) carries its events, lease and eventual cleanup. Only rows the
+    recovery stage dropped are eligible: a cancelled run is meant to be dead
+    and must never be resurrected. Unknown liveness holds the slot untouched —
+    judging an unobservable process was the original mistake. A gone process
+    (a reused PID is gone: the identity no longer matches) has nothing left to
+    protect, so its remaining steps run here and the row moves to the terminal
+    state its last event describes.
     """
+    adopted = 0
     finished = 0
     for row in _occupying_runs(store, project_id):
+        recovery_drop = row.get("failureStage") == "recovery" and bool(row.get("providerRunId"))
+        worker_pid = row.get("supervisorPid")
+        worker_identity = row.get("supervisorIdentity")
+        if isinstance(worker_pid, int) and worker_identity:
+            worker = observe_process(worker_pid)
+            if worker.liveness == "running" and worker.identity == worker_identity:
+                if recovery_drop:
+                    # 즉살 판정이 순간 관측 오류였고 감독자는 멀쩡하다. 실행을
+                    # 감독자에게 그대로 돌려준다.
+                    _restore_run(store, row)
+                    adopted += 1
+                continue
+            if worker.liveness != "gone":
+                # 관측 불가·신원 불일치 감독자는 살아 있을 수 있다. 입양하면 감독이
+                # 둘이 되어 이벤트를 겹쳐 읽으므로, 확실히 없어질 때까지 점유만 유지한다.
+                continue
         pid = row.get("pid")
         if isinstance(pid, int):
             observation = observe_process(pid)
             identity = row.get("processIdentity")
             if observation.liveness == "unknown":
                 continue
-            if observation.liveness == "running" and (not identity or observation.identity == identity):
-                continue
+            if observation.liveness == "running":
+                if not identity:
+                    continue
+                if observation.identity != identity:
+                    pass  # 재사용된 PID: provider는 이미 없다. 아래 정리로 진행한다.
+                elif recovery_drop:
+                    # 감독자는 없지만 provider가 검증된 채 살아 있다. 감독 소유를
+                    # 지운 활성 실행으로 되돌리면(재입양) 다음 재조정부터 데몬이
+                    # 이벤트·lease·종료 정리를 이어받는다.
+                    row["supervisorPid"] = None
+                    row["supervisorIdentity"] = None
+                    _restore_run(store, row)
+                    adopted += 1
+                    continue
+                else:
+                    continue  # 복구 단계가 놓은 실행이 아니면 살려 두되 점유만 유지한다.
         remaining = [step for step in row.get("remaining", ()) if step != "process_termination"]
         if "event_close" in remaining:
             # 남길 수 있는 이벤트는 장부로 옮기고 닫는다. 이벤트 파일이 이미 사라진
@@ -1571,7 +1631,7 @@ def sweep_dropped_runs(
         })
         store.save_run(row)
         finished += 1
-    return finished
+    return adopted, finished
 
 
 def preview_cancel(row: dict[str, Any]) -> dict[str, Any]:
@@ -1637,6 +1697,7 @@ class TickReport:
 
     project_id: str
     reconciled: int = 0
+    adopted: int = 0
     cleaned: int = 0
     started: int = 0
     waiting: list[str] = field(default_factory=list)
@@ -1667,9 +1728,9 @@ def tick_project(
         provider_factory=provider_factory,
     )
     # 슬롯 집계를 읽기 전이어야 한다. 뒤에 두면 정리로 풀릴 슬롯이 이 주기 내내 점유로
-    # 잡혀 배정이 한 주기를 통째로 쉰다. 일시정지 판정보다도 앞이다 — 정리는 배정이
-    # 아니라 위생이라, 멈춘 프로젝트의 밀린 정리도 여기서 함께 끝난다.
-    report.cleaned = sweep_dropped_runs(
+    # 잡혀 배정이 한 주기를 통째로 쉰다. 일시정지 판정보다도 앞이다 — 재입양과 정리는
+    # 배정이 아니라 사실 복원이라, 멈춘 프로젝트의 밀린 몫도 여기서 함께 끝난다.
+    report.adopted, report.cleaned = sweep_dropped_runs(
         store,
         project_id,
         helpers=helpers,

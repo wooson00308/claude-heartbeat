@@ -410,3 +410,30 @@ def test_retry_keeps_the_failed_run_and_links_the_new_one(tmp_path: Path, provid
     assert retried["previousRunId"] == failed["runId"]
     assert retried["state"] == "running"
     assert json.dumps(retried).count(failed["targetId"] or "none") == 0
+
+
+def test_a_verified_alive_provider_is_adopted_when_its_supervisor_died(
+    tmp_path: Path, provider_factory, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """감독자만 죽은 검증된 세션은 앱 밖으로 빠지는 대신 재조정 주체가 이어받는다."""
+    import subprocess
+
+    store, root, row = start_slow_run(tmp_path, provider_factory, monkeypatch)
+    corpse = subprocess.Popen([sys.executable, "-c", "pass"])
+    corpse.wait()
+    stored = store.get_run(row["runId"])
+    stored["supervisorPid"] = corpse.pid
+    stored["supervisorIdentity"] = "worker-at"
+    store.save_run(stored)
+
+    try:
+        reconcile_run(
+            store, store.get_run(row["runId"]), helpers=WorkflowHelpers(root), provider_factory=provider_factory
+        )
+        current = store.get_run(row["runId"])
+
+        assert current["state"] == "running"
+        assert (current["supervisorPid"], current["supervisorIdentity"]) == (None, None)
+        assert psutil.pid_exists(row["pid"])
+    finally:
+        stop_tree(row["pid"])

@@ -1087,7 +1087,8 @@ def test_a_failing_agent_store_never_stops_the_heartbeat_loop(monkeypatch) -> No
 def dropped_run(run_id: str = "run-dropped", role: str = "developer", **overrides):  # type: ignore[no-untyped-def]
     row = {
         "runId": run_id, "projectId": "project-one", "role": role, "provider": "claude",
-        "state": "recovery_required", "reason": "supervisor_identity_unverified",
+        "state": "recovery_required", "failureStage": "recovery",
+        "reason": "supervisor_identity_unverified", "providerRunId": f"prov-{run_id}",
         "remaining": ["process_termination", "event_close", "lease_release"],
         "pid": 4242, "processIdentity": "born-at",
     }
@@ -1148,29 +1149,105 @@ def test_a_dropped_run_with_finished_cleanup_frees_its_slot(
     assert plan["roles"][0]["excluded"] == []
 
 
-@pytest.mark.parametrize(
-    ("liveness", "identity"),
-    [("running", "born-at"), ("unknown", None)],
-)
-def test_sweep_leaves_a_live_or_unobservable_session_alone(
-    tmp_path: Path, monkeypatch, provider_factory, liveness: str, identity: str | None
+def test_sweep_holds_an_unobservable_session_without_touching_it(
+    tmp_path: Path, monkeypatch, provider_factory
 ) -> None:  # type: ignore[no-untyped-def]
     root = make_project(tmp_path)
     store = store_at(tmp_path)
     configure(store, root, "project-one")
     store.save_run(dropped_run(targetId="TASK-9", leaseId="lease-TASK-9"))
-    monkeypatch.setattr(agent_dispatch, "observe_process", lambda pid: observation(liveness, identity))
+    monkeypatch.setattr(agent_dispatch, "observe_process", lambda pid: observation("unknown"))
 
     swept = agent_dispatch.sweep_dropped_runs(
         store, "project-one", helpers=WorkflowHelpers(root), provider_factory=provider_factory
     )
 
     stored = store.get_run("run-dropped")
-    assert swept == 0
+    assert swept == (0, 0)
     assert stored["state"] == "recovery_required"
     assert stored["remaining"] == ["process_termination", "event_close", "lease_release"]
-    # 살아 있는 세션의 lease를 반납하면 같은 대상에 두 번째 세션이 붙는다.
+    # 살아 있을지 모르는 세션의 lease를 반납하면 같은 대상에 두 번째 세션이 붙는다.
     assert claim_log(root) == []
+
+
+def test_sweep_adopts_a_verified_alive_provider_back_into_the_ledger(
+    tmp_path: Path, monkeypatch, provider_factory
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    roles = default_configuration("project-one", str(root)).to_dict()["roles"]
+    roles["developer"]["maxParallel"] = 1
+    configuration = configure(store, root, "project-one", projectMaxParallel=2, deviceMaxParallel=5, roles=roles)
+    store.save_run(dropped_run(targetId="TASK-9", leaseId="lease-TASK-9"))
+    monkeypatch.setattr(agent_dispatch, "observe_process", lambda pid: observation("running", "born-at"))
+
+    swept = agent_dispatch.sweep_dropped_runs(
+        store, "project-one", helpers=WorkflowHelpers(root), provider_factory=provider_factory
+    )
+
+    stored = store.get_run("run-dropped")
+    assert swept == (1, 0)
+    # 앱 밖 세션으로 서술하는 대신 장부의 활성 실행으로 되돌린다. 감독 소유는 비워서
+    # 다음 재조정 주체가 이벤트·lease·종료 정리를 이어받는다.
+    assert (stored["state"], stored["remaining"]) == ("running", [])
+    assert (stored.get("supervisorPid"), stored.get("supervisorIdentity")) == (None, None)
+    assert (stored["failureStage"], stored["reason"], stored["finishedAt"]) == (None, None, None)
+    assert claim_log(root) == []
+    plan = build_plan(
+        store,
+        configuration,
+        [RoleSlots(role="developer", slots=1)],
+        helpers=WorkflowHelpers(root),
+        provider_factory=provider_factory,
+    )
+    # 점유가 아니라 활성으로 센다. 역할 한도 1은 평소의 한도 도달로 막힌다.
+    assert (plan["projectOccupied"], plan["roles"][0]["granted"]) == (0, 0)
+    assert plan["roles"][0]["excluded"] == ["limit_reached"]
+
+
+def test_sweep_returns_a_run_to_its_living_supervisor(
+    tmp_path: Path, monkeypatch, provider_factory
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configure(store, root, "project-one")
+    store.save_run(dropped_run(supervisorPid=5151, supervisorIdentity="worker-at"))
+    watchers = {5151: observation("running", "worker-at"), 4242: observation("running", "born-at")}
+    monkeypatch.setattr(agent_dispatch, "observe_process", lambda pid: watchers[pid])
+
+    swept = agent_dispatch.sweep_dropped_runs(
+        store, "project-one", helpers=WorkflowHelpers(root), provider_factory=provider_factory
+    )
+
+    stored = store.get_run("run-dropped")
+    assert swept == (1, 0)
+    # 즉살이 순간 관측 오류였고 감독자는 멀쩡하다. 감독 소유를 그대로 두고 돌려준다.
+    assert (stored["state"], stored["remaining"]) == ("running", [])
+    assert (stored["supervisorPid"], stored["supervisorIdentity"]) == (5151, "worker-at")
+
+
+def test_sweep_never_resurrects_a_cancelled_run(
+    tmp_path: Path, monkeypatch, provider_factory
+) -> None:  # type: ignore[no-untyped-def]
+    root = make_project(tmp_path)
+    store = store_at(tmp_path)
+    configure(store, root, "project-one")
+    store.save_run(dropped_run(
+        failureStage="cleanup", reason="partial_cleanup",
+        remaining=["process_termination", "lease_release"],
+    ))
+    monkeypatch.setattr(agent_dispatch, "observe_process", lambda pid: observation("running", "born-at"))
+
+    swept = agent_dispatch.sweep_dropped_runs(
+        store, "project-one", helpers=WorkflowHelpers(root), provider_factory=provider_factory
+    )
+
+    stored = store.get_run("run-dropped")
+    # 취소된 실행은 죽어야 할 실행이다. 살아 있어도 되살리지 않고, 죽이지도 않고,
+    # 슬롯만 점유로 유지한다.
+    assert swept == (0, 0)
+    assert stored["state"] == "recovery_required"
+    assert stored["remaining"] == ["process_termination", "lease_release"]
 
 
 @pytest.mark.parametrize(
@@ -1196,7 +1273,7 @@ def test_sweep_finishes_cleanup_once_the_process_is_gone_or_its_pid_reused(
     )
 
     stored = store.get_run("run-dropped")
-    assert swept == 1
+    assert swept == (0, 1)
     assert (stored["state"], stored["remaining"]) == ("succeeded", [])
     assert claim_log(root) == ["release TASK-9 lease-TASK-9"]
     plan = build_plan(
@@ -1228,7 +1305,7 @@ def test_sweep_keeps_the_slot_while_a_cleanup_step_still_fails(
         store, "project-one", helpers=WorkflowHelpers(root), provider_factory=provider_factory
     )
 
-    assert (first, second) == (0, 1)
+    assert (first, second) == ((0, 0), (0, 1))
     assert (held["state"], held["remaining"]) == ("recovery_required", ["lease_release"])
     # 이벤트 파일이 없는 행의 종료 상태는 기본값 실패다.
     assert store.get_run("run-dropped")["state"] == "failed"
@@ -1280,4 +1357,4 @@ def test_tick_sweeps_dropped_runs_before_refilling_their_slots(
     report = tick_project(store, "project-one", now=datetime(2026, 8, 19, 10, 0, tzinfo=UTC))
 
     # 정리가 집계보다 먼저라서, 놓인 슬롯이 같은 주기에 바로 쓰인다.
-    assert (report.cleaned, report.started) == (1, 1)
+    assert (report.adopted, report.cleaned, report.started) == (0, 1, 1)
